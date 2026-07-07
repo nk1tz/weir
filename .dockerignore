@@ -1,0 +1,19 @@
+# build context = package.json, pnpm-lock.yaml, tsconfig.json, src/ — exclude the rest
+node_modules
+dist
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+docs
+tests
+examples
+docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+vitest.config.ts
+LICENSE
+*.log
+.DS_Store

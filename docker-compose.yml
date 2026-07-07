@@ -1,0 +1,43 @@
+# weir stack: weir + redis always; bitcoind only under the 'regtest' profile
+# (mainnet/signet: bring your own node, point BITCOIN_RPC_URL/BITCOIN_ZMQ_URL at it).
+#
+#   cp .env.example .env          # then edit
+#   docker compose up -d                          # weir + redis
+#   docker compose --profile regtest up -d        # + throwaway regtest bitcoind
+#
+# NO published ports: weir listens on nothing (unless ADMIN_TOKEN), redis and
+# bitcoind are reachable only on the compose network.
+
+services:
+  weir:
+    build: .
+    env_file: .env
+    depends_on:
+      - redis
+    restart: unless-stopped
+    # lets WEBHOOK_URL=http://host.docker.internal:... reach the host on Linux too
+    # (native on Docker Desktop for mac/windows; harmless there)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  redis:
+    image: redis:7-alpine
+    # appendonly: the watch set + chain view must survive restarts.
+    # noeviction: eviction would silently delete watches — weir's preflight refuses any other policy.
+    command: redis-server --appendonly yes --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  bitcoind:
+    image: bitcoin/bitcoin:28
+    profiles:
+      - regtest
+    volumes:
+      - ./docker/bitcoin-regtest.conf:/home/bitcoin/.bitcoin/bitcoin.conf:ro
+      - bitcoind-data:/home/bitcoin/.bitcoin
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  bitcoind-data:
