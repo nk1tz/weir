@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="weir — watch every transaction flow by" width="100%">
+</p>
+
 # weir
 
 Watch bitcoin addresses. Get signed webhooks. Runs on a pruned node.
