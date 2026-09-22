@@ -16,9 +16,11 @@ under-tested, with real bugs in that gap. Order of work:
 3. **Regtest smoke** — DONE 2026-09-22: real bitcoind + redis, one payment: `seen` →
    `confirmed:1` → `confirmed:3`, all HMAC-verified by examples/catch.js; boot-time gap walk
    caught up 101 blocks. Found and fixed two compose/script bugs (conf mount, bitcoin-cli -conf).
-4. **Outbox** — every state transition is one Store method that mutates + enqueues
-   atomically; nothing awaits the network inside a transition. Fixes the `seen`/block
-   race structurally. Retries, bounded DLQ, delivery decoupled from block processing.
+4. **Outbox** — IN PROGRESS (branch v0.2/outbox). Spec: DESIGN.md "Outbox (durable
+   delivery)". Every state transition is one Store MULTI that also enqueues its event;
+   nothing awaits the network inside a transition (kills the `seen`/block race). One
+   drainer, persisted backoff, capped dead-letter after OUTBOX_MAX_AGE. Heartbeat bypasses
+   the outbox and reports it.
 5. **Outpoint tracking** and **chain-lag `/live` `/ready` `/metrics`** — in parallel.
 6. **Full regtest E2E** — reorg via `invalidateblock`, restart mid-flight, webhook down
    during a reorg. This is the v0.2 gate.

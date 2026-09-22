@@ -34,7 +34,9 @@ with an error message that would leak the password into logs.
 Optional: `CONFIRMATION_MILESTONES` (default `0,1,3`; 0 = seen events enabled; max value =
 tracking window = reorg shield), `WATCH_DEFAULT_TTL` (0 = forever), `HEARTBEAT_INTERVAL`
 (0 = off), `ADMIN_TOKEN` (unset = no HTTP server *exists*), `ADMIN_PORT` (8787),
-`WEBHOOK_MAX_RETRIES` (3), `WEBHOOK_TIMEOUT_MS` (10000).
+`WEBHOOK_TIMEOUT_MS` (10000), `OUTBOX_MAX_AGE` (seconds an undelivered event is retried
+before it is dead-lettered; default 259200 = 3 days), `OUTBOX_DEAD_MAX` (dead-letter cap,
+default 1000). There is no `WEBHOOK_MAX_RETRIES`: retry is the outbox's job, bounded by age.
 
 ## Redis schema (src/store/keys.ts — WRITTEN)
 
@@ -47,6 +49,10 @@ Working set (reconstructible): `pending`, `evaluated`, `mempool:current`, `mempo
 Reorg state (durable): `limbo` SET — txids whose inclusion block was disconnected by a reorg,
 awaiting re-resolution (re-included by the new chain / demoted to mempool / conflicted). Kept
 in redis so a crash mid-reorg finishes resolving on the next block or boot.
+Outbox (durable): `outbox` ZSET member=eventId score=nextAttemptAt-ms (the delivery queue);
+`outbox:{eventId}` HASH {payload(JSON WeirEvent), event, idempotencyKey, attempts, createdAt,
+lastError}; `outbox:dead` ZSET member=eventId score=deadAt-ms (same hash keys; capped at
+`OUTBOX_DEAD_MAX`, oldest dropped with their hashes). eventId = crypto.randomUUID().
 
 ## Events (src/lib/types.ts — WRITTEN)
 
@@ -54,14 +60,53 @@ in redis so a crash mid-reorg finishes resolving on the next block or boot.
 TxEvent payload: `{version:1, event, network, txid, confs, matched:[{address,vout,valueSats}],
 idempotencyKey, timestamp, blockHeight, blockHash, hex}`.
 `expired` is address-scoped: `{version:1, event:'expired', network, address, idempotencyKey, timestamp}`.
-`heartbeat`: `{version:1, event:'heartbeat', network, tipHeight, watchCount, memoryUsedPct, idempotencyKey, timestamp}`.
+`heartbeat`: `{version:1, event:'heartbeat', network, tipHeight, watchCount, memoryUsedPct,
+outboxDepth, outboxOldestAgeSec, deadLetterCount, idempotencyKey, timestamp}`.
 Idempotency key shapes are in `src/store/keys.ts` (`idem`). Timestamps: unix ms. For
 `confirmed`/`demoted`/`conflicted` use blockTime*1000 where a block drives the event, else `Date.now()`.
 
-Delivery is at-least-once. HMAC-SHA256 header:
+Delivery is at-least-once and ORDER IS BEST-EFFORT (see Outbox). HMAC-SHA256 header:
 `x-weir-signature: t=<unix seconds>, v1=<hex hmac_sha256(secret, "<t>." + rawBody)>`.
-2xx = delivered. Retries: exponential backoff (500ms base, x2, jitter), `WEBHOOK_MAX_RETRIES`
-attempts, per-request timeout `WEBHOOK_TIMEOUT_MS` via AbortController.
+2xx = delivered; anything else (non-2xx, network error, `WEBHOOK_TIMEOUT_MS` abort) is a failed
+attempt that the outbox retries. Consumers MUST dedupe on `idempotencyKey` in the same
+database transaction as the credit/reversal they perform, and must not assume arrival order:
+every event carries absolute state (event type, confs, block hash in the key), never a delta.
+
+## Outbox (durable delivery)
+
+Why: the events that REVERSE money (`dropped`, `demoted`, `conflicted`, `expired`) must not
+be lost when the webhook is down, and no state transition may await the network (a slow
+delivery inside a transition let a block race the `seen` write and corrupt the record).
+
+Rules:
+1. A state transition and its event are ONE Redis MULTI. Every Store transition method that
+   produces an event takes the event and appends `HSET outbox:{id} …` + `ZADD outbox now id`
+   to the same MULTI as its state mutation. Either both persist or neither does.
+2. Nothing in the engine awaits delivery. Engine code never calls the sink.
+3. One drainer (src/delivery/outbox.ts) delivers: every `OUTBOX_POLL_MS` (1000, constant) it
+   takes due events (`ZRANGEBYSCORE outbox -inf now LIMIT 0 50`), reads each hash, and sends
+   them SERIALLY in score order (so events enqueued together arrive in order when the
+   endpoint is healthy — best-effort only). Per event: 2xx → `outboxAck` (MULTI DEL hash,
+   ZREM); failure → attempts+1, `lastError`, and either `outboxRetry` (ZADD score =
+   now + backoff, backoff = min(1000·2^(attempts−1), 300000) ms + up to 25% jitter) or,
+   once `now − createdAt ≥ OUTBOX_MAX_AGE`, `outboxDead` (ZREM outbox, ZADD dead, then cap:
+   drop the oldest dead entries and their hashes beyond `OUTBOX_DEAD_MAX`) with an
+   error-level log naming the idempotencyKey. A dangling id (hash missing) is ZREM'd.
+4. The drainer's own failures (redis) are fatal (background path). The sink never throws.
+5. Crash after a 2xx but before the ack → the event is sent again: this is the at-least-once
+   duplicate consumers dedupe on `idempotencyKey`.
+6. `heartbeat` does NOT use the outbox: it is proof-of-life, delivered directly with one
+   attempt; a stale queued heartbeat carries no information. It reports the outbox instead.
+7. Boot: the drainer starts right after preflight (pending events from before a crash go
+   out before the possibly-long reconcile). Shutdown stops the poll loop and waits for the
+   in-flight drain pass.
+
+Store surface (all methods live on Store, mirrored exactly in tests/fakes.ts):
+`outboxDue(nowMs, limit): Promise<string[]>` (ids, ascending score), `outboxRead(id)` →
+`{event: WeirEvent, attempts, createdAt, lastError} | null`, `outboxAck(id)`,
+`outboxRetry(id, nextAtMs, attempts, lastError)`, `outboxDead(id, nowMs, attempts, lastError, deadMax)`,
+`outboxStats(): Promise<{depth: number; oldestCreatedAt: number | null; dead: number}>`.
+Transition methods that enqueue are listed under src/store/redis.ts.
 
 ## Module map and contracts
 
@@ -84,12 +129,16 @@ one-shot rule below.
 
 Deps are typed by picking from the real classes, never by hand-copying signatures:
 `store: Pick<Store, …>` / `rpc: Pick<Rpc, …>` (type-only imports) and
-`sink: Sink` (= `Pick<WebhookSink, 'deliver'>`, declared in src/delivery/webhook.ts). Logging
+`sink: Sink` (= `Pick<WebhookSink, 'send'>`, declared in src/delivery/webhook.ts) — only the
+outbox drainer and the heartbeat take a sink; engine modules enqueue through the Store. Logging
 is the single shared `log` from src/lib/log.ts — no module takes a logger dep. Tests
 substitute tests/fakes.ts (`FakeStore`, `FakeSink`, `FakeChain`), which MUST match the real
 classes' semantics exactly (e.g. `removeMaturing` deletes index AND record; the ring is a
 ZSET member→score map, so two hashes can coexist at one height); a signature mismatch is
-fixed in the fake, never in the real class.
+fixed in the fake, never in the real class. `FakeStore` also models the outbox (id → record,
+queue as id → score, dead set) and exposes `outboxEvents(): WeirEvent[]` (queued events in
+score-then-insertion order) so engine tests assert on what was ENQUEUED; delivery itself is
+tested through the drainer with `FakeSink`.
 
 ### src/lib/log.ts
 `export const log: { info(ctx: string, msg: string): void; warn(...): void; error(...): void }`
@@ -178,23 +227,34 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   miss on a fresh regtest ring holding only genesis), `ringPrune(keep: number)`,
   `ringRemoveAbove(height)` (ZREMRANGEBYSCORE — reorg rewind, keeps the one-hash-per-height
   invariant).
+- transitions that ENQUEUE (each one MULTI = state mutation + outbox HSET/ZADD; see Outbox):
+  `recordSeen(rec: MaturingRecord, event: TxEvent | null)` — HSET record (height 0), SADD
+  pending, SADD evaluated, + enqueue when event is non-null (null when seen is disabled);
+  `markFired(txid, fired: number[], event: TxEvent)` — HSET fired + enqueue `confirmed`
+  (fired is recorded at ENQUEUE time; delivery retry is the outbox's job);
+  `dropPending(txid, event: TxEvent)` — SREM pending, SREM evaluated, DEL record, + enqueue;
+  `demoteToPending(rec, event: TxEvent)` — HSET record back to height 0/blockHash ''/fired [],
+  SADD pending, SADD evaluated, SREM limbo, + enqueue `demoted` (`evaluated` is part of it
+  because the tip prune forgot the txid when it was mined; without it the next reparse would
+  emit a second `seen`);
+  `conflict(txid, event: TxEvent)` — SREM pending, ZREM maturing, DEL record, SREM limbo, + enqueue;
+  `expireWatch(addr, event: ExpiredEvent)` — SREM addresses, ZREM expiries, + enqueue;
+  `endTracking(txid)` — SREM pending, SREM limbo, DEL record (no event: watch removed mid-flight).
 - maturing: `promoteToMaturing(rec: MaturingRecord)` — THE mined-tx promotion, one MULTI:
   HSET record, ZADD maturing, SREM pending, SREM limbo, SADD evaluated (every promotion
-  branch uses it, so a crash cannot leave a half-promoted tx),
-  `maturingEntries(): Promise<Array<{txid: string; height: number}>>`,
-  `setMaturingFired(txid, fired: number[])`,
-  `removeMaturing(txid)` (deleteRecord + ZREM — callers do not deleteRecord again),
+  branch uses it, so a crash cannot leave a half-promoted tx; no event — confirmations come
+  from the milestone sweep), `maturingEntries(): Promise<Array<{txid: string; height: number}>>`,
+  `removeMaturing(txid)` (deleteRecord + ZREM — the final-milestone cleanup),
   `unindexMaturing(txids: string[])` (ONE ZREM of the index ONLY, records kept — the
   maturing→limbo transition; no-op on empty). Reading a maturing record is `readRecord`.
 - records (hash-only, exist from seen-time): `putRecord(rec)`, `readRecord(txid)`, `deleteRecord(txid)`.
-- limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`,
-  `demoteToPending(rec: MaturingRecord)` — THE reorg demotion, one MULTI: HSET record back to
-  height 0 / blockHash '' / fired [], SADD pending, SADD evaluated, SREM limbo. `evaluated`
-  is part of it because the tip prune forgot the txid when it was mined; without it the next
-  mempool reparse would emit a second `seen` under the same idempotency key.
+- limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`
+  (demotion is `demoteToPending` above).
 - `clearTracking(): Promise<string[]>` — prune-window guard: wipe maturing index + records +
-  pending + limbo + evaluated + mempool scratch, PRESERVING watches/expiries/tip/ring; returns
-  the txids whose tracking was lost for loud logging.
+  pending + limbo + evaluated + mempool scratch, PRESERVING watches/expiries/tip/ring AND the
+  outbox (queued events are still owed); returns the txids whose tracking was lost.
+- outbox: `outboxDue`, `outboxRead`, `outboxAck`, `outboxRetry`, `outboxDead`, `outboxStats`
+  (contracts under Outbox).
 - meta: `memoryInfo(): Promise<{usedBytes: number; maxBytes: number | null}>` (INFO memory),
   `maxmemoryPolicy(): Promise<string | null>` (CONFIG GET; null ONLY when the error is a
   command-access refusal — `/unknown command|not allowed|NOPERM|disabled|CONFIG/i`, e.g.
@@ -205,11 +265,20 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   flight would be a zombie process), and so is an `'end'` event not preceded by `quit()`.
 
 ### src/delivery/webhook.ts
-`export class WebhookSink { constructor(cfg: {url; secret; maxAttempts; timeoutMs}) ;
-deliver(event: WeirEvent): Promise<boolean> }` (`maxAttempts` = `WEBHOOK_MAX_RETRIES`, mapped
-in index.ts) plus `export type Sink = Pick<WebhookSink, 'deliver'>` — serialize once, sign via hmac.ts, POST with
-`content-type: application/json` + `x-weir-signature`, retry per rules. Returns true on 2xx.
-Never throws.
+`export class WebhookSink { constructor(cfg: {url; secret; timeoutMs}); send(event: WeirEvent):
+Promise<{ok: true} | {ok: false; error: string}> }` plus `export type Sink = Pick<WebhookSink, 'send'>`
+— ONE attempt: serialize, sign via hmac.ts with the current unix seconds, POST with
+`content-type: application/json` + `x-weir-signature`, `redirect: 'manual'`, AbortController
+timeout `WEBHOOK_TIMEOUT_MS`, cancel the response body. 2xx → `{ok: true}`; anything else →
+`{ok: false, error}` where error names the HTTP status or the network/abort error. Never
+throws. No retry loop here — retry is the outbox drainer's job (src/delivery/outbox.ts).
+
+### src/delivery/outbox.ts
+`export function startOutboxDrainer(deps: {cfg; store; sink}): {stop(): Promise<void>; drainOnce(): Promise<number>}`
+— the loop described under Outbox. `drainOnce` processes one batch and returns the number of
+events delivered (tests call it directly; the interval loop calls it every OUTBOX_POLL_MS and
+never overlaps itself). `stop()` clears the interval and awaits an in-flight pass. Store or
+sink-construction errors → fatal.
 
 ### src/engine/matcher.ts
 `export function matchAgainst(tx: DecodedTx, watched: ReadonlySet<string>): MatchedOutput[]`
@@ -222,9 +291,9 @@ yields 2 entries).
 `export function makeTxEvaluator(deps): (tx: DecodedTx) => Promise<void>` and
 `export function makeRawTxHandler(deps): (raw: Buffer) => Promise<void>` (decode → evaluate).
 Evaluate: if `isEvaluated` → return. Match. If no match → markEvaluated, done. If match:
-if seenEnabled, build `seen` TxEvent (confs 0, block fields null, timestamp now) and deliver.
-Delivery success → markEvaluated + addPending. Delivery failure → do NOT markEvaluated (the
-next reparse retries). If seen disabled (no 0 milestone): markEvaluated + addPending directly.
+build the `seen` TxEvent (confs 0, block fields null, timestamp now) when seenEnabled, then
+`recordSeen(rec, event | null)` — one MULTI, nothing awaited from the network. The old
+"delivery failed → leave un-evaluated" path no longer exists: the outbox owns retry.
 
 ### src/engine/mempool.ts
 `export function makeMempoolReparser(deps): () => Promise<void>` — module-level mutex (skip
@@ -253,11 +322,10 @@ found in a new block re-enters maturing (fresh height/blockHash, fired []) and l
 no event at re-inclusion; milestones re-fire on the sweep with new-blockhash idempotency keys.
 `export async function resolveLimbo(deps): Promise<void>` — runs after the TIP block finishes
 (and at boot when already reconciled): for each txid still in limbo,
-  - getMempoolEntry non-null → emit `demoted` (confs 0, block fields = the OLD block,
-    timestamp now), then `demoteToPending(rec)` (one MULTI: record to height 0, pending,
-    evaluated, out of limbo — no `seen` re-fires on the next reparse);
-  - else → emit `conflicted` (confs = last confirmed depth or 0, old block fields), full
-    cleanup (removePending/removeMaturing/SREM limbo). Terminal.
+  - getMempoolEntry non-null → build `demoted` (confs 0, block fields = the OLD block,
+    timestamp now) and `demoteToPending(rec, ev)` (one MULTI, enqueues it);
+  - else → build `conflicted` (confs = last confirmed depth or 0, old block fields) and
+    `conflict(txid, ev)` (one MULTI: full cleanup + enqueue). Terminal.
 Because limbo is durable, a crash anywhere in the sequence re-resolves on the next block/boot.
 
 ### src/engine/blockPipeline.ts
@@ -288,27 +356,32 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    mined payment to a watched address must confirm regardless. A tracked tx that no
    longer matches any watch (watch removed mid-flight) ends tracking quietly.
 3. milestone sweep: for each maturingEntries() entry: confs = h − height + 1; for each
-   confirm milestone m in (fired ∌ m) with confs ≥ m: emit `confirmed` (confs = m, block
-   fields from the record, timestamp = blockTime*1000 of B); on delivery success add m to
-   fired (setMaturingFired). When confs ≥ maxMilestone AND all milestones ≤ confs are fired →
-   removeMaturing (final; tracking ends).
+   confirm milestone m in (fired ∌ m) with confs ≥ m: build `confirmed` (confs = m, block
+   fields from the record, timestamp = blockTime*1000 of B) and `markFired(txid, fired+m, ev)`
+   (fired + enqueue, one MULTI; fired stays sorted). When confs ≥ maxMilestone AND all
+   milestones are fired → removeMaturing (final; tracking ends).
 4. dropped check — TIP BLOCKS ONLY: it compares pending against the LIVE mempool, which is
    meaningless for historical blocks during a catch-up walk (a pending tx mined in a LATER
    missed block would be falsely reported dropped). replacePostBlockMempool(getRawMempool) →
    droppedPending() → for each: emit `dropped` (hex+matched come from the seen-time record:
    every tx entering `pending` also gets its record written under `maturing:{txid}` with
    height 0 / blockHash '' — a dropped tx cannot be re-fetched from a pruned node. The
-   `maturing` ZSET still only indexes MINED txs; the record exists from seen onward). After
-   emitting: removePending, unmarkEvaluated (rebroadcast → seen can re-fire), deleteRecord.
-5. TTL sweep — TIP BLOCKS ONLY: dueExpiries(now) → emit `expired`, removeWatch (also ZREMs the expiry).
+   `maturing` ZSET still only indexes MINED txs; the record exists from seen onward):
+   `dropPending(txid, ev)` — one MULTI (pending, evaluated so a rebroadcast can re-fire
+   `seen`, record, + enqueue).
+5. TTL sweep — TIP BLOCKS ONLY: dueExpiries(now) → `expireWatch(addr, ev)` (one MULTI).
 6. pruneEvaluated (tip only), setTip({hash: H, height: h}), ringPut, ringPrune(ringSize).
-Failed `confirmed` deliveries: do NOT add to fired → retried next block. Failed dropped/
-demoted/conflicted/expired: log warn, proceed (best-effort one-shots).
+A tracked tx that no longer matches any watch → `endTracking(txid)` (no event).
+There are no delivery-failure branches in the engine: every event is enqueued atomically
+with its state change and the outbox retries it.
 
 ### src/engine/heartbeat.ts
 `export function startHeartbeat(deps): {stop(): void}` — setInterval(heartbeatInterval s):
-build HeartbeatEvent from getTip/watchCount/memoryInfo, deliver (a false result is warned,
-next interval retries). Skipped when interval 0. A rejected tick is fatal.
+build HeartbeatEvent from getTip/watchCount/memoryInfo/outboxStats and `sink.send` it
+DIRECTLY (not via the outbox — proof-of-life must reflect now; a failed send is warned, the
+next interval is the retry). Payload: `{version:1, event:'heartbeat', network, tipHeight,
+watchCount, memoryUsedPct, outboxDepth, outboxOldestAgeSec (null when empty), deadLetterCount,
+idempotencyKey, timestamp}`. Skipped when interval 0. A rejected tick is fatal.
 
 ### src/boot/preflight.ts
 `export async function preflight(deps): Promise<void>` — checks, in order, each with a clear
@@ -343,16 +416,21 @@ the bound port once listening (`ADMIN_PORT=0` = ephemeral; tests use it). Every 
 - `GET /watches?cursor=0` → `{addresses, cursor}` (SSCAN passthrough; cursor "0" = done;
   a cursor that is not `/^\d+$/` → 400).
 - `GET /watches/:address` → 200 `{address, watched: true, expiresAt}` or 404.
-- `GET /health` (no auth) → 200/503 `{ok, redis, rpc, tipHeight, secondsSinceLastBlock, watchCount}`.
+- `GET /health` (no auth) → 200/503 `{ok, redis, rpc, tipHeight, secondsSinceLastBlock, watchCount,
+  outboxDepth, outboxOldestAgeSec, deadLetterCount}` (`ok` is still redis && rpc — outbox
+  depth is a signal for the operator, not a readiness failure: the daemon is healthy when the
+  consumer is down).
 Reject bodies > 4KB with a real 413 response (`connection: close`; the socket is never
 destroyed before the status is written). JSON errors as `{error: string}`. An unhandled
 error inside a request handler → `500 {error: 'internal error'}` (request/response path:
 never fatal); a server `'error'` event (listen failure) → `fatal` (background path).
 
 ### src/index.ts (integration)
-loadConfig → Store.connect → preflight → reconcile → resolveLimbo → startZmq (rawtx → txHandler, rawblock →
-blockHandler, gap → reparser) → initial mempool reparse (async) → startHeartbeat → admin server
-if token. SIGINT/SIGTERM → close zmq, stop heartbeat, close admin, store.quit, exit 0.
+loadConfig → Store.connect → preflight → startOutboxDrainer → reconcile → resolveLimbo →
+startZmq (rawtx → txHandler, rawblock → blockHandler, gap → reparser) → initial mempool
+reparse (async) → startHeartbeat → admin server if token. Engine deps get NO sink (they
+enqueue); the sink goes only to the drainer and the heartbeat. SIGINT/SIGTERM → close zmq,
+stop heartbeat, close admin, await drainer.stop(), store.quit, exit 0.
 Log a startup banner: version, network, milestones, webhook target host, admin on/off.
 
 ## Coding conventions
