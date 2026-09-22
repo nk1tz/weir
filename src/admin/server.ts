@@ -1,23 +1,18 @@
-import { createServer, IncomingMessage, ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createHash, timingSafeEqual } from 'node:crypto'
-import { Network, Tip } from '../lib/types'
-import { log } from '../lib/log'
+import type { Network } from '../lib/types'
+import type { Store } from '../store/redis'
+import { describeError, log } from '../lib/log'
 
 const MAX_BODY_BYTES = 4096
 /** ttl upper bound: 10 years in seconds */
 const MAX_TTL_SECONDS = 10 * 365 * 24 * 3600
 
 export interface AdminDeps {
-  store: {
-    addWatch(address: string, expiresAtMs?: number): Promise<void>
-    removeWatch(address: string): Promise<boolean>
-    isWatched(address: string): Promise<boolean>
-    scanWatches(cursor: string): Promise<{ cursor: string; addresses: string[] }>
-    watchCount(): Promise<number>
-    getTip(): Promise<Tip | null>
-    /** expiresAt unix ms for a TTL'd watch, null when the watch has no expiry */
-    getExpiry(address: string): Promise<number | null>
-  }
+  store: Pick<
+    Store,
+    'addWatch' | 'removeWatch' | 'isWatched' | 'scanWatches' | 'watchCount' | 'getTip' | 'getExpiry'
+  >
   isValidAddress(address: string): boolean
   /** cheap RPC liveness probe (e.g. getBlockCount); must reject when bitcoind is unreachable */
   rpcPing(): Promise<void>
@@ -30,10 +25,6 @@ export interface AdminDeps {
     /** seconds; 0 = watch forever */
     watchDefaultTtl: number
   }
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
 }
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
@@ -90,11 +81,16 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer | null
   })
 }
 
-export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
-  const token = deps.config.adminToken
+/** The admin server must not be constructed without a token — fatal by design. */
+function requireAdminToken(token: string | null): string {
   if (token === null) {
     throw new Error('startAdminServer called without ADMIN_TOKEN — the admin server must not be constructed')
   }
+  return token
+}
+
+export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
+  const token = requireAdminToken(deps.config.adminToken)
 
   async function handleHealth(res: ServerResponse): Promise<void> {
     let redisOk = true
@@ -107,13 +103,13 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
       watchCount = await deps.store.watchCount()
     } catch (err) {
       redisOk = false
-      log.warn('admin', `health: redis check failed: ${errMsg(err)}`)
+      log.warn('admin', `health: redis check failed: ${describeError(err)}`)
     }
     try {
       await deps.rpcPing()
     } catch (err) {
       rpcOk = false
-      log.warn('admin', `health: rpc check failed: ${errMsg(err)}`)
+      log.warn('admin', `health: rpc check failed: ${describeError(err)}`)
     }
     const lastBlockAtMs = deps.lastBlockAtMs()
     const secondsSinceLastBlock =
@@ -139,7 +135,7 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
     try {
       parsed = JSON.parse(body.toString('utf8'))
     } catch (err) {
-      sendJson(res, 400, { error: `invalid JSON body: ${errMsg(err)}` })
+      sendJson(res, 400, { error: `invalid JSON body: ${describeError(err)}` })
       return
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
@@ -196,7 +192,7 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
       return
     }
 
-    if (!authorized(req, token as string)) {
+    if (!authorized(req, token)) {
       sendJson(res, 401, { error: 'unauthorized' })
       return
     }
@@ -206,7 +202,7 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
     try {
       segments = rawSegments.map((s) => decodeURIComponent(s))
     } catch (err) {
-      sendJson(res, 400, { error: `malformed percent-encoding in path: ${errMsg(err)}` })
+      sendJson(res, 400, { error: `malformed percent-encoding in path: ${describeError(err)}` })
       return
     }
 
@@ -238,7 +234,7 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
 
   const server = createServer((req, res) => {
     handle(req, res).catch((err: unknown) => {
-      log.error('admin', `unhandled error on ${req.method} ${req.url}: ${errMsg(err)}`)
+      log.error('admin', `unhandled error on ${req.method} ${req.url}: ${describeError(err)}`)
       if (!res.headersSent) {
         sendJson(res, 500, { error: 'internal error' })
       } else {
@@ -248,7 +244,7 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
   })
 
   server.on('error', (err) => {
-    log.error('admin', `server error: ${errMsg(err)}`)
+    log.error('admin', `server error: ${describeError(err)}`)
     throw err // fatal by design: docker restarts us
   })
 
@@ -262,7 +258,7 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
         server.closeAllConnections()
         server.close((err) => {
           if (err) {
-            log.error('admin', `close failed: ${errMsg(err)}`)
+            log.error('admin', `close failed: ${describeError(err)}`)
             reject(err)
             return
           }

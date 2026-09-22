@@ -1,96 +1,62 @@
 /**
- * Block pipeline: the ordered per-block sequence
- *   connectivity (gap/reorg) → mined-watch promotion → milestone sweep → dropped check
- *   → TTL sweep → prune/tip/ring, then limbo resolution once the TIP block is done.
+ * Block pipeline: the ordered per-block sequence — connectivity (gap/reorg) → mined-watch
+ * promotion → milestone sweep → dropped check → TTL sweep → prune/tip/ring, then limbo
+ * resolution once the TIP block is done. Spec: docs/DESIGN.md "src/engine/blockPipeline.ts".
  *
- * Spec: docs/DESIGN.md "src/engine/blockPipeline.ts".
- *
- * Two invariants that earlier revisions got wrong (see the review findings):
- *
- * - REORGS use the limbo model (src/engine/reorg.ts): displaced maturing txs move to the
- *   persisted `limbo` SET and the tip/ring REWIND to the fork point, so the replacement
- *   chain processes as a plain connected walk — one hash per height in the ring, no
- *   second fork search, and re-inclusion is discovered by the promotion step rather than
- *   by txid lookups that a pruned/no-txindex node cannot answer.
- *
- * - The dropped check, TTL sweep and evaluated-prune compare against the node's LIVE
- *   mempool, which is only meaningful at the chain tip — during a multi-block catch-up a
- *   pending tx mined in a LATER missed block would otherwise be falsely reported dropped.
- *   They run only when `isTip` (the outermost block), never for historical catch-up blocks.
- *
- * Record lifecycle note: a tx's `maturing:{txid}` hash record exists from SEEN-time onward
- * (the tx pipeline stores it at height 0 when the tx enters `pending`), so dropped/mined
- * transitions always have hex+matched at hand. The `maturing` ZSET only indexes MINED txs.
+ * INVARIANTS
+ * - Reorgs use the limbo model (src/engine/reorg.ts): rewind first, then the replacement
+ *   chain is a plain connected walk; re-inclusion is discovered by the promotion step.
+ * - The dropped check, TTL sweep and evaluated-prune run ONLY on the tip block: they compare
+ *   against the node's LIVE mempool / wall clock, which is meaningless for historical blocks
+ *   during a catch-up walk (a pending tx mined in a LATER missed block would be falsely
+ *   reported dropped).
+ * - A tx's `maturing:{txid}` record exists from SEEN-time (height 0); the `maturing` ZSET
+ *   only indexes MINED txs.
  */
-import { DecodedBlock, DecodedTx, ExpiredEvent, MatchedOutput, MaturingRecord, Network, Tip, TxEvent, WeirEvent } from '../lib/types'
+import type { DecodedBlock, ExpiredEvent, MaturingRecord, Network, TxEvent } from '../lib/types'
+import type { Rpc } from '../bitcoin/rpc'
+import type { Store } from '../store/redis'
+import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
-import { enterLimboAndRewind, findForkPoint, Log, ReorgRpc, ReorgStore, resolveLimbo } from './reorg'
-
-const consoleLog: Log = {
-  info: (ctx, msg) => console.log(`[info] [${ctx}] ${msg}`),
-  warn: (ctx, msg) => console.warn(`[warn] [${ctx}] ${msg}`),
-  error: (ctx, msg) => console.error(`[error] [${ctx}] ${msg}`),
-}
+import { log } from '../lib/log'
+import { matchAgainst } from './matcher'
+import { enterLimboAndRewind, findForkPoint, type ReorgRpc, type ReorgStore, resolveLimbo } from './reorg'
 
 const CTX = 'blockPipeline'
 
-export interface BlockStore extends ReorgStore {
-  getTip(): Promise<Tip | null>
-  ringPut(height: number, hash: string): Promise<void>
-  ringPrune(keep: number): Promise<void>
-  setBlockTxids(txids: string[]): Promise<void>
-  pendingInBlock(): Promise<string[]>
-  watchedSubset(addrs: string[]): Promise<string[]>
-  isEvaluated(txid: string): Promise<boolean>
-  markEvaluated(txid: string): Promise<void>
-  unmarkEvaluated(txid: string): Promise<void>
-  addMaturing(rec: MaturingRecord): Promise<void>
-  getMaturing(txid: string): Promise<MaturingRecord | null>
-  setMaturingFired(txid: string, fired: number[]): Promise<void>
-  replacePostBlockMempool(txids: string[]): Promise<void>
-  droppedPending(): Promise<string[]>
-  pruneEvaluated(): Promise<void>
-  dueExpiries(nowMs: number): Promise<Array<{ address: string; expiresAtMs: number }>>
-  removeWatch(addr: string): Promise<boolean>
-  clearExpiry(addr: string): Promise<void>
-  /** prune-window guard: wipe all tx tracking, keep watches/tip/ring; returns lost txids */
-  clearTracking(): Promise<string[]>
-}
+/** SMISMEMBER argument cap per round trip when resolving a block's distinct output addresses. */
+const WATCHED_SUBSET_CHUNK = 1000
 
-export interface BlockRpc extends ReorgRpc {
-  getBlockHash(height: number): Promise<string>
-  getBlockRaw(hash: string): Promise<Buffer>
-  getRawMempool(): Promise<string[]>
-  getBlockchainInfo(): Promise<{ chain: string; blocks: number; pruned: boolean; pruneheight?: number }>
-}
+export type BlockStore = ReorgStore &
+  Pick<
+    Store,
+    | 'getTip'
+    | 'ringPut'
+    | 'ringPrune'
+    | 'setBlockTxids'
+    | 'pendingInBlock'
+    | 'watchedSubset'
+    | 'isEvaluated'
+    | 'markEvaluated'
+    | 'unmarkEvaluated'
+    | 'addMaturing'
+    | 'setMaturingFired'
+    | 'replacePostBlockMempool'
+    | 'droppedPending'
+    | 'pruneEvaluated'
+    | 'dueExpiries'
+    | 'removeWatch'
+    | 'clearTracking'
+  >
+
+export type BlockRpc = ReorgRpc & Pick<Rpc, 'getBlockHash' | 'getBlockRaw' | 'getRawMempool' | 'getBlockchainInfo'>
 
 export interface BlockPipelineDeps {
   cfg: { network: Network; confirmMilestones: number[]; maxMilestone: number; ringSize: number }
   store: BlockStore
   rpc: BlockRpc
-  sink: { deliver(event: WeirEvent): Promise<boolean> }
+  sink: Sink
   decodeBlock(raw: Buffer, network: Network): DecodedBlock
-  log?: Log
-}
-
-/**
- * Same address-collection logic as src/engine/matcher.ts, inlined so this module has no
- * import on the matcher. An address matched by two outputs yields two entries.
- */
-async function matchOutputs(
-  tx: DecodedTx,
-  store: { watchedSubset(addrs: string[]): Promise<string[]> },
-): Promise<MatchedOutput[]> {
-  const addrs = [...new Set(tx.outputs.map((o) => o.address).filter((a): a is string => a !== null))]
-  if (addrs.length === 0) return []
-  const watched = new Set(await store.watchedSubset(addrs))
-  const matched: MatchedOutput[] = []
-  for (const o of tx.outputs) {
-    if (o.address !== null && watched.has(o.address)) {
-      matched.push({ address: o.address, vout: o.vout, valueSats: o.valueSats })
-    }
-  }
-  return matched
 }
 
 /**
@@ -100,22 +66,36 @@ async function matchOutputs(
  * whatever a reorg left in limbo.
  */
 export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Promise<void> {
-  const log = deps.log ?? consoleLog
   const { cfg, store, rpc, sink } = deps
+
+  /** The block's distinct output addresses that are watched — one round trip per chunk. */
+  async function watchedInBlock(block: DecodedBlock): Promise<Set<string>> {
+    const addrs = new Set<string>()
+    for (const tx of block.txs) {
+      for (const o of tx.outputs) if (o.address !== null) addrs.add(o.address)
+    }
+    const all = [...addrs]
+    const watched = new Set<string>()
+    for (let i = 0; i < all.length; i += WATCHED_SUBSET_CHUNK) {
+      for (const a of await store.watchedSubset(all.slice(i, i + WATCHED_SUBSET_CHUNK))) watched.add(a)
+    }
+    return watched
+  }
 
   async function processConnected(block: DecodedBlock, height: number, isTip: boolean): Promise<void> {
     const net = cfg.network
 
     // ── 2. mined-watch promotion ─────────────────────────────────────────────────────
-    // Check EVERY block tx against the matcher — not just pending ∩ block — so a payment
+    // Check EVERY block tx against the watch set — not just pending ∩ block — so a payment
     // never seen in the mempool (missed ZMQ, direct-to-block) still confirms. Limbo txids
     // found in the block are reorg re-inclusions: fresh height/blockHash, fired resets,
     // milestones re-fire on the sweep below with new-blockhash idempotency keys.
     await store.setBlockTxids(block.txs.map((t) => t.txid))
     const pendingMined = new Set(await store.pendingInBlock())
     const limbo = new Set(await store.limboTxids())
+    const watched = await watchedInBlock(block)
     for (const tx of block.txs) {
-      const matched = await matchOutputs(tx, store)
+      const matched = matchAgainst(tx, watched)
       if (matched.length === 0) {
         if (pendingMined.has(tx.txid) || limbo.has(tx.txid)) {
           // Was tracked but no longer matches (watch removed mid-flight): end tracking quietly.
@@ -144,7 +124,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
         await store.addMaturing(rec)
         log.info(CTX, `promoted pending ${tx.txid} → maturing at ${block.hash}@${height}`)
       } else {
-        const existing = await store.getMaturing(tx.txid)
+        const existing = await store.readRecord(tx.txid)
         if (existing && existing.height > 0) continue // already maturing (e.g. block replay)
         if (await store.isEvaluated(tx.txid)) continue
         await store.markEvaluated(tx.txid)
@@ -157,14 +137,14 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     // Runs for EVERY block (including catch-up blocks) so confirmations count correctly.
     const blockTimeMs = block.time * 1000
     for (const entry of await store.maturingEntries()) {
-      const rec = await store.getMaturing(entry.txid)
+      const rec = await store.readRecord(entry.txid)
       if (!rec) {
         log.warn(CTX, `maturing entry ${entry.txid} has no record — removing dangling zset entry`)
         await store.removeMaturing(entry.txid)
         continue
       }
       const confs = height - rec.height + 1
-      let fired = [...rec.fired]
+      const fired = [...rec.fired]
       for (const m of cfg.confirmMilestones) {
         if (confs < m || fired.includes(m)) continue
         const ev: TxEvent = {
@@ -182,7 +162,10 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
         }
         const ok = await sink.deliver(ev)
         if (ok) {
-          fired = [...fired, m].sort((a, b) => a - b)
+          // Sort, don't just push: a failed lower milestone can be retried AFTER a higher one
+          // succeeded (e.g. 3 delivered while 1 kept failing), so append order is not ascending.
+          fired.push(m)
+          fired.sort((a, b) => a - b)
           await store.setMaturingFired(rec.txid, fired)
         } else {
           // Do NOT add to fired — the milestone is retried on the next block's sweep.
@@ -191,8 +174,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
       }
       // Final removal only once confs ≥ maxMilestone AND every milestone has fired.
       if (confs >= cfg.maxMilestone && cfg.confirmMilestones.every((m) => fired.includes(m))) {
-        await store.removeMaturing(rec.txid)
-        await store.deleteRecord(rec.txid)
+        await store.removeMaturing(rec.txid) // deletes the record too
         log.info(CTX, `tracking ended for ${rec.txid} at ${confs} confs`)
       }
     }
@@ -239,8 +221,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
         }
         const ok = await sink.deliver(ev)
         if (!ok) log.warn(CTX, `expired delivery failed for ${address} — best-effort one-shot, proceeding`)
-        await store.removeWatch(address)
-        await store.clearExpiry(address)
+        await store.removeWatch(address) // also clears the expiry
         log.info(CTX, `watch expired: ${address}`)
       }
     }
@@ -328,13 +309,12 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
 }
 
 /**
- * ZMQ-facing handler: the processor behind a serialization queue so blocks arriving
+ * ZMQ-facing handler: the given processor behind a serialization queue so blocks arriving
  * back-to-back are processed strictly in order. The returned promise still rejects on
  * failure (the ZMQ wrapper logs it); the internal chain is kept alive so one failed
  * block does not poison processing of the next.
  */
-export function makeBlockHandler(deps: BlockPipelineDeps): (raw: Buffer) => Promise<void> {
-  const processBlock = makeBlockProcessor(deps)
+export function makeBlockHandler(processBlock: (raw: Buffer) => Promise<void>): (raw: Buffer) => Promise<void> {
   let queue: Promise<void> = Promise.resolve()
   return (raw: Buffer) => {
     const run = queue.then(() => processBlock(raw))

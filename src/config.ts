@@ -1,4 +1,4 @@
-import { Network } from './lib/types'
+import type { Network } from './lib/types'
 
 export interface WeirConfig {
   network: Network

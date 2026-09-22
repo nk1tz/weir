@@ -1,5 +1,5 @@
 import { Subscriber } from 'zeromq'
-import { log } from '../lib/log'
+import { describeError, log } from '../lib/log'
 
 const CTX = 'zmq'
 
@@ -9,9 +9,9 @@ const TOPIC_RAWBLOCK = 'rawblock'
 /** bitcoind's per-topic ZMQ sequence counter is a uint32 — wraps at 2^32. */
 const UINT32_WRAP = 0x1_0000_0000
 
-function describe(err: unknown): string {
-  if (err instanceof Error) return err.stack ?? err.message
-  return String(err)
+/** Handler failures are unexpected internal errors — keep the stack in the log line. */
+function stackOf(err: unknown): string {
+  return err instanceof Error && err.stack ? `\n${err.stack}` : ''
 }
 
 /**
@@ -22,7 +22,7 @@ function safeInvoke(name: string, fn: () => unknown): void {
   void Promise.resolve()
     .then(() => fn())
     .catch((err: unknown) => {
-      log.error(CTX, `${name} handler failed: ${describe(err)}`)
+      log.error(CTX, `${name} handler failed: ${describeError(err)}${stackOf(err)}`)
     })
 }
 
@@ -97,7 +97,7 @@ export async function startZmq(opts: {
     // reconciliation makes that safe). Rethrowing rejects this detached
     // promise, which terminates the process under Node's default
     // unhandled-rejection behavior.
-    log.error(CTX, `subscriber loop failed: ${describe(err)}`)
+    log.error(CTX, `subscriber loop failed: ${describeError(err)}${stackOf(err)}`)
     throw err
   })
 

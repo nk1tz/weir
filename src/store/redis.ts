@@ -1,35 +1,24 @@
 /**
- * Store — the daemon's redis-backed memory. Per DESIGN.md "src/store/redis.ts".
+ * Store — the daemon's redis-backed memory, one redis@4 client, keys via `keysFor(network)`.
+ * Spec: docs/DESIGN.md "src/store/redis.ts" (and "Redis schema").
  *
- * Wraps a single redis@4 client. All keys come from `keysFor(network)`.
- *
- * Record lifecycle note (DESIGN.md blockPipeline step 4, authoritative resolution):
- * a `maturing:{txid}` HASH record exists from *seen-time* onward — `putRecord` is
- * called (height 0, blockHash '') when a tx enters `pending`, so hex + matched are
- * available for later `dropped`/mined transitions even though the tx can no longer
- * be fetched from a pruned node once evicted. The `maturing` ZSET, by contrast,
- * only ever indexes *mined* txs: `addMaturing` = putRecord + ZADD, `removeMaturing`
- * = deleteRecord + ZREM.
+ * INVARIANTS
+ * - A `maturing:{txid}` record exists from SEEN-time onward (`putRecord`, height 0 /
+ *   blockHash ''); the `maturing` ZSET only ever indexes MINED txs. `addMaturing` =
+ *   putRecord + ZADD, `removeMaturing` = deleteRecord + ZREM, `unindexMaturing` = ZREM only
+ *   (the maturing→limbo transition keeps the record).
+ * - Bounded reconnects: boot fails fast on a bad REDIS_URL; at runtime, exhausting retries
+ *   rejects in-flight commands and the engine crashes per the log-and-crash policy.
  */
 
 import { createClient } from 'redis'
-import { MaturingRecord, Network, Tip } from '../lib/types'
-import { log } from '../lib/log'
-import { Keys, keysFor } from './keys'
+import type { MaturingRecord, Network, Tip } from '../lib/types'
+import { describeError, log } from '../lib/log'
+import { type Keys, keysFor } from './keys'
 
 const CTX = 'store'
 
 type Client = ReturnType<typeof createClient>
-
-/** AggregateError (e.g. dual-stack ECONNREFUSED) has an empty .message — surface the inner ones. */
-function describeErr(err: unknown): string {
-  if (err instanceof AggregateError) {
-    const inner = err.errors.map((e) => (e instanceof Error ? e.message : String(e))).join('; ')
-    return err.message ? `${err.message}: ${inner}` : inner || 'AggregateError (no detail)'
-  }
-  if (err instanceof Error) return err.message || err.name
-  return String(err)
-}
 
 /** MaturingRecord hash fields: height (string int), blockHash, matched (JSON), fired (JSON), hex. */
 function recordToHash(rec: MaturingRecord): Record<string, string> {
@@ -76,10 +65,6 @@ export class Store {
       url,
       socket: {
         connectTimeout: 10_000,
-        // Bounded retries: boot fails FAST on a bad REDIS_URL instead of hanging on
-        // the default infinite reconnect loop; at runtime, exhausting retries closes
-        // the client, in-flight commands reject, and the engine crashes per the
-        // log-and-crash policy (docker restarts us; boot reconciliation heals).
         reconnectStrategy: (retries: number) =>
           retries >= 5
             ? new Error(`[${CTX}] redis unreachable after ${retries} connection attempts`)
@@ -91,7 +76,7 @@ export class Store {
     // unhandled 'error' event would crash the process mid-reconnect. Log them —
     // commands issued while disconnected still reject, so nothing is swallowed.
     this.client.on('error', (err: unknown) => {
-      log.error(CTX, `redis client error: ${describeErr(err)}`)
+      log.error(CTX, `redis client error: ${describeError(err)}`)
     })
   }
 
@@ -109,19 +94,11 @@ export class Store {
     return this.client.sIsMember(this.keys.addresses, addr)
   }
 
-  /**
-   * Pipelined SISMEMBER for every address (redis@4 auto-pipelines concurrent
-   * commands). Returns ALL watched addresses — no early bail.
-   */
+  /** One SMISMEMBER round trip. Returns ALL watched addresses, input order — no early bail. */
   async watchedSubset(addrs: string[]): Promise<string[]> {
     if (addrs.length === 0) return []
-    const flags = await Promise.all(addrs.map((a) => this.client.sIsMember(this.keys.addresses, a)))
-    const watched: string[] = []
-    for (let i = 0; i < addrs.length; i++) {
-      const addr = addrs[i]
-      if (flags[i] && addr !== undefined) watched.push(addr)
-    }
-    return watched
+    const flags = await this.client.smIsMember(this.keys.addresses, addrs)
+    return addrs.filter((_, i) => flags[i])
   }
 
   /** SADD; with expiresAtMs also ZADD expiries — atomically (MULTI). Without it, any stale expiry is cleared. */
@@ -154,13 +131,13 @@ export class Store {
   /** SSCAN passthrough, COUNT 1000. Cursor "0" means iteration complete. */
   async scanWatches(cursor: string): Promise<{ cursor: string; addresses: string[] }> {
     const res = await this.client.sScan(this.keys.addresses, Number.parseInt(cursor, 10), { COUNT: 1000 })
-    return { cursor: String(res.cursor), addresses: res.members.map((m) => m.toString()) }
+    return { cursor: String(res.cursor), addresses: res.members }
   }
 
   /** Watches whose expiry deadline is at or before nowMs. */
   async dueExpiries(nowMs: number): Promise<Array<{ address: string; expiresAtMs: number }>> {
     const members = await this.client.zRangeByScoreWithScores(this.keys.expiries, '-inf', nowMs)
-    return members.map((m) => ({ address: m.value.toString(), expiresAtMs: m.score }))
+    return members.map((m) => ({ address: m.value, expiresAtMs: m.score }))
   }
 
   async clearExpiry(addr: string): Promise<void> {
@@ -271,8 +248,7 @@ export class Store {
 
   async ringHashAt(height: number): Promise<string | null> {
     const hashes = await this.client.zRangeByScore(this.keys.blocks, height, height)
-    const first = hashes[0]
-    return first === undefined ? null : first.toString()
+    return hashes[0] ?? null
   }
 
   /** Rewind the ring after a reorg: drop every entry strictly above `height` so the
@@ -284,7 +260,7 @@ export class Store {
   /** Ring entries strictly above `height`, ascending. */
   async ringAbove(height: number): Promise<Array<{ height: number; hash: string }>> {
     const members = await this.client.zRangeByScoreWithScores(this.keys.blocks, `(${height}`, '+inf')
-    return members.map((m) => ({ height: m.score, hash: m.value.toString() }))
+    return members.map((m) => ({ height: m.score, hash: m.value }))
   }
 
   /** ZREMRANGEBYRANK — keep only the `keep` highest entries. */
@@ -320,19 +296,29 @@ export class Store {
       .exec()
   }
 
-  async getMaturing(txid: string): Promise<MaturingRecord | null> {
-    return this.readRecord(txid)
-  }
-
   /** Every maturing txid with its inclusion height (ZSET score), ascending. */
   async maturingEntries(): Promise<Array<{ txid: string; height: number }>> {
     const members = await this.client.zRangeWithScores(this.keys.maturing, 0, -1)
-    return members.map((m) => ({ txid: m.value.toString(), height: m.score }))
+    return members.map((m) => ({ txid: m.value, height: m.score }))
   }
 
-  /** ZREM from the maturing index ONLY — the per-txid record stays (limbo transition). */
-  async unindexMaturing(txid: string): Promise<void> {
-    await this.client.zRem(this.keys.maturing, txid)
+  /** One ZREM from the maturing index ONLY — the records stay (limbo transition). No-op on empty. */
+  async unindexMaturing(txids: string[]): Promise<void> {
+    if (txids.length === 0) return
+    await this.client.zRem(this.keys.maturing, txids)
+  }
+
+  async setMaturingFired(txid: string, fired: number[]): Promise<void> {
+    await this.client.hSet(this.keys.maturingRecord(txid), { fired: JSON.stringify(fired) })
+  }
+
+  /** deleteRecord + ZREM index, atomically (MULTI). */
+  async removeMaturing(txid: string): Promise<void> {
+    await this.client
+      .multi()
+      .del(this.keys.maturingRecord(txid))
+      .zRem(this.keys.maturing, txid)
+      .exec()
   }
 
   // ── limbo (reorg-displaced txids awaiting re-resolution) ───────────────────
@@ -343,8 +329,7 @@ export class Store {
   }
 
   async limboTxids(): Promise<string[]> {
-    const members = await this.client.sMembers(this.keys.limbo)
-    return members.map((m) => m.toString())
+    return this.client.sMembers(this.keys.limbo)
   }
 
   async removeLimbo(txid: string): Promise<void> {
@@ -368,7 +353,7 @@ export class Store {
     // itself has no trailing colon, so the pattern cannot match it).
     const pattern = this.keys.maturingRecord('*')
     for await (const key of this.client.scanIterator({ MATCH: pattern, COUNT: 500 })) {
-      await this.client.del(key.toString())
+      await this.client.del(key)
     }
     await this.client.del([
       this.keys.maturing,
@@ -381,32 +366,6 @@ export class Store {
       this.keys.blockTxids,
     ])
     return [...lost]
-  }
-
-  async setMaturingFired(txid: string, fired: number[]): Promise<void> {
-    await this.client.hSet(this.keys.maturingRecord(txid), { fired: JSON.stringify(fired) })
-  }
-
-  /** Re-inclusion after a reorg: new ZSET score + new height/blockHash + fired reset, atomically (MULTI). */
-  async moveMaturing(txid: string, newHeight: number, newBlockHash: string): Promise<void> {
-    await this.client
-      .multi()
-      .zAdd(this.keys.maturing, { score: newHeight, value: txid })
-      .hSet(this.keys.maturingRecord(txid), {
-        height: String(newHeight),
-        blockHash: newBlockHash,
-        fired: '[]',
-      })
-      .exec()
-  }
-
-  /** deleteRecord + ZREM index, atomically (MULTI). */
-  async removeMaturing(txid: string): Promise<void> {
-    await this.client
-      .multi()
-      .del(this.keys.maturingRecord(txid))
-      .zRem(this.keys.maturing, txid)
-      .exec()
   }
 
   // ── meta ───────────────────────────────────────────────────────────────────
@@ -435,10 +394,7 @@ export class Store {
       const res = await this.client.configGet('maxmemory-policy')
       return res['maxmemory-policy'] ?? null
     } catch (err) {
-      log.warn(
-        CTX,
-        `CONFIG GET maxmemory-policy blocked (managed redis?): ${err instanceof Error ? err.message : String(err)}`,
-      )
+      log.warn(CTX, `CONFIG GET maxmemory-policy blocked (managed redis?): ${describeError(err)}`)
       return null
     }
   }

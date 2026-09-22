@@ -3,19 +3,10 @@
  *
  * Spec: docs/DESIGN.md "src/boot/preflight.ts".
  */
-import { Network } from '../lib/types'
-
-interface Log {
-  info(ctx: string, msg: string): void
-  warn(ctx: string, msg: string): void
-  error(ctx: string, msg: string): void
-}
-
-const consoleLog: Log = {
-  info: (ctx, msg) => console.log(`[info] [${ctx}] ${msg}`),
-  warn: (ctx, msg) => console.warn(`[warn] [${ctx}] ${msg}`),
-  error: (ctx, msg) => console.error(`[error] [${ctx}] ${msg}`),
-}
+import type { Network } from '../lib/types'
+import type { Rpc } from '../bitcoin/rpc'
+import type { Store } from '../store/redis'
+import { log } from '../lib/log'
 
 const CTX = 'preflight'
 
@@ -29,20 +20,11 @@ const CHAIN_FOR: Record<Network, string> = {
 
 export interface PreflightDeps {
   cfg: { network: Network }
-  store: {
-    memoryInfo(): Promise<{ usedBytes: number; maxBytes: number | null }>
-    maxmemoryPolicy(): Promise<string | null>
-  }
-  rpc: {
-    getBlockchainInfo(): Promise<{ chain: string; blocks: number; pruned: boolean }>
-    getZmqNotifications(): Promise<Array<{ type: string; address: string }>>
-  }
-  log?: Log
+  store: Pick<Store, 'memoryInfo' | 'maxmemoryPolicy'>
+  rpc: Pick<Rpc, 'getBlockchainInfo' | 'getZmqNotifications'>
 }
 
 export async function preflight(deps: PreflightDeps): Promise<void> {
-  const log = deps.log ?? consoleLog
-
   // 1. redis reachable + eviction policy must not silently delete watches
   const mem = await deps.store.memoryInfo() // throws if redis is unreachable — fatal
   log.info(CTX, `redis reachable (used ${(mem.usedBytes / 1024 / 1024).toFixed(1)} MB)`)

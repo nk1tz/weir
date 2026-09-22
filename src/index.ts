@@ -1,8 +1,8 @@
 /**
  * weir daemon entrypoint. Boot sequence per DESIGN.md "src/index.ts":
- *   loadConfig → Store.connect → preflight → reconcile → startZmq (rawtx → txHandler,
- *   rawblock → blockHandler, gap → reparser) → initial mempool reparse (async) →
- *   startHeartbeat → admin server when ADMIN_TOKEN is set.
+ *   loadConfig → Store.connect → preflight → reconcile (+ resolveLimbo) → startZmq
+ *   (rawtx → txHandler, rawblock → blockHandler, gap → reparser) → initial mempool
+ *   reparse (async) → startHeartbeat → admin server when ADMIN_TOKEN is set.
  * SIGINT/SIGTERM → close zmq, stop heartbeat, close admin, store.quit, exit 0.
  *
  * The startup banner never prints secrets: webhook target HOST only, and the RPC URL
@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadConfig } from './config'
-import { log } from './lib/log'
+import { describeError, log } from './lib/log'
 import { Store } from './store/redis'
 import { Rpc } from './bitcoin/rpc'
 import { startZmq } from './bitcoin/zmq'
@@ -27,25 +27,6 @@ import { reconcile } from './boot/reconcile'
 import { startAdminServer } from './admin/server'
 
 const CTX = 'index'
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
-}
-
-/** Mask credentials in a URL for log output. Handles passwords containing '@' (WHATWG
- *  parse, blank the userinfo) with a regex fallback for strings URL cannot parse. */
-function maskUrl(raw: string): string {
-  try {
-    const url = new URL(raw)
-    if (url.username !== '' || url.password !== '') {
-      url.username = '***'
-      url.password = ''
-    }
-    return url.toString()
-  } catch {
-    return raw.replace(/\/\/.*@/, '//***@')
-  }
-}
 
 /** Works from both src/ (tsx) and dist/ (node): ../package.json is the project root. */
 function packageVersion(): string {
@@ -72,33 +53,29 @@ async function main(): Promise<void> {
   const sink = new WebhookSink({
     url: cfg.webhookUrl,
     secret: cfg.webhookSecret,
-    maxRetries: cfg.webhookMaxRetries,
+    maxAttempts: cfg.webhookMaxRetries,
     timeoutMs: cfg.webhookTimeoutMs,
   })
 
   try {
     await store.connect()
   } catch (err) {
-    throw new Error(`redis connection failed (${maskUrl(cfg.redisUrl)}): ${errMsg(err)}`)
+    throw new Error(`redis connection failed (${new URL(cfg.redisUrl).host}): ${describeError(err)}`)
   }
   log.info(CTX, 'redis connected')
 
-  await preflight({ cfg, store, rpc, log })
+  await preflight({ cfg, store, rpc })
 
-  const processBlock = makeBlockProcessor({ cfg, store, rpc, sink, decodeBlock, log })
-  await reconcile({
-    store,
-    rpc,
-    processBlock,
-    // crash-recovery: adjudicate reorg-displaced txs even when there's nothing to catch up
-    resolveLimbo: () => resolveLimbo({ cfg, store, rpc, sink, log }),
-    log,
-  })
+  const processBlock = makeBlockProcessor({ cfg, store, rpc, sink, decodeBlock })
+  await reconcile({ store, rpc, processBlock })
+  // Crash-recovery: adjudicate reorg-displaced txs even when there was nothing to catch up
+  // (a crash between limbo-rewind and resolution). No-op when limbo is empty.
+  await resolveLimbo({ cfg, store, rpc, sink })
 
   const evaluate = makeTxEvaluator({ store, sink, cfg })
   const handleRawTx = makeRawTxHandler({ store, sink, cfg, decodeRawTx })
   const reparse = makeMempoolReparser({ rpc, store, cfg, decodeRawTx, evaluate })
-  const handleBlock = makeBlockHandler({ cfg, store, rpc, sink, decodeBlock, log })
+  const handleBlock = makeBlockHandler(processBlock)
 
   /** unix ms of the last block weir fully processed — feeds /health secondsSinceLastBlock */
   let lastBlockAt: number | null = null
@@ -117,11 +94,11 @@ async function main(): Promise<void> {
   // Initial mempool reparse — deliberately not awaited (spec: async). A failure here is an
   // unexpected internal error: log and crash, per DESIGN's error policy.
   reparse().catch((err: unknown) => {
-    log.error(CTX, `initial mempool reparse failed: ${errMsg(err)}`)
+    log.error(CTX, `initial mempool reparse failed: ${describeError(err)}`)
     process.exit(1)
   })
 
-  const heartbeat = startHeartbeat({ cfg, store, sink, log })
+  const heartbeat = startHeartbeat({ cfg, store, sink })
 
   let admin: { close(): Promise<void> } | null = null
   if (cfg.adminToken !== null) {
@@ -149,7 +126,7 @@ async function main(): Promise<void> {
       log.info(CTX, 'shutdown complete')
       process.exit(0)
     })().catch((err: unknown) => {
-      log.error(CTX, `shutdown failed: ${errMsg(err)}`)
+      log.error(CTX, `shutdown failed: ${describeError(err)}`)
       process.exit(1)
     })
   }
@@ -160,6 +137,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  log.error(CTX, `fatal: ${errMsg(err)}`)
+  log.error(CTX, `fatal: ${describeError(err)}`)
   process.exit(1)
 })

@@ -1,13 +1,13 @@
-import { MaturingRecord, Tip, WeirEvent } from '../src/lib/types'
+import type { DecodedBlock, DecodedTx, MaturingRecord, Tip, WeirEvent } from '../src/lib/types'
 
 /**
  * In-memory fakes for engine tests — no redis/bitcoind needed.
  *
- * FakeStore mirrors the full `src/store/redis.ts` Store surface from DESIGN.md,
- * including the hash-only record ops (putRecord/readRecord/deleteRecord) used to
- * persist pending-tx records at seen-time. All internal state is public so tests
- * can seed and assert directly. Values are cloned on the way in/out to mimic
- * redis serialization (no shared object aliasing between test and store).
+ * FakeStore mirrors the `src/store/redis.ts` Store surface and MUST match its
+ * semantics exactly (removeMaturing deletes index AND record; the ring is a ZSET
+ * member→score map, so two hashes can coexist at one height). All internal state
+ * is public so tests can seed and assert directly. Values are cloned on the way
+ * in/out to mimic redis serialization (no shared object aliasing).
  */
 export class FakeStore {
   // watches
@@ -30,14 +30,15 @@ export class FakeStore {
 
   // tip / ring
   tip: Tip | null = null
-  /** height -> blockHash */
-  ring = new Map<number, string>()
+  /** the `blocks` ZSET: member (blockHash) -> score (height); two hashes CAN share a height */
+  ring = new Map<string, number>()
 
   // maturing: zset index (mined txs only) + per-txid record hashes
   /** txid -> inclusion height; only mined txs are indexed here */
   maturingIndex = new Map<string, number>()
   /** txid -> record hash; exists from seen-time onward (putRecord) */
-  records = new Map<string, MaturingRecord>()
+  /** may hold a PARTIAL record (only `fired`) after setMaturingFired on a missing txid — HSET semantics */
+  records = new Map<string, Partial<MaturingRecord> & { txid: string }>()
 
   // meta (settable by tests)
   memory: { usedBytes: number; maxBytes: number | null } = { usedBytes: 0, maxBytes: null }
@@ -75,14 +76,20 @@ export class FakeStore {
     return { cursor: '0', addresses: [...this.watches] }
   }
 
+  /** ZRANGEBYSCORE order: by expiry ascending, ties by address lexicographically */
   async dueExpiries(nowMs: number): Promise<Array<{ address: string; expiresAtMs: number }>> {
     return [...this.expiries.entries()]
       .filter(([, at]) => at <= nowMs)
+      .sort(([aa, a], [ab, b]) => a - b || (aa < ab ? -1 : aa > ab ? 1 : 0))
       .map(([address, expiresAtMs]) => ({ address, expiresAtMs }))
   }
 
   async clearExpiry(addr: string): Promise<void> {
     this.expiries.delete(addr)
+  }
+
+  async getExpiry(addr: string): Promise<number | null> {
+    return this.expiries.get(addr) ?? null
   }
 
   // --- evaluated / pending ---
@@ -165,32 +172,38 @@ export class FakeStore {
     this.tip = { ...tip }
   }
 
-  async ringPut(height: number, hash: string): Promise<void> {
-    this.ring.set(height, hash)
-  }
-
-  async ringHashAt(height: number): Promise<string | null> {
-    return this.ring.get(height) ?? null
-  }
-
-  /** entries strictly above `height`, ascending */
-  async ringAbove(height: number): Promise<Array<{ height: number; hash: string }>> {
+  /** ZSET order: by score ascending, ties by member lexicographically (redis semantics). */
+  private ringSorted(): Array<{ height: number; hash: string }> {
     return [...this.ring.entries()]
-      .filter(([h]) => h > height)
-      .sort(([a], [b]) => a - b)
-      .map(([h, hash]) => ({ height: h, hash }))
+      .map(([hash, height]) => ({ height, hash }))
+      .sort((a, b) => a.height - b.height || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0))
   }
 
-  /** keep only the `keep` highest entries */
+  /** ZADD member=hash score=height — does NOT replace another hash at the same height */
+  async ringPut(height: number, hash: string): Promise<void> {
+    this.ring.set(hash, height)
+  }
+
+  /** ZRANGEBYSCORE h h → first member (lexicographic tie order), null when none */
+  async ringHashAt(height: number): Promise<string | null> {
+    return this.ringSorted().find((e) => e.height === height)?.hash ?? null
+  }
+
+  /** entries strictly above `height`, ascending by score */
+  async ringAbove(height: number): Promise<Array<{ height: number; hash: string }>> {
+    return this.ringSorted().filter((e) => e.height > height)
+  }
+
+  /** ZREMRANGEBYRANK 0 -(keep+1): keep only the `keep` highest-ranked entries */
   async ringPrune(keep: number): Promise<void> {
-    const heights = [...this.ring.keys()].sort((a, b) => b - a)
-    for (const h of heights.slice(keep)) this.ring.delete(h)
+    const sorted = this.ringSorted()
+    for (const e of sorted.slice(0, Math.max(0, sorted.length - keep))) this.ring.delete(e.hash)
   }
 
-  /** drop entries strictly above `height` (reorg rewind) */
+  /** ZREMRANGEBYSCORE (height +inf — drop every member scored strictly above `height` */
   async ringRemoveAbove(height: number): Promise<void> {
-    for (const h of [...this.ring.keys()]) {
-      if (h > height) this.ring.delete(h)
+    for (const [hash, h] of [...this.ring.entries()]) {
+      if (h > height) this.ring.delete(hash)
     }
   }
 
@@ -208,49 +221,59 @@ export class FakeStore {
     this.limbo.delete(txid)
   }
 
+  // --- record ops (hash-only; do NOT touch the maturing zset index) ---
+
+  /** persist a pending-tx record at seen-time (height 0, blockHash '') */
+  async putRecord(rec: MaturingRecord): Promise<void> {
+    this.records.set(rec.txid, structuredClone(rec))
+  }
+
+  /** like Store.readRecord: null when absent, THROWS on a partial (corrupt) hash */
+  async readRecord(txid: string): Promise<MaturingRecord | null> {
+    const rec = this.records.get(txid)
+    if (rec === undefined) return null
+    if (rec.height === undefined || rec.blockHash === undefined || rec.matched === undefined || rec.fired === undefined || rec.hex === undefined) {
+      throw new Error(`[fakes] corrupt maturing record for ${txid}: missing fields`)
+    }
+    return structuredClone(rec as MaturingRecord)
+  }
+
+  async deleteRecord(txid: string): Promise<void> {
+    this.records.delete(txid)
+  }
+
   // --- maturing ---
 
+  /** putRecord + index */
   async addMaturing(rec: MaturingRecord): Promise<void> {
     this.maturingIndex.set(rec.txid, rec.height)
     this.records.set(rec.txid, structuredClone(rec))
   }
 
-  async getMaturing(txid: string): Promise<MaturingRecord | null> {
-    const rec = this.records.get(txid)
-    return rec === undefined ? null : structuredClone(rec)
-  }
-
   /** ascending by inclusion height */
+  /** ZSET order: by height ascending, ties by txid lexicographically (redis semantics) */
   async maturingEntries(): Promise<Array<{ txid: string; height: number }>> {
     return [...this.maturingIndex.entries()]
-      .sort(([, a], [, b]) => a - b)
+      .sort(([ta, a], [tb, b]) => a - b || (ta < tb ? -1 : ta > tb ? 1 : 0))
       .map(([txid, height]) => ({ txid, height }))
   }
 
+  /** ZREM from the index only — the records stay (limbo transition); no-op on empty */
+  async unindexMaturing(txids: string[]): Promise<void> {
+    for (const t of txids) this.maturingIndex.delete(t)
+  }
+
+  /** HSET fired — on a missing txid this CREATES a partial hash, exactly like redis */
   async setMaturingFired(txid: string, fired: number[]): Promise<void> {
-    const rec = this.records.get(txid)
-    if (rec === undefined) throw new Error(`[fakes] setMaturingFired: no record for ${txid}`)
+    const rec = this.records.get(txid) ?? { txid }
     rec.fired = [...fired]
+    this.records.set(txid, rec)
   }
 
-  /** update zset score + record fields, reset fired to [] */
-  async moveMaturing(txid: string, newHeight: number, newBlockHash: string): Promise<void> {
-    const rec = this.records.get(txid)
-    if (rec === undefined) throw new Error(`[fakes] moveMaturing: no record for ${txid}`)
-    this.maturingIndex.set(txid, newHeight)
-    rec.height = newHeight
-    rec.blockHash = newBlockHash
-    rec.fired = []
-  }
-
+  /** deleteRecord + ZREM index — same as the real Store */
   async removeMaturing(txid: string): Promise<void> {
     this.maturingIndex.delete(txid)
     this.records.delete(txid)
-  }
-
-  /** ZREM from the index only — the record stays (limbo transition) */
-  async unindexMaturing(txid: string): Promise<void> {
-    this.maturingIndex.delete(txid)
   }
 
   /** wipe all tx tracking, keep watches/tip/ring; returns lost txids */
@@ -268,22 +291,6 @@ export class FakeStore {
     return [...lost]
   }
 
-  // --- record ops (hash-only; do NOT touch the maturing zset index) ---
-
-  /** persist a pending-tx record at seen-time (height 0, blockHash '') */
-  async putRecord(rec: MaturingRecord): Promise<void> {
-    this.records.set(rec.txid, structuredClone(rec))
-  }
-
-  async readRecord(txid: string): Promise<MaturingRecord | null> {
-    const rec = this.records.get(txid)
-    return rec === undefined ? null : structuredClone(rec)
-  }
-
-  async deleteRecord(txid: string): Promise<void> {
-    this.records.delete(txid)
-  }
-
   // --- meta ---
 
   async memoryInfo(): Promise<{ usedBytes: number; maxBytes: number | null }> {
@@ -296,98 +303,103 @@ export class FakeStore {
 }
 
 /**
- * Captures every deliver() attempt (success or failure) in `delivered`.
- * Set `deliverResult = false` to simulate webhook failure — deliver never throws,
- * matching the real WebhookSink contract.
+ * Captures every deliver() call in `attempts` and the successful ones in `delivered`.
+ * Simulate webhook failure with `deliverResult = false` (all events) or `failWhen`
+ * (per event). deliver never throws, matching the real WebhookSink contract.
  */
 export class FakeSink {
+  attempts: WeirEvent[] = []
   delivered: WeirEvent[] = []
   deliverResult = true
+  failWhen: (ev: WeirEvent) => boolean = () => false
 
   async deliver(event: WeirEvent): Promise<boolean> {
-    this.delivered.push(structuredClone(event))
-    return this.deliverResult
+    const ev = structuredClone(event)
+    this.attempts.push(ev)
+    if (!this.deliverResult || this.failWhen(ev)) return false
+    this.delivered.push(ev)
+    return true
   }
 }
 
+/** Address every test watches; `mkTx` pays it at vout 0. */
+export const ADDR = 'bcrt1qwatchedwatchedwatched'
+
+/** A decoded tx paying `address` (null = unrecognized script) at vout 0 plus an unwatched change output. */
+export function mkTx(txid: string, address: string | null = ADDR, valueSats = 5000): DecodedTx {
+  return {
+    txid,
+    hex: `hex-${txid}`,
+    outputs: [
+      { vout: 0, valueSats, address, scriptType: address ? 'p2wpkh' : null },
+      { vout: 1, valueSats: 111, address: 'bcrt1qchange', scriptType: 'p2wpkh' },
+    ],
+  }
+}
+
+export interface FakeBlock {
+  hash: string
+  prevHash: string
+  height: number
+  time: number
+  txs: DecodedTx[]
+}
+
 /**
- * Settable fake of src/bitcoin/rpc.ts Rpc. Seed `mempool`, `txs`, `headers`,
- * `blockHashByHeight`, `rawBlocks`, `bestBlockHash`, `blockCount` per test.
- * Missing headers/hashes/blocks throw, like a real RPC error would.
- * getMempoolEntry derives membership from `mempool`.
+ * Settable fake of bitcoind's chain view for block-pipeline tests: blocks by hash, the
+ * CURRENT main chain by height, the live mempool, and a matching Rpc subset. Raw block
+ * bytes are just the hash (see `raw`/`decode`), so no real serialization is needed.
  */
-export class FakeRpc {
+export class FakeChain {
+  blocks = new Map<string, FakeBlock>()
+  /** height → hash of the CURRENT main chain (what getblockhash answers) */
+  mainChain = new Map<number, string>()
   mempool: string[] = []
-  /** txid -> verbose result; absent txid → getRawTransactionVerbose returns null */
-  txs = new Map<string, { blockhash?: string; hex: string }>()
-  headers = new Map<string, { height: number; previousblockhash?: string; time: number }>()
-  blockHashByHeight = new Map<number, string>()
-  rawBlocks = new Map<string, Buffer>()
-  bestBlockHash = ''
-  blockCount = 0
-  blockchainInfo: { chain: string; blocks: number; pruned: boolean; pruneheight?: number } = {
-    chain: 'regtest',
-    blocks: 0,
-    pruned: false,
-  }
-  zmqNotifications: Array<{ type: string; address: string }> = [
-    { type: 'pubrawtx', address: 'tcp://127.0.0.1:28332' },
-    { type: 'pubrawblock', address: 'tcp://127.0.0.1:28332' },
-  ]
+  mempoolEntries = new Map<string, object>()
+  rawTxs = new Map<string, { blockhash?: string; hex: string }>()
+  getBlockHashCalls: number[] = []
+  pruned = false
+  pruneheight: number | undefined = undefined
 
-  async getBlockCount(): Promise<number> {
-    return this.blockCount
+  addBlock(b: FakeBlock, opts: { main?: boolean } = {}): FakeBlock {
+    this.blocks.set(b.hash, b)
+    if (opts.main !== false) this.mainChain.set(b.height, b.hash)
+    return b
   }
 
-  async getBestBlockHash(): Promise<string> {
-    return this.bestBlockHash
+  raw(hash: string): Buffer {
+    return Buffer.from(hash, 'utf8')
   }
 
-  async getBlockHash(height: number): Promise<string> {
-    const hash = this.blockHashByHeight.get(height)
-    if (hash === undefined) throw new Error(`[fakes] getBlockHash: no block at height ${height}`)
-    return hash
+  decode = (rawBuf: Buffer): DecodedBlock => {
+    const b = this.blocks.get(rawBuf.toString('utf8'))
+    if (!b) throw new Error(`decode: unknown block ${rawBuf.toString('utf8')}`)
+    return { hash: b.hash, prevHash: b.prevHash, time: b.time, txs: b.txs }
   }
 
-  async getBlockHeader(
-    hash: string,
-  ): Promise<{ height: number; previousblockhash?: string; time: number }> {
-    const header = this.headers.get(hash)
-    if (header === undefined) throw new Error(`[fakes] getBlockHeader: unknown hash ${hash}`)
-    return { ...header }
-  }
-
-  async getBlockRaw(hash: string): Promise<Buffer> {
-    const raw = this.rawBlocks.get(hash)
-    if (raw === undefined) throw new Error(`[fakes] getBlockRaw: unknown hash ${hash}`)
-    return raw
-  }
-
-  async getRawMempool(): Promise<string[]> {
-    return [...this.mempool]
-  }
-
-  async getRawTransactionVerbose(
-    txid: string,
-  ): Promise<{ blockhash?: string; hex: string } | null> {
-    const tx = this.txs.get(txid)
-    return tx === undefined ? null : { ...tx }
-  }
-
-  async getMempoolEntry(txid: string): Promise<object | null> {
-    return this.mempool.includes(txid) ? {} : null
-  }
-
-  async getBlockchainInfo(): Promise<{
-    chain: string
-    blocks: number
-    pruned: boolean
-    pruneheight?: number
-  }> {
-    return { ...this.blockchainInfo }
-  }
-
-  async getZmqNotifications(): Promise<Array<{ type: string; address: string }>> {
-    return this.zmqNotifications.map((n) => ({ ...n }))
+  rpc() {
+    return {
+      getBlockHeader: async (hash: string) => {
+        const b = this.blocks.get(hash)
+        if (!b) throw new Error(`getblockheader: unknown block ${hash}`)
+        return { height: b.height, previousblockhash: b.prevHash || undefined, time: b.time }
+      },
+      getBlockHash: async (height: number) => {
+        this.getBlockHashCalls.push(height)
+        const hash = this.mainChain.get(height)
+        if (!hash) throw new Error(`getblockhash: no main-chain block at height ${height}`)
+        return hash
+      },
+      getBlockRaw: async (hash: string) => this.raw(hash),
+      getRawMempool: async () => [...this.mempool],
+      getMempoolEntry: async (txid: string) => this.mempoolEntries.get(txid) ?? null,
+      getRawTransactionVerbose: async (txid: string) => this.rawTxs.get(txid) ?? null,
+      getBlockchainInfo: async () => ({
+        chain: 'regtest',
+        blocks: this.mainChain.size,
+        pruned: this.pruned,
+        pruneheight: this.pruneheight,
+      }),
+    }
   }
 }

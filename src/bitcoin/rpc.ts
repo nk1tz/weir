@@ -1,4 +1,4 @@
-import { log } from '../lib/log'
+import { describeError, log } from '../lib/log'
 
 const CTX = 'rpc'
 
@@ -33,18 +33,6 @@ class RpcError extends Error {
   }
 }
 
-function describe(err: unknown): string {
-  if (err instanceof AggregateError) {
-    const inner = err.errors.map((e) => (e instanceof Error ? e.message : String(e))).join('; ')
-    return err.message ? `${err.message}: ${inner}` : inner || 'AggregateError (no detail)'
-  }
-  if (err instanceof Error) {
-    // undici's fetch wraps the real network error ("connect ECONNREFUSED ...") in .cause
-    return err.cause !== undefined ? `${err.message}: ${describe(err.cause)}` : err.message
-  }
-  return String(err)
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -71,14 +59,11 @@ export class Rpc {
    * 'Unauthorized' immediately) and never retries JSON-RPC error responses
    * (throws RpcError with the node's code/message).
    */
-  private async call(method: string, params: unknown[] = []): Promise<unknown> {
-    const id = ++this.nextId
-    const body = JSON.stringify({ jsonrpc: '1.0', id, method, params })
-
-    let response: Response | null = null
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  /** POST with retry on network-level failure (fetch rejection); never retries an HTTP response. */
+  private async fetchWithRetry(method: string, body: string): Promise<Response> {
+    for (let attempt = 1; ; attempt++) {
       try {
-        response = await fetch(this.endpoint, {
+        return await fetch(this.endpoint, {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
@@ -86,22 +71,25 @@ export class Rpc {
           },
           body,
         })
-        break
       } catch (err) {
         if (attempt >= MAX_ATTEMPTS) {
-          log.error(CTX, `${method}: network failure after ${MAX_ATTEMPTS} attempts: ${describe(err)}`)
-          throw new Error(`rpc ${method} failed after ${MAX_ATTEMPTS} attempts: ${describe(err)}`, { cause: err })
+          log.error(CTX, `${method}: network failure after ${MAX_ATTEMPTS} attempts: ${describeError(err)}`)
+          throw new Error(`rpc ${method} failed after ${MAX_ATTEMPTS} attempts: ${describeError(err)}`, { cause: err })
         }
         const delayMs = BACKOFF_BASE_MS * 2 ** (attempt - 1)
         log.warn(
           CTX,
-          `${method}: network failure (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${delayMs}ms: ${describe(err)}`,
+          `${method}: network failure (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${delayMs}ms: ${describeError(err)}`,
         )
         await sleep(delayMs)
       }
     }
-    // Unreachable: the loop either breaks with a response or throws.
-    if (response === null) throw new Error(`${method}: no response`)
+  }
+
+  private async call(method: string, params: unknown[] = []): Promise<unknown> {
+    const id = ++this.nextId
+    const body = JSON.stringify({ jsonrpc: '1.0', id, method, params })
+    const response = await this.fetchWithRetry(method, body)
 
     if (response.status === 401 || response.status === 403) {
       log.error(CTX, `${method}: HTTP ${response.status} from node — bad RPC credentials`)
@@ -113,7 +101,7 @@ export class Rpc {
     try {
       parsed = JSON.parse(text) as JsonRpcResponse
     } catch (err) {
-      log.error(CTX, `${method}: HTTP ${response.status} with unparseable body: ${describe(err)}`)
+      log.error(CTX, `${method}: HTTP ${response.status} with unparseable body: ${describeError(err)}`)
       throw new Error(`${method}: HTTP ${response.status} with non-JSON body`)
     }
 
@@ -181,8 +169,13 @@ export class Rpc {
     }
   }
 
-  async getBlockchainInfo(): Promise<{ chain: string; blocks: number; pruned: boolean }> {
-    return (await this.call('getblockchaininfo')) as { chain: string; blocks: number; pruned: boolean }
+  async getBlockchainInfo(): Promise<{ chain: string; blocks: number; pruned: boolean; pruneheight?: number }> {
+    return (await this.call('getblockchaininfo')) as {
+      chain: string
+      blocks: number
+      pruned: boolean
+      pruneheight?: number
+    }
   }
 
   async getZmqNotifications(): Promise<Array<{ type: string; address: string }>> {

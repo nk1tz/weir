@@ -1,21 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { makeRawTxHandler, makeTxEvaluator } from '../src/engine/txPipeline'
 import { makeMempoolReparser } from '../src/engine/mempool'
-import { DecodedTx, TxEvent } from '../src/lib/types'
-import { FakeSink, FakeStore } from './fakes'
-
-const ADDR = 'bcrt1qwatchedwatchedwatched'
-
-function mkTx(txid: string, address: string | null = ADDR, valueSats = 5000): DecodedTx {
-  return {
-    txid,
-    hex: `hex-${txid}`,
-    outputs: [
-      { vout: 0, valueSats, address, scriptType: address ? 'p2wpkh' : null },
-      { vout: 1, valueSats: 111, address: 'bcrt1qchange', scriptType: 'p2wpkh' },
-    ],
-  }
-}
+import type { DecodedTx, TxEvent } from '../src/lib/types'
+import { ADDR, FakeSink, FakeStore, mkTx } from './fakes'
 
 function setup(overrides: { seenEnabled?: boolean } = {}) {
   const store = new FakeStore()
@@ -26,6 +13,14 @@ function setup(overrides: { seenEnabled?: boolean } = {}) {
 }
 
 describe('txPipeline', () => {
+  beforeAll(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+  afterAll(() => {
+    vi.restoreAllMocks()
+  })
+
   it('seen fires with ALL matched outputs, the right idempotency key, and persists record + pending + evaluated', async () => {
     const { store, sink, evaluate } = setup()
     store.watches.add(ADDR)
@@ -75,7 +70,8 @@ describe('txPipeline', () => {
     sink.deliverResult = true
     await evaluate(mkTx('tx1'))
     expect(store.pending.has('tx1')).toBe(true)
-    expect(sink.delivered.filter((e) => e.event === 'seen')).toHaveLength(2) // both attempts captured
+    expect(sink.attempts.filter((e) => e.event === 'seen')).toHaveLength(2) // both attempts captured
+    expect(sink.delivered.filter((e) => e.event === 'seen')).toHaveLength(1) // only the retry succeeded
   })
 
   it('seen disabled (no 0 milestone): tracks silently — evaluated + pending + record, nothing delivered', async () => {

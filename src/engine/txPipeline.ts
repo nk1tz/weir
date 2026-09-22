@@ -1,17 +1,16 @@
-import { DecodedTx, MaturingRecord, Network, TxEvent, WeirEvent } from '../lib/types'
+import type { DecodedTx, Network, TxEvent } from '../lib/types'
+import type { Store } from '../store/redis'
+import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
+import { log } from '../lib/log'
 import { matchTx } from './matcher'
+
+const CTX = 'txPipeline'
 
 /** Structural deps — tests pass in-memory fakes (tests/fakes.ts). */
 export interface TxEvaluatorDeps {
-  store: {
-    isEvaluated(txid: string): Promise<boolean>
-    markEvaluated(txid: string): Promise<void>
-    addPending(txid: string): Promise<void>
-    putRecord(rec: MaturingRecord): Promise<void>
-    watchedSubset(addresses: string[]): Promise<string[]>
-  }
-  sink: { deliver(event: WeirEvent): Promise<boolean> }
+  store: Pick<Store, 'isEvaluated' | 'markEvaluated' | 'addPending' | 'putRecord' | 'watchedSubset'>
+  sink: Sink
   cfg: { network: Network; seenEnabled: boolean }
 }
 
@@ -64,9 +63,7 @@ export function makeTxEvaluator(deps: TxEvaluatorDeps): (tx: DecodedTx) => Promi
       if (!delivered) {
         // Deliberately NOT marked evaluated: the next mempool reparse re-evaluates
         // this txid and retries the seen delivery.
-        console.warn(
-          `[warn] [txPipeline] seen delivery failed for ${tx.txid}; leaving un-evaluated for reparse retry`,
-        )
+        log.warn(CTX, `seen delivery failed for ${tx.txid}; leaving un-evaluated for reparse retry`)
         return
       }
     }

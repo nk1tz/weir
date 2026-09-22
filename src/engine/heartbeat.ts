@@ -4,36 +4,21 @@
  *
  * Spec: docs/DESIGN.md "src/engine/heartbeat.ts".
  */
-import { HeartbeatEvent, Network, Tip, WeirEvent } from '../lib/types'
+import type { HeartbeatEvent, Network } from '../lib/types'
+import type { Store } from '../store/redis'
+import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
-
-interface Log {
-  info(ctx: string, msg: string): void
-  warn(ctx: string, msg: string): void
-  error(ctx: string, msg: string): void
-}
-
-const consoleLog: Log = {
-  info: (ctx, msg) => console.log(`[info] [${ctx}] ${msg}`),
-  warn: (ctx, msg) => console.warn(`[warn] [${ctx}] ${msg}`),
-  error: (ctx, msg) => console.error(`[error] [${ctx}] ${msg}`),
-}
+import { describeError, log } from '../lib/log'
 
 const CTX = 'heartbeat'
 
 export interface HeartbeatDeps {
   cfg: { network: Network; heartbeatInterval: number }
-  store: {
-    getTip(): Promise<Tip | null>
-    watchCount(): Promise<number>
-    memoryInfo(): Promise<{ usedBytes: number; maxBytes: number | null }>
-  }
-  sink: { deliver(event: WeirEvent): Promise<boolean> }
-  log?: Log
+  store: Pick<Store, 'getTip' | 'watchCount' | 'memoryInfo'>
+  sink: Sink
 }
 
 export function startHeartbeat(deps: HeartbeatDeps): { stop(): void } {
-  const log = deps.log ?? consoleLog
   const intervalSec = deps.cfg.heartbeatInterval
   if (intervalSec === 0) {
     log.info(CTX, 'heartbeat disabled (HEARTBEAT_INTERVAL=0)')
@@ -65,11 +50,11 @@ export function startHeartbeat(deps: HeartbeatDeps): { stop(): void } {
     tick().catch((err) => {
       // Unexpected internal error (redis down, etc): log and crash — never swallow.
       // Rethrowing here becomes an unhandled rejection; docker restarts us safely.
-      log.error(CTX, `heartbeat tick failed: ${err instanceof Error ? err.message : String(err)}`)
+      log.error(CTX, `heartbeat tick failed: ${describeError(err)}`)
       throw err
     })
   }, intervalSec * 1000)
-  timer.unref?.()
+  timer.unref()
   log.info(CTX, `heartbeat every ${intervalSec}s`)
 
   return {

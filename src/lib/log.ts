@@ -31,3 +31,19 @@ export const log: {
     emit('error', ctx, msg)
   },
 }
+
+/**
+ * One-line description of any thrown value for log output. AggregateError (e.g.
+ * dual-stack ECONNREFUSED) has an empty .message — surface the inner ones; undici's
+ * fetch wraps the real network error ("connect ECONNREFUSED ...") in .cause — follow it.
+ */
+export function describeError(err: unknown): string {
+  if (err instanceof AggregateError) {
+    const inner = err.errors.map((e) => (e instanceof Error ? e.message : String(e))).join('; ')
+    return err.message ? `${err.message}: ${inner}` : inner || 'AggregateError (no detail)'
+  }
+  if (err instanceof Error) {
+    return err.cause !== undefined ? `${err.message}: ${describeError(err.cause)}` : err.message
+  }
+  return String(err)
+}

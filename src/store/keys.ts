@@ -1,4 +1,4 @@
-import { Network } from '../lib/types'
+import type { Network } from '../lib/types'
 
 /**
  * The complete redis footprint. `addresses` (and `expiries` alongside it) is the

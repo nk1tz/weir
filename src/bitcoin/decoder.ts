@@ -13,7 +13,7 @@
 import * as bitcoinjs from 'bitcoinjs-lib'
 import bs58check from 'bs58check'
 import { bech32, bech32m } from 'bech32'
-import { DecodedBlock, DecodedOutput, DecodedTx, Network, ScriptType } from '../lib/types'
+import type { DecodedBlock, DecodedOutput, DecodedTx, Network, ScriptType } from '../lib/types'
 
 interface AddressPrefixes {
   /** base58check version byte for p2pkh */

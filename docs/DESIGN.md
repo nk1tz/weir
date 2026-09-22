@@ -69,9 +69,20 @@ All engine modules take a `deps` object (structural typing) so tests can pass in
 NEVER swallow errors silently: webhook failures are handled per the rules below; unexpected
 internal errors log and crash (docker restarts us; boot reconciliation makes that safe).
 
+Deps are typed by picking from the real classes, never by hand-copying signatures:
+`store: Pick<Store, …>` / `rpc: Pick<Rpc, …>` (type-only imports) and
+`sink: Sink` (= `Pick<WebhookSink, 'deliver'>`, declared in src/delivery/webhook.ts). Logging
+is the single shared `log` from src/lib/log.ts — no module takes a logger dep. Tests
+substitute tests/fakes.ts (`FakeStore`, `FakeSink`, `FakeChain`), which MUST match the real
+classes' semantics exactly (e.g. `removeMaturing` deletes index AND record; the ring is a
+ZSET member→score map, so two hashes can coexist at one height); a signature mismatch is
+fixed in the fake, never in the real class.
+
 ### src/lib/log.ts
 `export const log: { info(ctx: string, msg: string): void; warn(...): void; error(...): void }`
 — single-line output `[level] [ctx] msg`, no colors dependency.
+`export function describeError(err: unknown): string` — the one error describer for log
+lines: joins AggregateError inner messages, follows `.cause` chains.
 
 ### src/lib/hmac.ts
 `export function signBody(secret: string, body: string, tSeconds: number): string` → full header value.
@@ -129,8 +140,8 @@ without await (fire-and-forget) but MUST be wrapped so rejections are logged, ne
 ### src/store/redis.ts
 `export class Store` wrapping `redis` v4 client. Constructor `(url: string, network: Network)`.
 `connect()/quit()`. Methods (all promise-returning; keys via `keysFor`):
-- watches: `isWatched(addr)`, `watchedSubset(addrs: string[]): Promise<string[]>` (pipelined
-  SISMEMBER — return ALL matches, do not bail on first), `addWatch(addr, expiresAtMs?: number)`,
+- watches: `isWatched(addr)`, `watchedSubset(addrs: string[]): Promise<string[]>` (one
+  SMISMEMBER — return ALL matches, do not bail on first), `addWatch(addr, expiresAtMs?: number)`,
   `removeWatch(addr): Promise<boolean>` (also ZREM expiries), `watchCount()`,
   `scanWatches(cursor: string): Promise<{cursor: string; addresses: string[]}>` (SSCAN, COUNT 1000),
   `dueExpiries(nowMs): Promise<Array<{address: string; expiresAtMs: number}>>`,
@@ -148,12 +159,12 @@ without await (fire-and-forget) but MUST be wrapped so rejections are logged, ne
   `ringHashAt(height): Promise<string | null>`, `ringAbove(height): Promise<Array<{height; hash}>>`,
   `ringPrune(keep: number)`, `ringRemoveAbove(height)` (ZREMRANGEBYSCORE — reorg rewind, keeps
   the one-hash-per-height invariant).
-- maturing: `addMaturing(rec: MaturingRecord)`, `getMaturing(txid): Promise<MaturingRecord | null>`,
+- maturing: `addMaturing(rec: MaturingRecord)` (putRecord + ZADD),
   `maturingEntries(): Promise<Array<{txid: string; height: number}>>`,
   `setMaturingFired(txid, fired: number[])`,
-  `moveMaturing(txid, newHeight, newBlockHash)` (update zset score + hash fields, reset fired to []),
-  `removeMaturing(txid)`, `unindexMaturing(txid)` (ZREM the index ONLY, record kept — the
-  maturing→limbo transition).
+  `removeMaturing(txid)` (deleteRecord + ZREM — callers do not deleteRecord again),
+  `unindexMaturing(txids: string[])` (ONE ZREM of the index ONLY, records kept — the
+  maturing→limbo transition; no-op on empty). Reading a maturing record is `readRecord`.
 - records (hash-only, exist from seen-time): `putRecord(rec)`, `readRecord(txid)`, `deleteRecord(txid)`.
 - limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`.
 - `clearTracking(): Promise<string[]>` — prune-window guard: wipe maturing index + records +
@@ -163,15 +174,18 @@ without await (fire-and-forget) but MUST be wrapped so rejections are logged, ne
   `maxmemoryPolicy(): Promise<string | null>` (CONFIG GET, null if CONFIG is blocked e.g. managed redis).
 
 ### src/delivery/webhook.ts
-`export class WebhookSink { constructor(cfg: {url; secret; maxRetries; timeoutMs}) ;
-deliver(event: WeirEvent): Promise<boolean> }` — serialize once, sign via hmac.ts, POST with
+`export class WebhookSink { constructor(cfg: {url; secret; maxAttempts; timeoutMs}) ;
+deliver(event: WeirEvent): Promise<boolean> }` (`maxAttempts` = `WEBHOOK_MAX_RETRIES`, mapped
+in index.ts) plus `export type Sink = Pick<WebhookSink, 'deliver'>` — serialize once, sign via hmac.ts, POST with
 `content-type: application/json` + `x-weir-signature`, retry per rules. Returns true on 2xx.
 Never throws.
 
 ### src/engine/matcher.ts
-`export async function matchTx(tx: DecodedTx, store: {watchedSubset(a: string[]): Promise<string[]>}): Promise<MatchedOutput[]>`
-— collect addresses from outputs, query watched subset, return ALL matched outputs (an address
-matched by 2 outputs yields 2 entries).
+`export function matchAgainst(tx: DecodedTx, watched: ReadonlySet<string>): MatchedOutput[]`
+— pure: return ALL outputs paying an address in `watched` (an address matched by 2 outputs
+yields 2 entries).
+`export async function matchTx(tx: DecodedTx, store: Pick<Store, 'watchedSubset'>): Promise<MatchedOutput[]>`
+— thin wrapper: collect addresses from outputs, `watchedSubset`, `matchAgainst`.
 
 ### src/engine/txPipeline.ts
 `export function makeTxEvaluator(deps): (tx: DecodedTx) => Promise<void>` and
@@ -209,12 +223,14 @@ no event at re-inclusion; milestones re-fire on the sweep with new-blockhash ide
   - getMempoolEntry non-null → emit `demoted` (confs 0, block fields = the OLD block,
     timestamp now), putRecord(height 0, blockHash '', fired []), addPending, SREM limbo;
   - else → emit `conflicted` (confs = last confirmed depth or 0, old block fields), full
-    cleanup (removePending/removeMaturing/deleteRecord/SREM limbo). Terminal.
+    cleanup (removePending/removeMaturing/SREM limbo). Terminal.
 Because limbo is durable, a crash anywhere in the sequence re-resolves on the next block/boot.
 
 ### src/engine/blockPipeline.ts
-`export function makeBlockHandler(deps): (raw: Buffer) => Promise<void>` plus
-`export function makeBlockProcessor(deps)` used by both ZMQ path and catch-up. Sequence for
+`export function makeBlockProcessor(deps): (raw: Buffer) => Promise<void>` used by both the ZMQ
+path and catch-up, plus `export function makeBlockHandler(processBlock): (raw: Buffer) => Promise<void>`
+which wraps that ONE processor in a serialization queue (index.ts builds a single processor
+and hands it to both reconcile and makeBlockHandler). Sequence for
 a block B (hash H, prev P, height h from getBlockHeader(H)):
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
    If P === tip.hash → connected. Else: findForkPoint (a pure gap yields empty disconnected);
@@ -226,9 +242,10 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    ancestor+1 .. h-1 via getBlockHash → getBlockRaw → process (in order, as NON-tip blocks),
    then B itself. After the OUTERMOST (tip) block completes: `resolveLimbo`.
 2. per connected block: decodeBlock → setBlockTxids → `pendingInBlock()` + `limboTxids()` →
-   for each block tx that matches the watch set (check EVERY block tx, not just pending ∩
-   block — a payment never seen in the mempool still confirms): build MaturingRecord from the
-   block's own decode. Limbo txid → re-inclusion: addMaturing + removeLimbo (no event).
+   resolve the block's DISTINCT output addresses with `watchedSubset` ONCE (chunked at 1000
+   addresses) → `matchAgainst` per tx: for each block tx that matches (check EVERY block tx,
+   not just pending ∩ block — a payment never seen in the mempool still confirms): build
+   MaturingRecord from the block's own decode. Limbo txid → re-inclusion: addMaturing + removeLimbo (no event).
    Pending txid → removePending + addMaturing. Neither → if not already maturing/evaluated:
    markEvaluated + addMaturing. A tracked tx that no longer matches any watch (watch removed
    mid-flight) ends tracking quietly.
@@ -245,7 +262,7 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    height 0 / blockHash '' — a dropped tx cannot be re-fetched from a pruned node. The
    `maturing` ZSET still only indexes MINED txs; the record exists from seen onward). After
    emitting: removePending, unmarkEvaluated (rebroadcast → seen can re-fire), deleteRecord.
-5. TTL sweep — TIP BLOCKS ONLY: dueExpiries(now) → emit `expired`, removeWatch, clearExpiry.
+5. TTL sweep — TIP BLOCKS ONLY: dueExpiries(now) → emit `expired`, removeWatch (also ZREMs the expiry).
 6. pruneEvaluated (tip only), setTip({hash: H, height: h}), ringPut, ringPrune(ringSize).
 Failed `confirmed` deliveries: do NOT add to fired → retried next block. Failed dropped/
 demoted/conflicted/expired: log warn, proceed (best-effort one-shots).
@@ -269,10 +286,11 @@ one-line log; throw Error (fatal) unless noted:
 ### src/boot/reconcile.ts
 `export async function reconcile(deps): Promise<void>` — tip = getTip(). If null: initialize
 tip/ring to current best block (getBestBlockHash + header; ringPut) — forward-only, no backfill.
-Else: node best = getBestBlockHash(); if same as tip.hash → done, but still run `resolveLimbo`
-(a crash between limbo-rewind and resolution must not leave displaced txs unadjudicated until
-the next block). Else: process blocks from tip → best via the blockPipeline's processor
-(handles gap, reorg, prune-window guard and limbo resolution via the same logic).
+Else: node best = getBestBlockHash(); if same as tip.hash → done. Else: process blocks from
+tip → best via the blockPipeline's processor (handles gap, reorg, prune-window guard and limbo
+resolution via the same logic). reconcile takes no limbo dep: index.ts calls `resolveLimbo`
+unconditionally right after `reconcile` returns (a crash between limbo-rewind and resolution
+must not leave displaced txs unadjudicated until the next block; no-op when limbo is empty).
 
 ### src/admin/server.ts
 `export function startAdminServer(deps): {close(): Promise<void>}` — node:http only, no
@@ -288,7 +306,7 @@ framework. Only constructed when adminToken set. Every route (except /health) re
 Reject bodies > 4KB. JSON errors as `{error: string}`.
 
 ### src/index.ts (integration)
-loadConfig → Store.connect → preflight → reconcile → startZmq (rawtx → txHandler, rawblock →
+loadConfig → Store.connect → preflight → reconcile → resolveLimbo → startZmq (rawtx → txHandler, rawblock →
 blockHandler, gap → reparser) → initial mempool reparse (async) → startHeartbeat → admin server
 if token. SIGINT/SIGTERM → close zmq, stop heartbeat, close admin, store.quit, exit 0.
 Log a startup banner: version, network, milestones, webhook target host, admin on/off.

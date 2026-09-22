@@ -1,16 +1,14 @@
-import { DecodedTx, Network } from '../lib/types'
+import type { DecodedTx, Network } from '../lib/types'
+import type { Rpc } from '../bitcoin/rpc'
+import type { Store } from '../store/redis'
+import { log } from '../lib/log'
+
+const CTX = 'mempool'
 
 /** Structural deps — tests pass in-memory fakes (tests/fakes.ts). */
 export interface MempoolReparserDeps {
-  rpc: {
-    getRawMempool(): Promise<string[]>
-    getRawTransactionVerbose(txid: string): Promise<{ blockhash?: string; hex: string } | null>
-  }
-  store: {
-    replaceCurrentMempool(txids: string[]): Promise<void>
-    newMempoolTxids(): Promise<string[]>
-    rotateMempool(): Promise<void>
-  }
+  rpc: Pick<Rpc, 'getRawMempool' | 'getRawTransactionVerbose'>
+  store: Pick<Store, 'replaceCurrentMempool' | 'newMempoolTxids' | 'rotateMempool'>
   cfg: { network: Network }
   decodeRawTx(raw: Buffer | string, network: Network): DecodedTx
   /** the txPipeline evaluator (makeTxEvaluator) */
@@ -49,7 +47,7 @@ export function makeMempoolReparser(deps: MempoolReparserDeps): () => Promise<vo
 
   return async function reparseMempool(): Promise<void> {
     if (running) {
-      console.log('[info] [mempool] reparse already running; skipping')
+      log.info(CTX, 'reparse already running; skipping')
       return
     }
     running = true

@@ -1,81 +1,58 @@
 /**
- * Reorg handling — the limbo model.
+ * Reorg handling — the limbo model. Spec: docs/DESIGN.md "src/engine/reorg.ts".
  *
- * On weir's target deployment (pruned node, NO txindex) there is no reliable way to ask
- * "which block is txid X in now?" at reorg time: getrawtransaction without a blockhash
- * only answers for mempool txs. So weir never adjudicates a displaced tx's fate at
- * detection time. Instead:
- *
- *   1. `enterLimboAndRewind` — every maturing tx included above the fork point moves to
- *      the persisted `limbo` SET (record kept, maturing index entry removed), the ring is
- *      truncated to the ancestor and the tip rewound to it. The replacement chain then
- *      processes as a plain connected walk (no second fork search, one hash per height).
- *   2. Re-inclusion is discovered NATURALLY: the block pipeline's promotion step matches
- *      each new block's txs; a limbo txid found in a new block re-enters maturing with a
- *      fresh height/blockHash and an empty fired list — milestones re-fire on the next
- *      sweep with new-blockhash idempotency keys. No event at re-inclusion itself.
- *   3. `resolveLimbo` — runs after the TIP block finishes (and at boot when there is
- *      nothing to catch up): whatever is still in limbo was NOT re-included, so probe the
- *      mempool: present → `demoted` (back to pending); absent → `conflicted` (terminal).
- *
- * The limbo SET is durable redis state, so a crash between rewind and resolution is safe:
- * the next boot's reconcile + resolveLimbo finishes the job.
- *
- * Spec: docs/DESIGN.md "src/engine/reorg.ts".
+ * INVARIANTS
+ * - Nothing is adjudicated at detection time: a pruned/no-txindex node cannot answer
+ *   "which block is txid X in now?". Displaced maturing txs go to the durable `limbo` SET
+ *   (record kept), the ring/tip rewind to the fork point, and the replacement chain then
+ *   processes as a plain connected walk (one hash per height, no second fork search).
+ * - Re-inclusion is discovered by the block pipeline's promotion step (no event; milestones
+ *   re-fire under the new blockHash). `resolveLimbo` runs only after the TIP block finishes
+ *   (and at boot), when the node's mempool reflects the new chain: present → demoted,
+ *   absent → conflicted (terminal).
+ * - Limbo is durable, so a crash between rewind and resolution re-resolves on the next
+ *   block or boot.
  */
-import { MaturingRecord, Network, TxEvent, WeirEvent } from '../lib/types'
+import type { Network, TxEvent } from '../lib/types'
+import type { Rpc } from '../bitcoin/rpc'
+import type { Store } from '../store/redis'
+import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
-
-export interface Log {
-  info(ctx: string, msg: string): void
-  warn(ctx: string, msg: string): void
-  error(ctx: string, msg: string): void
-}
-
-const consoleLog: Log = {
-  info: (ctx, msg) => console.log(`[info] [${ctx}] ${msg}`),
-  warn: (ctx, msg) => console.warn(`[warn] [${ctx}] ${msg}`),
-  error: (ctx, msg) => console.error(`[error] [${ctx}] ${msg}`),
-}
+import { log } from '../lib/log'
 
 const CTX = 'reorg'
 
-export interface ReorgStore {
-  ringHashAt(height: number): Promise<string | null>
-  ringAbove(height: number): Promise<Array<{ height: number; hash: string }>>
-  ringRemoveAbove(height: number): Promise<void>
-  setTip(tip: { hash: string; height: number }): Promise<void>
-  maturingEntries(): Promise<Array<{ txid: string; height: number }>>
-  unindexMaturing(txid: string): Promise<void>
-  removeMaturing(txid: string): Promise<void>
-  addLimbo(txids: string[]): Promise<void>
-  limboTxids(): Promise<string[]>
-  removeLimbo(txid: string): Promise<void>
-  addPending(txid: string): Promise<void>
-  removePending(txid: string): Promise<void>
-  /** hash-only record ops: pending/maturing tx records live in maturing:{txid} from seen-time */
-  putRecord(rec: MaturingRecord): Promise<void>
-  readRecord(txid: string): Promise<MaturingRecord | null>
-  deleteRecord(txid: string): Promise<void>
-}
+export type ReorgStore = Pick<
+  Store,
+  | 'ringHashAt'
+  | 'ringAbove'
+  | 'ringRemoveAbove'
+  | 'setTip'
+  | 'maturingEntries'
+  | 'unindexMaturing'
+  | 'removeMaturing'
+  | 'addLimbo'
+  | 'limboTxids'
+  | 'removeLimbo'
+  | 'addPending'
+  | 'removePending'
+  | 'putRecord'
+  | 'readRecord'
+  | 'deleteRecord'
+>
 
-export interface ReorgRpc {
-  getBlockHeader(hash: string): Promise<{ height: number; previousblockhash?: string; time: number }>
-  getMempoolEntry(txid: string): Promise<object | null>
-}
+export type ReorgRpc = Pick<Rpc, 'getBlockHeader' | 'getMempoolEntry'>
 
 export interface ForkPointDeps {
   store: Pick<ReorgStore, 'ringAbove' | 'ringHashAt'>
   rpc: Pick<ReorgRpc, 'getBlockHeader'>
-  log?: Log
 }
 
 export interface ReorgDeps {
   cfg: { network: Network }
   store: ReorgStore
   rpc: ReorgRpc
-  sink: { deliver(event: WeirEvent): Promise<boolean> }
-  log?: Log
+  sink: Sink
 }
 
 /**
@@ -90,9 +67,8 @@ export async function findForkPoint(
   incomingPrevHash: string,
   incomingHeight: number,
 ): Promise<{ ancestorHeight: number; disconnected: Array<{ height: number; hash: string }> }> {
-  const log = deps.log ?? consoleLog
-  // Snapshot the whole ring once: gives us per-height hashes plus the lower bound of the walk.
-  const ring = (await deps.store.ringAbove(0)).slice().sort((a, b) => a.height - b.height)
+  // Snapshot the whole ring once (ascending): per-height hashes plus the walk's lower bound.
+  const ring = await deps.store.ringAbove(0)
   if (ring.length === 0) {
     log.error(CTX, 'ring is empty during fork-point search — cannot detect reorg, treating incoming block as connected')
     return { ancestorHeight: incomingHeight - 1, disconnected: [] }
@@ -108,9 +84,8 @@ export async function findForkPoint(
     }
     const header = await deps.rpc.getBlockHeader(hash)
     if (!header.previousblockhash) break // genesis — nothing further back
-    const nextHeight = Math.min(height - 1, header.height - 1) // guarantee progress
     hash = header.previousblockhash
-    height = nextHeight
+    height = height - 1
   }
 
   log.error(
@@ -127,15 +102,13 @@ export async function findForkPoint(
  * tip to it. After this the replacement chain connects like an ordinary gap walk.
  */
 export async function enterLimboAndRewind(deps: ReorgDeps, ancestorHeight: number): Promise<void> {
-  const log = deps.log ?? consoleLog
   const displaced = (await deps.store.maturingEntries()).filter((e) => e.height > ancestorHeight)
 
   if (displaced.length > 0) {
-    await deps.store.addLimbo(displaced.map((e) => e.txid))
-    for (const { txid } of displaced) {
-      await deps.store.unindexMaturing(txid)
-    }
-    log.warn(CTX, `${displaced.length} maturing tx(s) displaced by reorg → limbo: ${displaced.map((e) => e.txid).join(', ')}`)
+    const txids = displaced.map((e) => e.txid)
+    await deps.store.addLimbo(txids)
+    await deps.store.unindexMaturing(txids)
+    log.warn(CTX, `${displaced.length} maturing tx(s) displaced by reorg → limbo: ${txids.join(', ')}`)
   }
 
   const ancestorHash = await deps.store.ringHashAt(ancestorHeight)
@@ -154,7 +127,6 @@ export async function enterLimboAndRewind(deps: ReorgDeps, ancestorHeight: numbe
  * Mempool probe is now trustworthy — bitcoind has fully switched to the new chain.
  */
 export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
-  const log = deps.log ?? consoleLog
   const leftover = await deps.store.limboTxids()
   if (leftover.length === 0) return
   const net = deps.cfg.network
@@ -211,8 +183,7 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
     const ok = await deps.sink.deliver(ev)
     if (!ok) log.warn(CTX, `conflicted delivery failed for ${txid} — best-effort one-shot, proceeding`)
     await deps.store.removePending(txid)
-    await deps.store.removeMaturing(txid)
-    await deps.store.deleteRecord(txid)
+    await deps.store.removeMaturing(txid) // deletes the record too
     await deps.store.removeLimbo(txid)
     log.info(CTX, `conflicted ${txid} (was ${rec.blockHash}@${rec.height}) — tracking ended`)
   }

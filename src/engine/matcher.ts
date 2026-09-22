@@ -1,24 +1,12 @@
-import { DecodedTx, MatchedOutput } from '../lib/types'
+import type { DecodedTx, MatchedOutput } from '../lib/types'
+import type { Store } from '../store/redis'
 
 /**
- * Match a decoded transaction's outputs against the watch set.
- *
- * Collects the distinct addresses present in the outputs, asks the store which
- * of them are watched (single pipelined round-trip), then returns ALL matched
- * outputs — an address paid by two outputs yields two entries.
+ * Pure match of a decoded transaction's outputs against an already-resolved watched
+ * set. Returns ALL matched outputs — an address paid by two outputs yields two entries.
  */
-export async function matchTx(
-  tx: DecodedTx,
-  store: { watchedSubset(addresses: string[]): Promise<string[]> },
-): Promise<MatchedOutput[]> {
-  const addresses = [
-    ...new Set(tx.outputs.map((o) => o.address).filter((a): a is string => a !== null)),
-  ]
-  if (addresses.length === 0) return []
-
-  const watched = new Set(await store.watchedSubset(addresses))
+export function matchAgainst(tx: DecodedTx, watched: ReadonlySet<string>): MatchedOutput[] {
   if (watched.size === 0) return []
-
   const matched: MatchedOutput[] = []
   for (const out of tx.outputs) {
     if (out.address !== null && watched.has(out.address)) {
@@ -26,4 +14,16 @@ export async function matchTx(
     }
   }
   return matched
+}
+
+/**
+ * Match one transaction against the watch set: collect its distinct output addresses,
+ * ask the store which of them are watched (one round trip), then `matchAgainst`.
+ */
+export async function matchTx(tx: DecodedTx, store: Pick<Store, 'watchedSubset'>): Promise<MatchedOutput[]> {
+  const addresses = [
+    ...new Set(tx.outputs.map((o) => o.address).filter((a): a is string => a !== null)),
+  ]
+  if (addresses.length === 0) return []
+  return matchAgainst(tx, new Set(await store.watchedSubset(addresses)))
 }

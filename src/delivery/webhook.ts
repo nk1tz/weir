@@ -1,15 +1,18 @@
-import { WeirEvent } from '../lib/types'
+import type { WeirEvent } from '../lib/types'
 import { signBody } from '../lib/hmac'
-import { log } from '../lib/log'
+import { describeError, log } from '../lib/log'
 
 export interface WebhookSinkConfig {
   url: string
   secret: string
-  /** total attempts (not extra retries) */
-  maxRetries: number
+  /** total attempts (not extra retries); config field webhookMaxRetries / env WEBHOOK_MAX_RETRIES */
+  maxAttempts: number
   /** per-request timeout, enforced via AbortController */
   timeoutMs: number
 }
+
+/** What every module needs from the sink — engine deps type `sink` as this. */
+export type Sink = Pick<WebhookSink, 'deliver'>
 
 const BACKOFF_BASE_MS = 500
 const JITTER_MAX_MS = 250
@@ -18,16 +21,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function errMsg(err: unknown): string {
-  if (err instanceof Error) return err.cause instanceof Error ? `${err.message}: ${err.cause.message}` : err.message
-  return String(err)
-}
-
 /**
  * POSTs signed events to the configured webhook URL.
  *
  * - Body is serialized exactly once; each attempt is re-signed with the current unix seconds.
- * - Retries up to `maxRetries` attempts total, backoff 500ms * 2^n + jitter between attempts.
+ * - Retries up to `maxAttempts` attempts total, backoff 500ms * 2^n + jitter between attempts.
  * - `redirect: 'manual'` so a signed body is never re-POSTed to a redirect target.
  * - Returns true on any 2xx; false when attempts are exhausted. NEVER throws.
  */
@@ -39,17 +37,17 @@ export class WebhookSink {
   }
 
   async deliver(event: WeirEvent): Promise<boolean> {
-    const { url, secret, maxRetries, timeoutMs } = this.cfg
+    const { url, secret, maxAttempts, timeoutMs } = this.cfg
 
     let body: string
     try {
       body = JSON.stringify(event)
     } catch (err) {
-      log.error('webhook', `failed to serialize event ${event.event}: ${errMsg(err)}`)
+      log.error('webhook', `failed to serialize event ${event.event}: ${describeError(err)}`)
       return false
     }
 
-    const attempts = Math.max(1, maxRetries)
+    const attempts = Math.max(1, maxAttempts)
     for (let attempt = 1; attempt <= attempts; attempt++) {
       if (attempt > 1) {
         const backoff = BACKOFF_BASE_MS * 2 ** (attempt - 2) + Math.floor(Math.random() * JITTER_MAX_MS)
@@ -70,11 +68,11 @@ export class WebhookSink {
           redirect: 'manual',
           signal: controller.signal,
         })
-        // Drain the response so the connection can be reused; a drain failure is
+        // Cancel the unread response body so the socket is released; a cancel failure is
         // inconsequential to delivery status but is still logged.
         if (res.body) {
           void res.body.cancel().catch((err: unknown) => {
-            log.warn('webhook', `response body drain failed: ${errMsg(err)}`)
+            log.warn('webhook', `response body cancel failed: ${describeError(err)}`)
           })
         }
         if (res.status >= 200 && res.status < 300) return true
@@ -85,7 +83,7 @@ export class WebhookSink {
       } catch (err) {
         log.warn(
           'webhook',
-          `attempt ${attempt}/${attempts} failed: ${errMsg(err)} (event=${event.event}, key=${event.idempotencyKey})`,
+          `attempt ${attempt}/${attempts} failed: ${describeError(err)} (event=${event.event}, key=${event.idempotencyKey})`,
         )
       } finally {
         clearTimeout(timer)
