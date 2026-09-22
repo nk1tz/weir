@@ -1,5 +1,28 @@
 # Roadmap
 
+## v0.2 execution sequence (decided 2026-09-22)
+
+Five independent reviews (two fresh-eyes, Codex, Kimi K3, driver) agreed: the core
+design earns its keep; the plumbing is duplicated; state transitions and the edges are
+under-tested, with real bugs in that gap. Order of work:
+
+1. **Consolidation** — zero behavior change. One `FakeStore`, one matcher with one
+   `SMISMEMBER` per block, one logger, one error-describer, `Pick<>` deps, delete dead
+   store methods and double cleanup, trim spec-narrating docblocks.
+2. **Standalone bug fixes**, each with a test: reparse retry (`current − evaluated`,
+   drop `previous`), 413 must actually respond, `?cursor=abc` → 400, `ringAbove(0)`
+   exclusive at height 0, drop the `evaluated` gate in block promotion and make
+   promotion one MULTI, one fatal-error policy.
+3. **Regtest smoke** — real bitcoind + redis, one payment, `seen` → `confirmed`.
+4. **Outbox** — every state transition is one Store method that mutates + enqueues
+   atomically; nothing awaits the network inside a transition. Fixes the `seen`/block
+   race structurally. Retries, bounded DLQ, delivery decoupled from block processing.
+5. **Outpoint tracking** and **chain-lag `/live` `/ready` `/metrics`** — in parallel.
+6. **Full regtest E2E** — reorg via `invalidateblock`, restart mid-flight, webhook down
+   during a reorg. This is the v0.2 gate.
+
+Known bugs (from the reviews) are tracked against steps 2 and 4 above.
+
 ## Gate before any of this: regtest end-to-end
 
 Run weir against a real bitcoind + redis on regtest. Watch an address, send, mine,
