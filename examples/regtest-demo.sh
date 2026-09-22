@@ -23,7 +23,7 @@ cd "$(dirname "$0")/.."
 step() { printf '\n== %s\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
 
-bcli() { docker compose exec -T bitcoind bitcoin-cli "$@"; }
+bcli() { docker compose exec -T bitcoind bitcoin-cli -conf=/etc/bitcoin/bitcoin.conf "$@"; }
 rcli() { docker compose exec -T redis redis-cli "$@"; }
 
 if [[ ! -f .env ]]; then

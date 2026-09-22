@@ -68,7 +68,7 @@ there, change it here.)
 Back in the first terminal. An alias saves typing:
 
 ```console
-$ alias btc='docker compose exec bitcoind bitcoin-cli -regtest -rpcuser=weir -rpcpassword=weir'
+$ alias btc='docker compose exec bitcoind bitcoin-cli -conf=/etc/bitcoin/bitcoin.conf -regtest -rpcuser=weir -rpcpassword=weir'
 $ btc createwallet demo
 {
   "name": "demo"

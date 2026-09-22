@@ -13,7 +13,9 @@ under-tested, with real bugs in that gap. Order of work:
    drop `previous`), 413 must actually respond, `?cursor=abc` → 400, `ringAbove(0)`
    exclusive at height 0, drop the `evaluated` gate in block promotion and make
    promotion one MULTI, one fatal-error policy.
-3. **Regtest smoke** — real bitcoind + redis, one payment, `seen` → `confirmed`.
+3. **Regtest smoke** — DONE 2026-09-22: real bitcoind + redis, one payment: `seen` →
+   `confirmed:1` → `confirmed:3`, all HMAC-verified by examples/catch.js; boot-time gap walk
+   caught up 101 blocks. Found and fixed two compose/script bugs (conf mount, bitcoin-cli -conf).
 4. **Outbox** — every state transition is one Store method that mutates + enqueues
    atomically; nothing awaits the network inside a transition. Fixes the `seen`/block
    race structurally. Retries, bounded DLQ, delivery decoupled from block processing.

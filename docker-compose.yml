@@ -33,8 +33,12 @@ services:
     image: bitcoin/bitcoin:28
     profiles:
       - regtest
+    # The image's entrypoint chowns the whole datadir; a read-only file mounted INSIDE it
+    # makes that chown fail and the container exit. So the conf lives outside the datadir
+    # and is passed with -conf. The datadir itself is a named volume the entrypoint owns.
+    command: ["bitcoind", "-conf=/etc/bitcoin/bitcoin.conf", "-datadir=/home/bitcoin/.bitcoin"]
     volumes:
-      - ./docker/bitcoin-regtest.conf:/home/bitcoin/.bitcoin/bitcoin.conf:ro
+      - ./docker/bitcoin-regtest.conf:/etc/bitcoin/bitcoin.conf:ro
       - bitcoind-data:/home/bitcoin/.bitcoin
     restart: unless-stopped
 
