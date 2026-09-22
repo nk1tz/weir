@@ -25,7 +25,7 @@ const CTX = 'reorg'
 export type ReorgStore = Pick<
   Store,
   | 'ringHashAt'
-  | 'ringAbove'
+  | 'ringAll'
   | 'ringRemoveAbove'
   | 'setTip'
   | 'maturingEntries'
@@ -34,9 +34,8 @@ export type ReorgStore = Pick<
   | 'addLimbo'
   | 'limboTxids'
   | 'removeLimbo'
-  | 'addPending'
+  | 'demoteToPending'
   | 'removePending'
-  | 'putRecord'
   | 'readRecord'
   | 'deleteRecord'
 >
@@ -44,7 +43,7 @@ export type ReorgStore = Pick<
 export type ReorgRpc = Pick<Rpc, 'getBlockHeader' | 'getMempoolEntry'>
 
 export interface ForkPointDeps {
-  store: Pick<ReorgStore, 'ringAbove' | 'ringHashAt'>
+  store: Pick<ReorgStore, 'ringAll' | 'ringHashAt'>
   rpc: Pick<ReorgRpc, 'getBlockHeader'>
 }
 
@@ -68,7 +67,8 @@ export async function findForkPoint(
   incomingHeight: number,
 ): Promise<{ ancestorHeight: number; disconnected: Array<{ height: number; hash: string }> }> {
   // Snapshot the whole ring once (ascending): per-height hashes plus the walk's lower bound.
-  const ring = await deps.store.ringAbove(0)
+  // ringAll, not a range above 0: a fresh regtest ring holds genesis at height 0.
+  const ring = await deps.store.ringAll()
   if (ring.length === 0) {
     log.error(CTX, 'ring is empty during fork-point search — cannot detect reorg, treating incoming block as connected')
     return { ancestorHeight: incomingHeight - 1, disconnected: [] }
@@ -157,10 +157,9 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
       }
       const ok = await deps.sink.deliver(ev)
       if (!ok) log.warn(CTX, `demoted delivery failed for ${txid} — best-effort one-shot, proceeding`)
-      // Return the tx to the pending pool; keep its record available (height 0 = unmined).
-      await deps.store.putRecord({ ...rec, height: 0, blockHash: '', fired: [] })
-      await deps.store.addPending(txid)
-      await deps.store.removeLimbo(txid)
+      // One MULTI: record back to height 0, pending, evaluated (so the next reparse does not
+      // re-fire `seen` — the tip prune forgot it when it was mined), out of limbo.
+      await deps.store.demoteToPending(rec)
       log.info(CTX, `demoted ${txid} (was ${rec.blockHash}@${rec.height}) — back to pending`)
       continue
     }

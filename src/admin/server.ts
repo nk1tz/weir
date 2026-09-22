@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { Network } from '../lib/types'
 import type { Store } from '../store/redis'
-import { describeError, log } from '../lib/log'
+import { describeError, fatal, log } from '../lib/log'
 
 const MAX_BODY_BYTES = 4096
 /** ttl upper bound: 10 years in seconds */
@@ -27,11 +27,12 @@ export interface AdminDeps {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, payload: unknown): void {
+function sendJson(res: ServerResponse, status: number, payload: unknown, extraHeaders: Record<string, string> = {}): void {
   const body = JSON.stringify(payload)
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(body),
+    ...extraHeaders,
   })
   res.end(body)
 }
@@ -48,22 +49,25 @@ function authorized(req: IncomingMessage, token: string): boolean {
   return timingSafeEqual(a, b)
 }
 
-/** Resolves to the body buffer, or null when the body exceeds maxBytes. */
+/**
+ * Resolves to the body buffer, or null when the body exceeds maxBytes. On overflow the
+ * socket is deliberately NOT destroyed here — that would reset the connection before the
+ * caller's 413 is written. Instead buffering stops (later chunks are drained and dropped)
+ * and the caller answers 413 with `connection: close`; Node then ends the socket right
+ * after the response flushes, which also cuts off an endless chunked upload.
+ */
 function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer | null> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let total = 0
     let done = false
     req.on('data', (chunk: Buffer) => {
-      if (done) return
+      if (done) return // overflowed: drain without buffering
       total += chunk.length
       if (total > maxBytes) {
         done = true
+        chunks.length = 0
         resolve(null)
-        // Cut the connection: without this the server keeps draining an oversized
-        // (possibly endless chunked) upload for the full request timeout after
-        // having already answered 413.
-        req.destroy()
         return
       }
       chunks.push(chunk)
@@ -89,7 +93,7 @@ function requireAdminToken(token: string | null): string {
   return token
 }
 
-export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
+export function startAdminServer(deps: AdminDeps): { close(): Promise<void>; port: Promise<number> } {
   const token = requireAdminToken(deps.config.adminToken)
 
   async function handleHealth(res: ServerResponse): Promise<void> {
@@ -128,7 +132,9 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
   async function handleCreateWatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await readBody(req, MAX_BODY_BYTES)
     if (body === null) {
-      sendJson(res, 413, { error: `body exceeds ${MAX_BODY_BYTES} byte limit` })
+      // `connection: close` makes Node end the socket once this response has flushed
+      // (see readBody) — the client reads a real 413 instead of ECONNRESET.
+      sendJson(res, 413, { error: `body exceeds ${MAX_BODY_BYTES} byte limit` }, { connection: 'close' })
       return
     }
     let parsed: unknown
@@ -179,6 +185,10 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
 
   async function handleListWatches(res: ServerResponse, url: URL): Promise<void> {
     const cursor = url.searchParams.get('cursor') ?? '0'
+    if (!/^\d+$/.test(cursor)) {
+      sendJson(res, 400, { error: 'cursor must be a non-negative integer string (from a previous page, or "0")' })
+      return
+    }
     const page = await deps.store.scanWatches(cursor)
     sendJson(res, 200, { addresses: page.addresses, cursor: page.cursor })
   }
@@ -243,16 +253,24 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void> } {
     })
   })
 
-  server.on('error', (err) => {
-    log.error('admin', `server error: ${describeError(err)}`)
-    throw err // fatal by design: docker restarts us
-  })
+  // A server-level error (listen failure such as EADDRINUSE) has no request to answer with
+  // a 500 — it is a background failure, so it takes the one fatal exit path. Per-request
+  // failures are answered 500 above and never crash the daemon.
+  server.on('error', (err) => fatal('admin', err))
 
-  server.listen(deps.config.adminPort, () => {
-    log.info('admin', `listening on :${deps.config.adminPort}`)
+  // Resolves with the BOUND port once listening (adminPort 0 = ephemeral, used by tests).
+  // Never rejects: a listen failure surfaces through the server 'error' handler above.
+  const port = new Promise<number>((resolve) => {
+    server.listen(deps.config.adminPort, () => {
+      const addr = server.address()
+      const bound = typeof addr === 'object' && addr !== null ? addr.port : deps.config.adminPort
+      log.info('admin', `listening on :${bound}`)
+      resolve(bound)
+    })
   })
 
   return {
+    port,
     close(): Promise<void> {
       return new Promise((resolve, reject) => {
         server.closeAllConnections()

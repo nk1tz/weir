@@ -42,8 +42,8 @@ See `keysFor()`. Public: `addresses` SET (+ `expiries` ZSET member=address score
 Durable chain view: `tip` HASH {hash,height}; `blocks` ZSET (member=hash, score=height,
 pruned to `ringSize`); `maturing` ZSET (member=txid, score=inclusion height);
 `maturing:{txid}` HASH {height, blockHash, matched(JSON), fired(JSON array), hex}.
-Working set (reconstructible): `pending`, `evaluated`, `mempool:previous`, `mempool:current`,
-`mempool:postBlock`, `blockTxids` — all SETs of txids.
+Working set (reconstructible): `pending`, `evaluated`, `mempool:current`, `mempool:postBlock`,
+`blockTxids` — all SETs of txids.
 Reorg state (durable): `limbo` SET — txids whose inclusion block was disconnected by a reorg,
 awaiting re-resolution (re-included by the new chain / demoted to mempool / conflicted). Kept
 in redis so a crash mid-reorg finishes resolving on the next block or boot.
@@ -66,8 +66,21 @@ attempts, per-request timeout `WEBHOOK_TIMEOUT_MS` via AbortController.
 ## Module map and contracts
 
 All engine modules take a `deps` object (structural typing) so tests can pass in-memory fakes.
-NEVER swallow errors silently: webhook failures are handled per the rules below; unexpected
-internal errors log and crash (docker restarts us; boot reconciliation makes that safe).
+NEVER swallow errors silently. ONE fatal-error policy for BACKGROUND paths: an UNEXPECTED
+error on a path where nobody is waiting for an answer — where a swallowed error would be a
+silent stall — crashes the process through `fatal()` (src/lib/log.ts — logs message + stack,
+`process.exit(1)`); docker restarts the daemon and boot reconciliation (reconcile →
+resolveLimbo → mempool reparse) heals. Fatal sites: the ZMQ subscriber loop failing or ANY
+ZMQ handler rejecting (rawtx, rawblock, gap-triggered reparse), a heartbeat tick rejecting,
+the initial mempool reparse rejecting, a block that fails to process (makeBlockHandler — no
+"skip the failed block and keep the queue alive"), the redis client giving up reconnecting
+or ending unasked (src/store/redis.ts), the admin server's `'error'` event (listen failure),
+and boot/shutdown failures. Every abnormal exit goes through `fatal`; a clean shutdown exits 0.
+REQUEST/RESPONSE paths are different: a failed admin request is answered `500 {error}` and
+the daemon keeps running — the request has a natural error channel, and a failed request
+does not imply corrupted engine state. Webhook delivery failures are NEVER fatal either:
+`deliver` returns a boolean and each event type has a documented retry or best-effort
+one-shot rule below.
 
 Deps are typed by picking from the real classes, never by hand-copying signatures:
 `store: Pick<Store, …>` / `rpc: Pick<Rpc, …>` (type-only imports) and
@@ -83,6 +96,8 @@ fixed in the fake, never in the real class.
 — single-line output `[level] [ctx] msg`, no colors dependency.
 `export function describeError(err: unknown): string` — the one error describer for log
 lines: joins AggregateError inner messages, follows `.cause` chains.
+`export function fatal(ctx: string, err: unknown): never` — the one fatal-error exit: logs
+`describeError(err)` plus the stack when present at error level, then `process.exit(1)`.
 
 ### src/lib/hmac.ts
 `export function signBody(secret: string, body: string, tSeconds: number): string` → full header value.
@@ -135,7 +150,8 @@ Methods: `getBlockCount(): Promise<number>`, `getBestBlockHash(): Promise<string
 onRawBlock: (buf: Buffer) => void; onTxGap: () => void }): Promise<{ close(): Promise<void> }>`
 — zeromq v6 Subscriber, topics `rawtx` + `rawblock`, sequence tracking per topic; a rawtx
 sequence gap calls `onTxGap()` (fires once per gap, not per message). Handlers are invoked
-without await (fire-and-forget) but MUST be wrapped so rejections are logged, never unhandled.
+without await (fire-and-forget) but MUST be wrapped so a rejection is `fatal` — never
+unhandled, never swallowed. A subscriber-loop failure (other than close()) is fatal too.
 
 ### src/store/redis.ts
 `export class Store` wrapping `redis` v4 client. Constructor `(url: string, network: Network)`.
@@ -151,27 +167,42 @@ without await (fire-and-forget) but MUST be wrapped so rejections are logged, ne
   `addPending(txid)`, `removePending(txid)`, `pendingTxids(): Promise<string[]>`.
 - block/mempool bookkeeping: `setBlockTxids(txids)`, `pendingInBlock(): Promise<string[]>`
   (SINTER pending ∩ blockTxids), `replaceCurrentMempool(txids)`,
-  `newMempoolTxids(): Promise<string[]>` (SDIFF current − previous − evaluated),
-  `rotateMempool()` (current → previous), `replacePostBlockMempool(txids)`,
+  `newMempoolTxids(): Promise<string[]>` (SDIFF current − evaluated — no "previous" snapshot:
+  a tx whose `seen` delivery failed is un-evaluated and must be retried on the next reparse),
+  `clearCurrentMempool()` (DEL current), `replacePostBlockMempool(txids)`,
   `droppedPending(): Promise<string[]>` (SDIFF pending − postBlock − blockTxids),
   `pruneEvaluated()` (SINTERSTORE evaluated = evaluated ∩ postBlock).
 - tip/ring: `getTip(): Promise<Tip | null>`, `setTip(tip)`, `ringPut(height, hash)`,
-  `ringHashAt(height): Promise<string | null>`, `ringAbove(height): Promise<Array<{height; hash}>>`,
-  `ringPrune(keep: number)`, `ringRemoveAbove(height)` (ZREMRANGEBYSCORE — reorg rewind, keeps
-  the one-hash-per-height invariant).
-- maturing: `addMaturing(rec: MaturingRecord)` (putRecord + ZADD),
+  `ringHashAt(height): Promise<string | null>`, `ringAll(): Promise<Array<{height; hash}>>`
+  (ZRANGE 0 -1 WITHSCORES, ascending — INCLUDES height 0, which a `(0 +inf` range would
+  miss on a fresh regtest ring holding only genesis), `ringPrune(keep: number)`,
+  `ringRemoveAbove(height)` (ZREMRANGEBYSCORE — reorg rewind, keeps the one-hash-per-height
+  invariant).
+- maturing: `promoteToMaturing(rec: MaturingRecord)` — THE mined-tx promotion, one MULTI:
+  HSET record, ZADD maturing, SREM pending, SREM limbo, SADD evaluated (every promotion
+  branch uses it, so a crash cannot leave a half-promoted tx),
   `maturingEntries(): Promise<Array<{txid: string; height: number}>>`,
   `setMaturingFired(txid, fired: number[])`,
   `removeMaturing(txid)` (deleteRecord + ZREM — callers do not deleteRecord again),
   `unindexMaturing(txids: string[])` (ONE ZREM of the index ONLY, records kept — the
   maturing→limbo transition; no-op on empty). Reading a maturing record is `readRecord`.
 - records (hash-only, exist from seen-time): `putRecord(rec)`, `readRecord(txid)`, `deleteRecord(txid)`.
-- limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`.
+- limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`,
+  `demoteToPending(rec: MaturingRecord)` — THE reorg demotion, one MULTI: HSET record back to
+  height 0 / blockHash '' / fired [], SADD pending, SADD evaluated, SREM limbo. `evaluated`
+  is part of it because the tip prune forgot the txid when it was mined; without it the next
+  mempool reparse would emit a second `seen` under the same idempotency key.
 - `clearTracking(): Promise<string[]>` — prune-window guard: wipe maturing index + records +
   pending + limbo + evaluated + mempool scratch, PRESERVING watches/expiries/tip/ring; returns
   the txids whose tracking was lost for loud logging.
 - meta: `memoryInfo(): Promise<{usedBytes: number; maxBytes: number | null}>` (INFO memory),
-  `maxmemoryPolicy(): Promise<string | null>` (CONFIG GET, null if CONFIG is blocked e.g. managed redis).
+  `maxmemoryPolicy(): Promise<string | null>` (CONFIG GET; null ONLY when the error is a
+  command-access refusal — `/unknown command|not allowed|NOPERM|disabled|CONFIG/i`, e.g.
+  managed redis — anything else, such as connection loss, is rethrown).
+- connection: `connect()` rejects when the bounded reconnect (5 attempts, 250ms x2 capped 2s)
+  is exhausted at boot. At RUNTIME exhaustion is fatal from inside the reconnect strategy
+  (node-redis emits no terminal event when it gives up — a closed client with no command in
+  flight would be a zombie process), and so is an `'end'` event not preceded by `quit()`.
 
 ### src/delivery/webhook.ts
 `export class WebhookSink { constructor(cfg: {url; secret; maxAttempts; timeoutMs}) ;
@@ -199,7 +230,9 @@ next reparse retries). If seen disabled (no 0 milestone): markEvaluated + addPen
 `export function makeMempoolReparser(deps): () => Promise<void>` — module-level mutex (skip
 if running). getRawMempool → replaceCurrentMempool → newMempoolTxids → for each (bounded
 concurrency 32): getRawTransactionVerbose → decode → evaluate (reuse txPipeline evaluator);
-tx that vanished (null) is skipped. Then rotateMempool.
+tx that vanished (null) is skipped; tx that was mined meanwhile (`blockhash` set) is skipped
+too — the block pipeline owns mined txs and a `seen` for it would be false. Then
+clearCurrentMempool.
 
 ### src/engine/reorg.ts
 `export async function findForkPoint(deps, incomingPrevHash: string, incomingHeight: number):
@@ -221,16 +254,18 @@ no event at re-inclusion; milestones re-fire on the sweep with new-blockhash ide
 `export async function resolveLimbo(deps): Promise<void>` — runs after the TIP block finishes
 (and at boot when already reconciled): for each txid still in limbo,
   - getMempoolEntry non-null → emit `demoted` (confs 0, block fields = the OLD block,
-    timestamp now), putRecord(height 0, blockHash '', fired []), addPending, SREM limbo;
+    timestamp now), then `demoteToPending(rec)` (one MULTI: record to height 0, pending,
+    evaluated, out of limbo — no `seen` re-fires on the next reparse);
   - else → emit `conflicted` (confs = last confirmed depth or 0, old block fields), full
     cleanup (removePending/removeMaturing/SREM limbo). Terminal.
 Because limbo is durable, a crash anywhere in the sequence re-resolves on the next block/boot.
 
 ### src/engine/blockPipeline.ts
 `export function makeBlockProcessor(deps): (raw: Buffer) => Promise<void>` used by both the ZMQ
-path and catch-up, plus `export function makeBlockHandler(processBlock): (raw: Buffer) => Promise<void>`
+path and catch-up, plus `export function makeBlockHandler(processBlock, onFatal = fatal): (raw: Buffer) => Promise<void>`
 which wraps that ONE processor in a serialization queue (index.ts builds a single processor
-and hands it to both reconcile and makeBlockHandler). Sequence for
+and hands it to both reconcile and makeBlockHandler). A rejected processBlock is fatal —
+`onFatal` is injectable for tests only. Sequence for
 a block B (hash H, prev P, height h from getBlockHeader(H)):
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
    If P === tip.hash → connected. Else: findForkPoint (a pure gap yields empty disconnected);
@@ -245,10 +280,13 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    resolve the block's DISTINCT output addresses with `watchedSubset` ONCE (chunked at 1000
    addresses) → `matchAgainst` per tx: for each block tx that matches (check EVERY block tx,
    not just pending ∩ block — a payment never seen in the mempool still confirms): build
-   MaturingRecord from the block's own decode. Limbo txid → re-inclusion: addMaturing + removeLimbo (no event).
-   Pending txid → removePending + addMaturing. Neither → if not already maturing/evaluated:
-   markEvaluated + addMaturing. A tracked tx that no longer matches any watch (watch removed
-   mid-flight) ends tracking quietly.
+   MaturingRecord from the block's own decode, then `promoteToMaturing` (one MULTI) for
+   every origin: limbo txid → re-inclusion (no event); pending txid → promotion; neither →
+   never-seen, promoted unless its record already has height > 0 (block replay guard).
+   The `evaluated` flag is NOT a gate: it only says the mempool evaluator looked once —
+   possibly before the address was watched, or before a crash lost the record — and a
+   mined payment to a watched address must confirm regardless. A tracked tx that no
+   longer matches any watch (watch removed mid-flight) ends tracking quietly.
 3. milestone sweep: for each maturingEntries() entry: confs = h − height + 1; for each
    confirm milestone m in (fired ∌ m) with confs ≥ m: emit `confirmed` (confs = m, block
    fields from the record, timestamp = blockTime*1000 of B); on delivery success add m to
@@ -269,7 +307,8 @@ demoted/conflicted/expired: log warn, proceed (best-effort one-shots).
 
 ### src/engine/heartbeat.ts
 `export function startHeartbeat(deps): {stop(): void}` — setInterval(heartbeatInterval s):
-build HeartbeatEvent from getTip/watchCount/memoryInfo, deliver. Skipped when interval 0.
+build HeartbeatEvent from getTip/watchCount/memoryInfo, deliver (a false result is warned,
+next interval retries). Skipped when interval 0. A rejected tick is fatal.
 
 ### src/boot/preflight.ts
 `export async function preflight(deps): Promise<void>` — checks, in order, each with a clear
@@ -293,17 +332,22 @@ unconditionally right after `reconcile` returns (a crash between limbo-rewind an
 must not leave displaced txs unadjudicated until the next block; no-op when limbo is empty).
 
 ### src/admin/server.ts
-`export function startAdminServer(deps): {close(): Promise<void>}` — node:http only, no
-framework. Only constructed when adminToken set. Every route (except /health) requires
-`authorization: Bearer <ADMIN_TOKEN>` (timingSafeEqual) → 401 otherwise.
+`export function startAdminServer(deps): {close(): Promise<void>; port: Promise<number>}` —
+node:http only, no framework. Only constructed when adminToken set. `port` resolves with
+the bound port once listening (`ADMIN_PORT=0` = ephemeral; tests use it). Every route
+(except /health) requires `authorization: Bearer <ADMIN_TOKEN>` (timingSafeEqual) → 401 otherwise.
 - `POST /watches` body `{address: string, ttl?: number}` → validate with isValidAddress →
   422 `{error}` on invalid; addWatch(+expiry from ttl ?? watchDefaultTtl when > 0) → 201
   `{address, network, expiresAt: number | null}`. Idempotent.
 - `DELETE /watches/:address` → 204 (idempotent; 204 even if absent).
-- `GET /watches?cursor=0` → `{addresses, cursor}` (SSCAN passthrough; cursor "0" = done).
+- `GET /watches?cursor=0` → `{addresses, cursor}` (SSCAN passthrough; cursor "0" = done;
+  a cursor that is not `/^\d+$/` → 400).
 - `GET /watches/:address` → 200 `{address, watched: true, expiresAt}` or 404.
 - `GET /health` (no auth) → 200/503 `{ok, redis, rpc, tipHeight, secondsSinceLastBlock, watchCount}`.
-Reject bodies > 4KB. JSON errors as `{error: string}`.
+Reject bodies > 4KB with a real 413 response (`connection: close`; the socket is never
+destroyed before the status is written). JSON errors as `{error: string}`. An unhandled
+error inside a request handler → `500 {error: 'internal error'}` (request/response path:
+never fatal); a server `'error'` event (listen failure) → `fatal` (background path).
 
 ### src/index.ts (integration)
 loadConfig → Store.connect → preflight → reconcile → resolveLimbo → startZmq (rawtx → txHandler, rawblock →

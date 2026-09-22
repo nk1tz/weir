@@ -25,8 +25,6 @@ export interface Keys {
   limbo: string
   /** SET txids already evaluated (skip on re-sight) */
   evaluated: string
-  /** SET last full-reparse mempool snapshot */
-  mempoolPrevious: string
   /** SET transient snapshot during a reparse */
   mempoolCurrent: string
   /** SET mempool right after a block, feeds the dropped check */
@@ -47,7 +45,6 @@ export function keysFor(network: Network): Keys {
     pending: `${p}:pending`,
     limbo: `${p}:limbo`,
     evaluated: `${p}:evaluated`,
-    mempoolPrevious: `${p}:mempool:previous`,
     mempoolCurrent: `${p}:mempool:current`,
     mempoolPostBlock: `${p}:mempool:postBlock`,
     blockTxids: `${p}:block:txids`,

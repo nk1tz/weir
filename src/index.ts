@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadConfig } from './config'
-import { describeError, log } from './lib/log'
+import { describeError, fatal, log } from './lib/log'
 import { Store } from './store/redis'
 import { Rpc } from './bitcoin/rpc'
 import { startZmq } from './bitcoin/zmq'
@@ -80,7 +80,8 @@ async function main(): Promise<void> {
   /** unix ms of the last block weir fully processed — feeds /health secondsSinceLastBlock */
   let lastBlockAt: number | null = null
 
-  // zmq's safeInvoke wraps every handler: returned promise rejections are logged, never unhandled.
+  // zmq's safeInvoke wraps every handler: a returned promise rejection is fatal (never
+  // unhandled, never swallowed) — including a gap-triggered reparse failing.
   const zmq = await startZmq({
     url: cfg.bitcoinZmqUrl,
     onRawTx: (buf) => handleRawTx(buf),
@@ -92,10 +93,10 @@ async function main(): Promise<void> {
   })
 
   // Initial mempool reparse — deliberately not awaited (spec: async). A failure here is an
-  // unexpected internal error: log and crash, per DESIGN's error policy.
+  // unexpected internal error → fatal, per DESIGN's error policy.
   reparse().catch((err: unknown) => {
-    log.error(CTX, `initial mempool reparse failed: ${describeError(err)}`)
-    process.exit(1)
+    log.error(CTX, 'initial mempool reparse failed')
+    fatal(CTX, err)
   })
 
   const heartbeat = startHeartbeat({ cfg, store, sink })
@@ -126,8 +127,8 @@ async function main(): Promise<void> {
       log.info(CTX, 'shutdown complete')
       process.exit(0)
     })().catch((err: unknown) => {
-      log.error(CTX, `shutdown failed: ${describeError(err)}`)
-      process.exit(1)
+      log.error(CTX, 'shutdown failed')
+      fatal(CTX, err)
     })
   }
   process.on('SIGINT', () => shutdown('SIGINT'))
@@ -136,7 +137,4 @@ async function main(): Promise<void> {
   log.info(CTX, 'weir is running')
 }
 
-main().catch((err: unknown) => {
-  log.error(CTX, `fatal: ${describeError(err)}`)
-  process.exit(1)
-})
+main().catch((err: unknown) => fatal(CTX, err))

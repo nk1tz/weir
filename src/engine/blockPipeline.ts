@@ -18,7 +18,7 @@ import type { Rpc } from '../bitcoin/rpc'
 import type { Store } from '../store/redis'
 import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
-import { log } from '../lib/log'
+import { fatal, log } from '../lib/log'
 import { matchAgainst } from './matcher'
 import { enterLimboAndRewind, findForkPoint, type ReorgRpc, type ReorgStore, resolveLimbo } from './reorg'
 
@@ -36,10 +36,8 @@ export type BlockStore = ReorgStore &
     | 'setBlockTxids'
     | 'pendingInBlock'
     | 'watchedSubset'
-    | 'isEvaluated'
-    | 'markEvaluated'
     | 'unmarkEvaluated'
-    | 'addMaturing'
+    | 'promoteToMaturing'
     | 'setMaturingFired'
     | 'replacePostBlockMempool'
     | 'droppedPending'
@@ -115,22 +113,20 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
         fired: [],
         hex: tx.hex,
       }
+      // One code path for all three origins: promoteToMaturing is a single MULTI, so a
+      // crash can never leave a tx half-promoted. The `evaluated` flag is deliberately NOT
+      // a gate here: it only means "the mempool evaluator looked at it once" (possibly
+      // before the address was watched, or before a crash lost the record).
       if (limbo.has(tx.txid)) {
-        await store.addMaturing(rec)
-        await store.removeLimbo(tx.txid)
         log.info(CTX, `re-included ${tx.txid} after reorg → maturing at ${block.hash}@${height} (milestones re-fire)`)
       } else if (pendingMined.has(tx.txid)) {
-        await store.removePending(tx.txid)
-        await store.addMaturing(rec)
         log.info(CTX, `promoted pending ${tx.txid} → maturing at ${block.hash}@${height}`)
       } else {
         const existing = await store.readRecord(tx.txid)
         if (existing && existing.height > 0) continue // already maturing (e.g. block replay)
-        if (await store.isEvaluated(tx.txid)) continue
-        await store.markEvaluated(tx.txid)
-        await store.addMaturing(rec)
         log.info(CTX, `never-seen ${tx.txid} mined paying a watched address — maturing at ${block.hash}@${height}`)
       }
+      await store.promoteToMaturing(rec)
     }
 
     // ── 3. milestone sweep ───────────────────────────────────────────────────────────
@@ -310,15 +306,19 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
 
 /**
  * ZMQ-facing handler: the given processor behind a serialization queue so blocks arriving
- * back-to-back are processed strictly in order. The returned promise still rejects on
- * failure (the ZMQ wrapper logs it); the internal chain is kept alive so one failed
- * block does not poison processing of the next.
+ * back-to-back are processed strictly in order. A block that fails to process is an
+ * UNEXPECTED error → `fatal` (the process exits; docker restarts it and boot reconciliation
+ * replays the block). There is deliberately no "keep the queue alive" path: skipping a
+ * failed block and processing the next would silently lose confirmations.
+ * `onFatal` is injectable for tests only; production callers use the default.
  */
-export function makeBlockHandler(processBlock: (raw: Buffer) => Promise<void>): (raw: Buffer) => Promise<void> {
+export function makeBlockHandler(
+  processBlock: (raw: Buffer) => Promise<void>,
+  onFatal: (ctx: string, err: unknown) => void = fatal,
+): (raw: Buffer) => Promise<void> {
   let queue: Promise<void> = Promise.resolve()
   return (raw: Buffer) => {
-    const run = queue.then(() => processBlock(raw))
-    queue = run.catch(() => undefined) // error surfaces via `run`; chain stays usable
-    return run
+    queue = queue.then(() => processBlock(raw)).catch((err: unknown) => onFatal(CTX, err))
+    return queue
   }
 }

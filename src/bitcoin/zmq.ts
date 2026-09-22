@@ -1,5 +1,5 @@
 import { Subscriber } from 'zeromq'
-import { describeError, log } from '../lib/log'
+import { fatal, log } from '../lib/log'
 
 const CTX = 'zmq'
 
@@ -9,20 +9,17 @@ const TOPIC_RAWBLOCK = 'rawblock'
 /** bitcoind's per-topic ZMQ sequence counter is a uint32 — wraps at 2^32. */
 const UINT32_WRAP = 0x1_0000_0000
 
-/** Handler failures are unexpected internal errors — keep the stack in the log line. */
-function stackOf(err: unknown): string {
-  return err instanceof Error && err.stack ? `\n${err.stack}` : ''
-}
-
 /**
- * Fire-and-forget handler invocation: never awaited, but sync throws and async
- * rejections are always caught and logged — never unhandled.
+ * Fire-and-forget handler invocation: never awaited, but a sync throw or an async
+ * rejection is an UNEXPECTED error (the handlers already absorb delivery failures as
+ * booleans) → fatal. Never unhandled, never swallowed.
  */
 function safeInvoke(name: string, fn: () => unknown): void {
   void Promise.resolve()
     .then(() => fn())
     .catch((err: unknown) => {
-      log.error(CTX, `${name} handler failed: ${describeError(err)}${stackOf(err)}`)
+      log.error(CTX, `${name} handler failed`)
+      fatal(CTX, err)
     })
 }
 
@@ -93,12 +90,9 @@ export async function startZmq(opts: {
       // close() interrupted a pending receive — expected during shutdown.
       return
     }
-    // Unexpected internal error: log and crash (docker restarts us; boot
-    // reconciliation makes that safe). Rethrowing rejects this detached
-    // promise, which terminates the process under Node's default
-    // unhandled-rejection behavior.
-    log.error(CTX, `subscriber loop failed: ${describeError(err)}${stackOf(err)}`)
-    throw err
+    // Unexpected internal error: crash (docker restarts us; boot reconciliation heals).
+    log.error(CTX, 'subscriber loop failed')
+    fatal(CTX, err)
   })
 
   return {

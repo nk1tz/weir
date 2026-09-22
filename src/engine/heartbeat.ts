@@ -8,7 +8,7 @@ import type { HeartbeatEvent, Network } from '../lib/types'
 import type { Store } from '../store/redis'
 import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
-import { describeError, log } from '../lib/log'
+import { fatal, log } from '../lib/log'
 
 const CTX = 'heartbeat'
 
@@ -47,12 +47,9 @@ export function startHeartbeat(deps: HeartbeatDeps): { stop(): void } {
   }
 
   const timer = setInterval(() => {
-    tick().catch((err) => {
-      // Unexpected internal error (redis down, etc): log and crash — never swallow.
-      // Rethrowing here becomes an unhandled rejection; docker restarts us safely.
-      log.error(CTX, `heartbeat tick failed: ${describeError(err)}`)
-      throw err
-    })
+    // A failed delivery is a boolean (warned above); a rejected tick is an unexpected
+    // internal error (redis down, etc) → fatal, never swallowed.
+    tick().catch((err: unknown) => fatal(CTX, err))
   }, intervalSec * 1000)
   timer.unref()
   log.info(CTX, `heartbeat every ${intervalSec}s`)

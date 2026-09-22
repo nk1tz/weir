@@ -4,19 +4,42 @@
  *
  * INVARIANTS
  * - A `maturing:{txid}` record exists from SEEN-time onward (`putRecord`, height 0 /
- *   blockHash ''); the `maturing` ZSET only ever indexes MINED txs. `addMaturing` =
- *   putRecord + ZADD, `removeMaturing` = deleteRecord + ZREM, `unindexMaturing` = ZREM only
- *   (the maturing→limbo transition keeps the record).
- * - Bounded reconnects: boot fails fast on a bad REDIS_URL; at runtime, exhausting retries
- *   rejects in-flight commands and the engine crashes per the log-and-crash policy.
+ *   blockHash ''); the `maturing` ZSET only ever indexes MINED txs. `promoteToMaturing` =
+ *   one MULTI (putRecord + ZADD + leave pending/limbo + mark evaluated), `removeMaturing` =
+ *   deleteRecord + ZREM, `unindexMaturing` = ZREM only (the maturing→limbo transition keeps
+ *   the record), `demoteToPending` = one MULTI (record back to height 0 + SADD pending +
+ *   SADD evaluated + SREM limbo — evaluated so the next reparse does not re-fire `seen`).
+ * - Bounded reconnects: boot fails fast on a bad REDIS_URL (connect() rejects). At runtime,
+ *   exhausting the retries is FATAL from inside the reconnect strategy: node-redis emits no
+ *   terminal event when it gives up, it just leaves a closed client — with no command in
+ *   flight nothing would ever notice (a zombie process). An 'end' we did not ask for
+ *   (quit()) is fatal for the same reason.
  */
 
 import { createClient } from 'redis'
 import type { MaturingRecord, Network, Tip } from '../lib/types'
-import { describeError, log } from '../lib/log'
+import { describeError, fatal, log } from '../lib/log'
 import { type Keys, keysFor } from './keys'
 
 const CTX = 'store'
+
+/** Connection attempts before giving up (boot: connect() rejects; runtime: fatal). */
+const MAX_RECONNECTS = 5
+
+/**
+ * Managed redis (Elasticache, Upstash, ACL-restricted users, ...) refuses CONFIG with a
+ * command-access error. Anything else (connection loss mid-call) is NOT "blocked".
+ */
+/**
+ * Managed redis (Upstash, ElastiCache, ...) blocks CONFIG with an explicit command-access
+ * denial. Only those messages count as "blocked"; an auth failure (WRONGPASS/NOAUTH — Upstash's
+ * WRONGPASS text even contains "disabled") or any transport error must surface as-is.
+ */
+const CONFIG_BLOCKED = /unknown command|unknown subcommand|NOPERM|no permissions|not allowed|not permitted|disabled/i
+const AUTH_FAILURE = /WRONGPASS|NOAUTH|AUTH failed/i
+function isConfigBlocked(msg: string): boolean {
+  return CONFIG_BLOCKED.test(msg) && !AUTH_FAILURE.test(msg)
+}
 
 type Client = ReturnType<typeof createClient>
 
@@ -59,16 +82,17 @@ function hashToRecord(txid: string, h: Record<string, string>): MaturingRecord {
 export class Store {
   private readonly client: Client
   private readonly keys: Keys
+  /** true once connect() resolved — giving up before that is a boot failure, not a crash */
+  private ready = false
+  /** set by quit(): the 'end' that follows is expected */
+  private closing = false
 
   constructor(url: string, network: Network) {
     this.client = createClient({
       url,
       socket: {
         connectTimeout: 10_000,
-        reconnectStrategy: (retries: number) =>
-          retries >= 5
-            ? new Error(`[${CTX}] redis unreachable after ${retries} connection attempts`)
-            : Math.min(250 * 2 ** retries, 2000),
+        reconnectStrategy: (retries: number, cause: Error) => this.reconnectDecision(retries, cause),
       },
     })
     this.keys = keysFor(network)
@@ -78,13 +102,34 @@ export class Store {
     this.client.on('error', (err: unknown) => {
       log.error(CTX, `redis client error: ${describeError(err)}`)
     })
+    // node-redis emits 'end' only after a deliberate quit()/disconnect(). Any other 'end'
+    // means the client is closed for good with nobody awaiting a command → zombie → fatal.
+    this.client.on('end', () => {
+      if (this.closing) return
+      fatal(CTX, new Error('redis connection closed unexpectedly'))
+    })
+  }
+
+  /**
+   * Bounded exponential backoff (250ms x2, capped 2s). On exhaustion: before connect()
+   * resolved, return the Error so connect() rejects and boot fails fast with a clear
+   * message; at runtime, node-redis would swallow that Error and go quiet with a closed
+   * client (see module doc) — crash instead.
+   */
+  private reconnectDecision(retries: number, cause: Error): number | Error {
+    if (retries < MAX_RECONNECTS) return Math.min(250 * 2 ** retries, 2000)
+    const err = new Error(`[${CTX}] redis unreachable after ${retries} connection attempts: ${describeError(cause)}`)
+    if (this.ready && !this.closing) fatal(CTX, err)
+    return err
   }
 
   async connect(): Promise<void> {
     await this.client.connect()
+    this.ready = true
   }
 
   async quit(): Promise<void> {
+    this.closing = true
     await this.client.quit()
   }
 
@@ -195,18 +240,18 @@ export class Store {
     await multi.exec()
   }
 
-  /** SDIFF current − previous − evaluated — txids needing evaluation this reparse. */
+  /**
+   * SDIFF current − evaluated — txids needing evaluation this reparse. Deliberately NOT
+   * minus a previous snapshot: a tx whose `seen` delivery failed is un-evaluated and must
+   * be retried on the next reparse even though the mempool did not change.
+   */
   async newMempoolTxids(): Promise<string[]> {
-    return this.client.sDiff([this.keys.mempoolCurrent, this.keys.mempoolPrevious, this.keys.evaluated])
+    return this.client.sDiff([this.keys.mempoolCurrent, this.keys.evaluated])
   }
 
-  /** current → previous. SDIFFSTORE with a single source key copies (or clears when empty). */
-  async rotateMempool(): Promise<void> {
-    await this.client
-      .multi()
-      .sDiffStore(this.keys.mempoolPrevious, [this.keys.mempoolCurrent])
-      .del(this.keys.mempoolCurrent)
-      .exec()
+  /** DEL the transient reparse snapshot once evaluation is done. */
+  async clearCurrentMempool(): Promise<void> {
+    await this.client.del(this.keys.mempoolCurrent)
   }
 
   async replacePostBlockMempool(txids: string[]): Promise<void> {
@@ -257,9 +302,9 @@ export class Store {
     await this.client.zRemRangeByScore(this.keys.blocks, `(${height}`, '+inf')
   }
 
-  /** Ring entries strictly above `height`, ascending. */
-  async ringAbove(height: number): Promise<Array<{ height: number; hash: string }>> {
-    const members = await this.client.zRangeByScoreWithScores(this.keys.blocks, `(${height}`, '+inf')
+  /** Every ring entry, ascending by height (ZRANGE 0 -1 WITHSCORES). Height 0 included. */
+  async ringAll(): Promise<Array<{ height: number; hash: string }>> {
+    const members = await this.client.zRangeWithScores(this.keys.blocks, 0, -1)
     return members.map((m) => ({ height: m.score, hash: m.value }))
   }
 
@@ -287,12 +332,37 @@ export class Store {
 
   // ── maturing (mined, below max milestone) ──────────────────────────────────
 
-  /** putRecord + ZADD maturing index, atomically (MULTI). */
-  async addMaturing(rec: MaturingRecord): Promise<void> {
+  /**
+   * The ONE mined-tx promotion, atomically (MULTI): HSET record, ZADD maturing index,
+   * SREM pending, SREM limbo, SADD evaluated. Used for every promotion branch (pending,
+   * limbo re-inclusion, never-seen) so a crash can never leave a half-promoted tx.
+   */
+  async promoteToMaturing(rec: MaturingRecord): Promise<void> {
     await this.client
       .multi()
       .hSet(this.keys.maturingRecord(rec.txid), recordToHash(rec))
       .zAdd(this.keys.maturing, { score: rec.height, value: rec.txid })
+      .sRem(this.keys.pending, rec.txid)
+      .sRem(this.keys.limbo, rec.txid)
+      .sAdd(this.keys.evaluated, rec.txid)
+      .exec()
+  }
+
+  /**
+   * The ONE reorg demotion (maturing/limbo → pending), atomically (MULTI): HSET record back
+   * to height 0 / blockHash '' / fired [], SADD pending, SADD evaluated, SREM limbo. Marking
+   * it evaluated is essential: the tip prune forgot the txid from `evaluated` when it was
+   * mined, so without this the next mempool reparse would re-evaluate it and emit a second
+   * `seen` under the same idempotency key.
+   */
+  async demoteToPending(rec: MaturingRecord): Promise<void> {
+    const demoted: MaturingRecord = { ...rec, height: 0, blockHash: '', fired: [] }
+    await this.client
+      .multi()
+      .hSet(this.keys.maturingRecord(rec.txid), recordToHash(demoted))
+      .sAdd(this.keys.pending, rec.txid)
+      .sAdd(this.keys.evaluated, rec.txid)
+      .sRem(this.keys.limbo, rec.txid)
       .exec()
   }
 
@@ -360,7 +430,6 @@ export class Store {
       this.keys.pending,
       this.keys.limbo,
       this.keys.evaluated,
-      this.keys.mempoolPrevious,
       this.keys.mempoolCurrent,
       this.keys.mempoolPostBlock,
       this.keys.blockTxids,
@@ -386,14 +455,16 @@ export class Store {
   }
 
   /**
-   * CONFIG GET maxmemory-policy. Managed redis (Elasticache, Upstash, ...) blocks
-   * CONFIG — the ONE permitted swallow in weir: log at warn, return null.
+   * CONFIG GET maxmemory-policy. Managed redis (Elasticache, Upstash, ...) blocks CONFIG
+   * with a command-access error — the ONE permitted swallow in weir: log at warn, return
+   * null. Any other failure (connection loss) is rethrown: it is not "blocked".
    */
   async maxmemoryPolicy(): Promise<string | null> {
     try {
       const res = await this.client.configGet('maxmemory-policy')
       return res['maxmemory-policy'] ?? null
     } catch (err) {
+      if (!isConfigBlocked(describeError(err))) throw err
       log.warn(CTX, `CONFIG GET maxmemory-policy blocked (managed redis?): ${describeError(err)}`)
       return null
     }

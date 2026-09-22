@@ -137,11 +137,12 @@ describe('mempool reparser', () => {
     const cfg = { network: 'regtest' as const, seenEnabled: true }
     const evaluate = makeTxEvaluator({ store, sink, cfg })
     const hexToTx = new Map<string, DecodedTx>()
-    const rpcTxs = new Map<string, { hex: string }>()
+    const rpcTxs = new Map<string, { blockhash?: string; hex: string }>()
     const mempool: string[] = []
-    const seed = (tx: DecodedTx) => {
+    /** register a tx with the fake node; `blockhash` = the node has mined it since the snapshot */
+    const seed = (tx: DecodedTx, blockhash?: string) => {
       hexToTx.set(tx.hex, tx)
-      rpcTxs.set(tx.txid, { hex: tx.hex })
+      rpcTxs.set(tx.txid, blockhash === undefined ? { hex: tx.hex } : { blockhash, hex: tx.hex })
     }
     const rpc = {
       getRawMempool: async () => [...mempool],
@@ -161,26 +162,44 @@ describe('mempool reparser', () => {
     return { store, sink, seed, mempool, reparse }
   }
 
-  it('evaluates only NEW txids (not in previous snapshot, not already evaluated)', async () => {
+  it('evaluates only txids not already evaluated (current − evaluated), then drops the snapshot', async () => {
     const { store, sink, seed, mempool, reparse } = reparserSetup()
     store.watches.add(ADDR)
     const fresh = mkTx('fresh')
-    const old = mkTx('old')
     const done = mkTx('done')
     seed(fresh)
-    seed(old)
     seed(done)
-    mempool.push('fresh', 'old', 'done')
-    store.mempoolPrevious = new Set(['old'])
+    mempool.push('fresh', 'done')
     store.evaluated = new Set(['done'])
 
     await reparse()
 
     const seen = sink.delivered.filter((e): e is TxEvent => e.event === 'seen')
     expect(seen.map((e) => e.txid)).toEqual(['fresh'])
-    // snapshots rotated: current → previous
-    expect(store.mempoolPrevious).toEqual(new Set(['fresh', 'old', 'done']))
     expect(store.mempoolCurrent.size).toBe(0)
+  })
+
+  it('a failed seen delivery is retried on the NEXT reparse of the same mempool', async () => {
+    // Regression: `current − previous − evaluated` excluded a failed-delivery tx forever,
+    // because rotateMempool moved it into `previous` even though it was never evaluated.
+    const { store, sink, seed, mempool, reparse } = reparserSetup()
+    store.watches.add(ADDR)
+    seed(mkTx('tx1'))
+    mempool.push('tx1')
+
+    sink.deliverResult = false
+    await reparse()
+    expect(sink.attempts.filter((e) => e.event === 'seen')).toHaveLength(1)
+    expect(store.evaluated.has('tx1')).toBe(false)
+    expect(store.pending.has('tx1')).toBe(false)
+
+    sink.deliverResult = true
+    await reparse() // same mempool — nothing changed on the node
+
+    expect(sink.attempts.filter((e) => e.event === 'seen')).toHaveLength(2)
+    expect(sink.delivered.filter((e) => e.event === 'seen')).toHaveLength(1)
+    expect(store.evaluated.has('tx1')).toBe(true)
+    expect(store.pending.has('tx1')).toBe(true)
   })
 
   it('a txid that vanishes between snapshot and fetch is skipped, not fatal', async () => {
@@ -193,6 +212,23 @@ describe('mempool reparser', () => {
 
     const seen = sink.delivered.filter((e): e is TxEvent => e.event === 'seen')
     expect(seen.map((e) => e.txid)).toEqual(['kept'])
+  })
+
+  it('a txid mined between snapshot and fetch (verbose.blockhash set) is skipped — no false seen', async () => {
+    const { store, sink, seed, mempool, reparse } = reparserSetup()
+    store.watches.add(ADDR)
+    seed(mkTx('mined'), 'b101') // in the snapshot, but getrawtransaction now reports a block
+    seed(mkTx('still'))
+    mempool.push('mined', 'still')
+
+    await reparse()
+
+    const seen = sink.attempts.filter((e): e is TxEvent => e.event === 'seen')
+    expect(seen.map((e) => e.txid)).toEqual(['still'])
+    // the block pipeline owns mined txs: nothing recorded for it here
+    expect(store.evaluated.has('mined')).toBe(false)
+    expect(store.pending.has('mined')).toBe(false)
+    expect(store.records.has('mined')).toBe(false)
   })
 
   it('mutex: overlapping invocations are skipped, not queued', async () => {

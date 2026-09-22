@@ -33,6 +33,19 @@ export const log: {
 }
 
 /**
+ * THE fatal-error policy (DESIGN.md "Module map and contracts"): an UNEXPECTED error — a
+ * redis/rpc failure inside an engine loop, a rejected ZMQ handler, a block that fails to
+ * process — is logged with its stack and the process exits 1. Docker restarts the daemon
+ * and boot reconciliation heals. Delivery failures are never routed here: they stay
+ * boolean per the documented retry/one-shot rules.
+ */
+export function fatal(ctx: string, err: unknown): never {
+  const stack = err instanceof Error && err.stack ? `\n${err.stack}` : ''
+  emit('error', ctx, `fatal: ${describeError(err)}${stack}`)
+  process.exit(1)
+}
+
+/**
  * One-line description of any thrown value for log output. AggregateError (e.g.
  * dual-stack ECONNREFUSED) has an empty .message — surface the inner ones; undici's
  * fetch wraps the real network error ("connect ECONNREFUSED ...") in .cause — follow it.

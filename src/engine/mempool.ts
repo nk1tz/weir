@@ -8,7 +8,7 @@ const CTX = 'mempool'
 /** Structural deps — tests pass in-memory fakes (tests/fakes.ts). */
 export interface MempoolReparserDeps {
   rpc: Pick<Rpc, 'getRawMempool' | 'getRawTransactionVerbose'>
-  store: Pick<Store, 'replaceCurrentMempool' | 'newMempoolTxids' | 'rotateMempool'>
+  store: Pick<Store, 'replaceCurrentMempool' | 'newMempoolTxids' | 'clearCurrentMempool'>
   cfg: { network: Network }
   decodeRawTx(raw: Buffer | string, network: Network): DecodedTx
   /** the txPipeline evaluator (makeTxEvaluator) */
@@ -35,8 +35,8 @@ async function mapBounded<T>(
 }
 
 /**
- * Full mempool reparse: snapshot the node's mempool, evaluate only the txids not
- * seen in the previous snapshot and not already evaluated, then rotate snapshots.
+ * Full mempool reparse: snapshot the node's mempool, evaluate every txid not already
+ * evaluated (so a failed `seen` delivery is retried next time), then drop the snapshot.
  *
  * Mutex (held in the factory closure — one reparser instance exists per daemon):
  * overlapping invocations are skipped, not queued. Errors propagate to the caller
@@ -59,11 +59,13 @@ export function makeMempoolReparser(deps: MempoolReparserDeps): () => Promise<vo
       await mapBounded(fresh, FETCH_CONCURRENCY, async (txid) => {
         const verbose = await deps.rpc.getRawTransactionVerbose(txid)
         if (verbose === null) return // vanished between snapshot and fetch — skip
+        // Mined between snapshot and fetch: the block pipeline owns it; a `seen` now would be false.
+        if (verbose.blockhash !== undefined) return
         const tx = deps.decodeRawTx(verbose.hex, deps.cfg.network)
         await deps.evaluate(tx)
       })
 
-      await deps.store.rotateMempool()
+      await deps.store.clearCurrentMempool()
     } finally {
       running = false
     }

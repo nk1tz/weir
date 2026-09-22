@@ -23,7 +23,6 @@ export class FakeStore {
   limbo = new Set<string>()
 
   // mempool / block scratch sets
-  mempoolPrevious = new Set<string>()
   mempoolCurrent = new Set<string>()
   mempoolPostBlock = new Set<string>()
   blockTxids = new Set<string>()
@@ -71,9 +70,20 @@ export class FakeStore {
     return this.watches.size
   }
 
-  /** single-page SSCAN: returns everything with terminal cursor "0" */
-  async scanWatches(_cursor: string): Promise<{ cursor: string; addresses: string[] }> {
-    return { cursor: '0', addresses: [...this.watches] }
+  /** SSCAN COUNT — deliberately small so tests exercise multi-page iteration */
+  scanPageSize = 2
+
+  /**
+   * SSCAN: the cursor is a numeric string (here: the offset into the set), "0" once the
+   * iteration is complete; a non-numeric cursor is rejected by redis ("ERR invalid cursor"),
+   * which node-redis surfaces as a thrown Error.
+   */
+  async scanWatches(cursor: string): Promise<{ cursor: string; addresses: string[] }> {
+    if (!/^\d+$/.test(cursor)) throw new Error('ERR invalid cursor')
+    const all = [...this.watches]
+    const start = Number(cursor)
+    const next = start + this.scanPageSize
+    return { cursor: next >= all.length ? '0' : String(next), addresses: all.slice(start, next) }
   }
 
   /** ZRANGEBYSCORE order: by expiry ascending, ties by address lexicographically */
@@ -133,16 +143,13 @@ export class FakeStore {
     this.mempoolCurrent = new Set(txids)
   }
 
-  /** current − previous − evaluated */
+  /** current − evaluated */
   async newMempoolTxids(): Promise<string[]> {
-    return [...this.mempoolCurrent].filter(
-      (t) => !this.mempoolPrevious.has(t) && !this.evaluated.has(t),
-    )
+    return [...this.mempoolCurrent].filter((t) => !this.evaluated.has(t))
   }
 
-  /** current → previous */
-  async rotateMempool(): Promise<void> {
-    this.mempoolPrevious = this.mempoolCurrent
+  /** DEL current */
+  async clearCurrentMempool(): Promise<void> {
     this.mempoolCurrent = new Set()
   }
 
@@ -189,9 +196,9 @@ export class FakeStore {
     return this.ringSorted().find((e) => e.height === height)?.hash ?? null
   }
 
-  /** entries strictly above `height`, ascending by score */
-  async ringAbove(height: number): Promise<Array<{ height: number; hash: string }>> {
-    return this.ringSorted().filter((e) => e.height > height)
+  /** ZRANGE 0 -1 WITHSCORES: every entry, ascending by score (height 0 included) */
+  async ringAll(): Promise<Array<{ height: number; hash: string }>> {
+    return this.ringSorted()
   }
 
   /** ZREMRANGEBYRANK 0 -(keep+1): keep only the `keep` highest-ranked entries */
@@ -244,13 +251,23 @@ export class FakeStore {
 
   // --- maturing ---
 
-  /** putRecord + index */
-  async addMaturing(rec: MaturingRecord): Promise<void> {
-    this.maturingIndex.set(rec.txid, rec.height)
+  /** one MULTI: record + index + SREM pending + SREM limbo + SADD evaluated */
+  async promoteToMaturing(rec: MaturingRecord): Promise<void> {
     this.records.set(rec.txid, structuredClone(rec))
+    this.maturingIndex.set(rec.txid, rec.height)
+    this.pending.delete(rec.txid)
+    this.limbo.delete(rec.txid)
+    this.evaluated.add(rec.txid)
   }
 
-  /** ascending by inclusion height */
+  /** one MULTI: record → height 0 / blockHash '' / fired [] + SADD pending + SADD evaluated + SREM limbo */
+  async demoteToPending(rec: MaturingRecord): Promise<void> {
+    this.records.set(rec.txid, structuredClone({ ...rec, height: 0, blockHash: '', fired: [] }))
+    this.pending.add(rec.txid)
+    this.evaluated.add(rec.txid)
+    this.limbo.delete(rec.txid)
+  }
+
   /** ZSET order: by height ascending, ties by txid lexicographically (redis semantics) */
   async maturingEntries(): Promise<Array<{ txid: string; height: number }>> {
     return [...this.maturingIndex.entries()]
@@ -284,7 +301,6 @@ export class FakeStore {
     this.pending.clear()
     this.limbo.clear()
     this.evaluated.clear()
-    this.mempoolPrevious.clear()
     this.mempoolCurrent.clear()
     this.mempoolPostBlock.clear()
     this.blockTxids.clear()
