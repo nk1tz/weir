@@ -9,14 +9,14 @@
  * - Re-inclusion is discovered by the block pipeline's promotion step (no event; milestones
  *   re-fire under the new blockHash). `resolveLimbo` runs only after the TIP block finishes
  *   (and at boot), when the node's mempool reflects the new chain: present → demoted,
- *   absent → conflicted (terminal).
+ *   absent → conflicted (terminal). Each outcome is ONE store transition that also enqueues
+ *   its event — nothing here awaits delivery.
  * - Limbo is durable, so a crash between rewind and resolution re-resolves on the next
  *   block or boot.
  */
 import type { Network, TxEvent } from '../lib/types'
 import type { Rpc } from '../bitcoin/rpc'
 import type { Store } from '../store/redis'
-import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
 import { log } from '../lib/log'
 
@@ -35,9 +35,8 @@ export type ReorgStore = Pick<
   | 'limboTxids'
   | 'removeLimbo'
   | 'demoteToPending'
-  | 'removePending'
+  | 'conflict'
   | 'readRecord'
-  | 'deleteRecord'
 >
 
 export type ReorgRpc = Pick<Rpc, 'getBlockHeader' | 'getMempoolEntry'>
@@ -51,7 +50,6 @@ export interface ReorgDeps {
   cfg: { network: Network }
   store: ReorgStore
   rpc: ReorgRpc
-  sink: Sink
 }
 
 /**
@@ -155,11 +153,9 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
         idempotencyKey: idem.demoted(net, txid, rec.blockHash),
         timestamp: Date.now(),
       }
-      const ok = await deps.sink.deliver(ev)
-      if (!ok) log.warn(CTX, `demoted delivery failed for ${txid} — best-effort one-shot, proceeding`)
       // One MULTI: record back to height 0, pending, evaluated (so the next reparse does not
-      // re-fire `seen` — the tip prune forgot it when it was mined), out of limbo.
-      await deps.store.demoteToPending(rec)
+      // re-fire `seen` — the tip prune forgot it when it was mined), out of limbo, + `demoted`.
+      await deps.store.demoteToPending(rec, ev)
       log.info(CTX, `demoted ${txid} (was ${rec.blockHash}@${rec.height}) — back to pending`)
       continue
     }
@@ -179,11 +175,8 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
       idempotencyKey: idem.conflicted(net, txid),
       timestamp: Date.now(),
     }
-    const ok = await deps.sink.deliver(ev)
-    if (!ok) log.warn(CTX, `conflicted delivery failed for ${txid} — best-effort one-shot, proceeding`)
-    await deps.store.removePending(txid)
-    await deps.store.removeMaturing(txid) // deletes the record too
-    await deps.store.removeLimbo(txid)
+    // One MULTI: pending, maturing index, record, limbo all cleared + `conflicted` enqueued.
+    await deps.store.conflict(txid, ev)
     log.info(CTX, `conflicted ${txid} (was ${rec.blockHash}@${rec.height}) — tracking ended`)
   }
 }

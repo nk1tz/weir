@@ -112,9 +112,20 @@ http.createServer((req, res) => {
 }).listen(9090)
 ```
 
-Respond 2xx fast and do real work async. Failed deliveries retry with exponential backoff
-(`WEBHOOK_MAX_RETRIES` attempts); `confirmed` events that never get a 2xx are retried again
-on every subsequent block until delivered.
+Respond 2xx fast and do real work async. Every event is written to a durable outbox in redis
+in the same transaction as the state change that produced it, and a drainer POSTs it: a
+non-2xx, a network error or a timeout is retried with exponential backoff (1s doubling, capped
+at 5 min, with jitter) for up to `OUTBOX_MAX_AGE` (3 days by default). After that the event is
+dead-lettered — kept in redis (`weir:{network}:outbox:dead`, capped at `OUTBOX_DEAD_MAX`) and
+logged at error level with its `idempotencyKey`. The guarantee is per queued EVENT, by age:
+an event is retried until it is older than `OUTBOX_MAX_AGE`, then dead-lettered on its next
+failed attempt — regardless of how long the current outage has lasted. Only the last
+`OUTBOX_DEAD_MAX` dead-lettered events are retained for inspection. Block processing never
+waits on your endpoint.
+
+Because retries reorder things, **dedupe on `idempotencyKey` in the same database transaction
+as the credit or reversal you perform, and never assume arrival order**: every event carries
+absolute state (event type, `confs`, block hash in the key), never a delta.
 
 ## Events
 
@@ -130,11 +141,15 @@ idempotencyKey, timestamp, blockHeight, blockHash, hex}`):
 | `demoted` | a reorg orphans the tx's block and the tx returns to the mempool | revert to unconfirmed; new `confirmed` events follow if it's re-mined |
 | `conflicted` | a reorg orphans the tx's block and the tx is gone (double-spend won) | reverse any credit, alert a human — terminal |
 | `expired` | a TTL'd watch passed its deadline unpaid (address-scoped payload) | close the invoice for that address |
-| `heartbeat` | every `HEARTBEAT_INTERVAL` seconds (`{tipHeight, watchCount, memoryUsedPct}`) | reset a dead-man's switch; page if heartbeats stop |
+| `heartbeat` | every `HEARTBEAT_INTERVAL` seconds (`{tipHeight, watchCount, memoryUsedPct, outboxDepth, outboxOldestAgeSec, deadLetterCount}`) | reset a dead-man's switch; page if heartbeats stop or `outboxDepth` keeps growing |
 
 Every event carries an `idempotencyKey` unique to the logical occurrence — a re-mined tx's
 second `confirmed:1` has a *different* key (it embeds the block hash). Dedupe on the key,
 not on `(txid, event)`.
+
+`heartbeat` is the one event that skips the outbox: it is proof-of-life, sent directly once
+per interval, and it *reports* the outbox instead (`outboxDepth`, `outboxOldestAgeSec`,
+`deadLetterCount`). `GET /health` reports the same three fields.
 
 ## Configuration
 
@@ -153,8 +168,9 @@ All configuration is environment variables. See [.env.example](.env.example).
 | `HEARTBEAT_INTERVAL` | no | `0` | seconds between heartbeats; `0` = off |
 | `ADMIN_TOKEN` | no | unset | setting it creates the HTTP admin API and is its bearer token; unset = no listening socket exists |
 | `ADMIN_PORT` | no | `8787` | admin API port |
-| `WEBHOOK_MAX_RETRIES` | no | `3` | delivery attempts per event |
-| `WEBHOOK_TIMEOUT_MS` | no | `10000` | per-attempt timeout |
+| `WEBHOOK_TIMEOUT_MS` | no | `10000` | per-attempt timeout; a failed attempt is retried by the outbox |
+| `OUTBOX_MAX_AGE` | no | `259200` | seconds an undelivered event is retried before it is dead-lettered (3 days) |
+| `OUTBOX_DEAD_MAX` | no | `1000` | dead-letter cap; the oldest dead events beyond it are dropped |
 | `REDIS_MAXMEMORY` | no | `256mb` | read by docker-compose for the redis container, not by the daemon |
 
 **Capacity:** watches live in redis, ~330 bytes each with overhead. Rough formula:
@@ -166,15 +182,17 @@ roughly 2M. weir logs the estimate for your configured maxmemory at boot.
 
 Honest edges, beyond the [is-not list](#what-weir-is-not):
 
-- **At-least-once delivery.** Crashes and retries can duplicate events. Dedupe on
-  `idempotencyKey` — this is not optional.
+- **At-least-once delivery.** A crash between a 2xx and the outbox ack re-sends the event.
+  Dedupe on `idempotencyKey` — this is not optional.
 - **`seen` is best-effort.** A tx can be mined without weir ever seeing it unconfirmed
   (daemon restart, ZMQ gap, direct-to-block). It still gets its `confirmed` events; don't
   build logic that requires a `seen` first.
-- **`dropped`/`demoted`/`conflicted`/`expired` are one-shot.** If delivery fails after all
-  retries, the event is logged and lost. Only `confirmed` re-fires until delivered.
-- **Ordering isn't guaranteed** across event types under retries. Use `confs` and the
-  idempotency keys, not arrival order.
+- **Delivery is bounded by age, not by attempts.** An event that never gets a 2xx within
+  `OUTBOX_MAX_AGE` is dead-lettered (kept in redis, logged loudly) — it will not be retried
+  by itself. Watch `deadLetterCount` in heartbeats or `/health`.
+- **Ordering is best-effort across failures.** Events enqueued together arrive in order when
+  your endpoint is healthy; once a delivery fails, its retry can land after younger events.
+  Use `confs` and the idempotency keys, not arrival order.
 - **Script coverage:** p2pkh, p2sh, p2wpkh, p2wsh, p2tr. Exotic output scripts decode with
   `address: null` and can't be watched.
 - **Redis is the source of truth for watches.** Persistence is on (AOF) in the shipped

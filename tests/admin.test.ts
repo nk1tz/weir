@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { request as httpRequest } from 'node:http'
 import { startAdminServer } from '../src/admin/server'
+import type { TxEvent } from '../src/lib/types'
 import { FakeStore } from './fakes'
 
 const TOKEN = 'test-admin-token'
@@ -81,6 +82,9 @@ describe('admin server', () => {
   beforeEach(() => {
     store.watches.clear()
     store.expiries.clear()
+    store.outbox.clear()
+    store.outboxQueue.clear()
+    store.outboxDeadSet.clear()
     store.tip = null
     rpcOk = true
     lastBlockAt = null
@@ -112,7 +116,40 @@ describe('admin server', () => {
       tipHeight: 100,
       secondsSinceLastBlock: 5,
       watchCount: 1,
+      outboxDepth: 0,
+      outboxOldestAgeSec: null,
+      deadLetterCount: 0,
     })
+  })
+
+  it('GET /health reports the outbox (depth, oldest age, dead count) and stays 200: a down consumer is not a readiness failure', async () => {
+    const queued: TxEvent = {
+      version: 1,
+      event: 'dropped',
+      network: 'regtest',
+      txid: 'tx1',
+      confs: 0,
+      matched: [],
+      blockHeight: null,
+      blockHash: null,
+      hex: '',
+      idempotencyKey: 'regtest:tx1:dropped:1',
+      timestamp: 1_700_000_000_000,
+    }
+    store.enqueue(queued, 1_700_000_000_000 - 90_000)
+    store.enqueue({ ...queued, txid: 'tx2', idempotencyKey: 'regtest:tx2:dropped:1' }, 1_700_000_000_000 - 1_000)
+    store.outboxDeadSet.set('dead-1', 1)
+    store.outboxDeadSet.set('dead-2', 2)
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    let r: Reply
+    try {
+      r = await call(port, 'GET', '/health')
+    } finally {
+      now.mockRestore()
+    }
+
+    expect(r.status).toBe(200)
+    expect(r.json).toMatchObject({ ok: true, outboxDepth: 2, outboxOldestAgeSec: 90, deadLetterCount: 2 })
   })
 
   it('GET /health is 503 with rpc:false when the rpc ping rejects', async () => {
@@ -121,7 +158,7 @@ describe('admin server', () => {
     const r = await call(port, 'GET', '/health')
 
     expect(r.status).toBe(503)
-    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: false, tipHeight: null, secondsSinceLastBlock: null })
+    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: false, tipHeight: null, secondsSinceLastBlock: null, outboxDepth: 0 })
   })
 
   it('POST /watches without a token is 401', async () => {

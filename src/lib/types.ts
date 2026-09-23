@@ -74,6 +74,12 @@ export interface HeartbeatEvent extends EventBase {
   watchCount: number
   /** 0-100, or null when redis has no maxmemory set */
   memoryUsedPct: number | null
+  /** events queued for delivery (undelivered, still retrying) */
+  outboxDepth: number
+  /** age in seconds of the oldest queued event, null when the outbox is empty */
+  outboxOldestAgeSec: number | null
+  /** events given up on after OUTBOX_MAX_AGE (capped at OUTBOX_DEAD_MAX) */
+  deadLetterCount: number
 }
 
 export type WeirEvent = TxEvent | ExpiredEvent | HeartbeatEvent
@@ -85,7 +91,7 @@ export interface MaturingRecord {
   height: number
   blockHash: string
   matched: MatchedOutput[]
-  /** milestones already successfully delivered (e.g. [1] after the 1-conf event) */
+  /** milestones whose `confirmed` event has been ENQUEUED (e.g. [1] after the 1-conf event) */
   fired: number[]
   hex: string
 }

@@ -31,6 +31,17 @@ export interface Keys {
   mempoolPostBlock: string
   /** SET latest block's txids, intersection scratch space */
   blockTxids: string
+
+  /** ZSET eventId scored by nextAttemptAt unix ms — the durable delivery queue */
+  outbox: string
+  /** HASH per queued event (payload json, event, idempotencyKey, attempts, createdAt, lastError) */
+  outboxRecord: (eventId: string) => string
+  /** ZSET eventId scored by deadAt unix ms — events given up on after OUTBOX_MAX_AGE (capped) */
+  outboxDead: string
+  /** ZSET eventId scored by createdAt unix ms — the exact "oldest queued event" index (mirrors `outbox` membership) */
+  outboxCreated: string
+  /** ZSET txid scored by doneAt unix ms — txids whose tracking ENDED; a stale evaluation must not resurrect them */
+  tombstones: string
 }
 
 export function keysFor(network: Network): Keys {
@@ -48,6 +59,11 @@ export function keysFor(network: Network): Keys {
     mempoolCurrent: `${p}:mempool:current`,
     mempoolPostBlock: `${p}:mempool:postBlock`,
     blockTxids: `${p}:block:txids`,
+    outbox: `${p}:outbox`,
+    outboxRecord: (eventId: string) => `${p}:outbox:${eventId}`,
+    outboxDead: `${p}:outbox:dead`,
+    outboxCreated: `${p}:outbox:created`,
+    tombstones: `${p}:tombstones`,
   }
 }
 

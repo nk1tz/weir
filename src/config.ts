@@ -24,8 +24,11 @@ export interface WeirConfig {
   /** null = admin HTTP server does not exist */
   adminToken: string | null
   adminPort: number
-  webhookMaxRetries: number
   webhookTimeoutMs: number
+  /** seconds an undelivered event is retried before it is dead-lettered */
+  outboxMaxAgeSec: number
+  /** dead-letter cap: oldest dead events beyond this are dropped */
+  outboxDeadMax: number
 }
 
 const NETWORKS: Network[] = ['mainnet', 'testnet', 'signet', 'regtest']
@@ -41,6 +44,14 @@ function intOr(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   if (!raw) return fallback
   const n = Number(raw)
   if (!Number.isInteger(n) || n < 0) throw new Error(`${name} must be a non-negative integer, got "${raw}"`)
+  return n
+}
+
+function positiveIntOr(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name]?.trim()
+  if (!raw) return fallback
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) throw new Error(`${name} must be a positive integer, got "${raw}"`)
   return n
 }
 
@@ -108,7 +119,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WeirConfig {
     heartbeatInterval: intOr(env, 'HEARTBEAT_INTERVAL', 0),
     adminToken,
     adminPort: intOr(env, 'ADMIN_PORT', 8787),
-    webhookMaxRetries: intOr(env, 'WEBHOOK_MAX_RETRIES', 3),
     webhookTimeoutMs: intOr(env, 'WEBHOOK_TIMEOUT_MS', 10000),
+    outboxMaxAgeSec: positiveIntOr(env, 'OUTBOX_MAX_AGE', 259200),
+    outboxDeadMax: positiveIntOr(env, 'OUTBOX_DEAD_MAX', 1000),
   }
 }

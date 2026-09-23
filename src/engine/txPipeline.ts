@@ -1,16 +1,14 @@
 import type { DecodedTx, Network, TxEvent } from '../lib/types'
 import type { Store } from '../store/redis'
-import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
 import { log } from '../lib/log'
 import { matchTx } from './matcher'
 
 const CTX = 'txPipeline'
 
-/** Structural deps — tests pass in-memory fakes (tests/fakes.ts). */
+/** Structural deps — tests pass in-memory fakes (tests/fakes.ts). No sink: events are enqueued. */
 export interface TxEvaluatorDeps {
-  store: Pick<Store, 'isEvaluated' | 'markEvaluated' | 'addPending' | 'putRecord' | 'watchedSubset'>
-  sink: Sink
+  store: Pick<Store, 'isEvaluated' | 'markEvaluated' | 'watchedSubset' | 'recordSeen'>
   cfg: { network: Network; seenEnabled: boolean }
 }
 
@@ -23,20 +21,22 @@ export interface RawTxHandlerDeps extends TxEvaluatorDeps {
  *
  * - already evaluated → no-op.
  * - no matched outputs → markEvaluated only.
- * - matched, seen enabled (milestone 0 configured) → deliver a `seen` TxEvent first;
- *   only on delivery success does the tx become evaluated + pending — a failed
- *   delivery leaves it un-evaluated so the next mempool reparse retries it.
- * - matched, seen disabled → evaluated + pending directly, nothing delivered.
+ * - matched → `recordSeen(rec, event | null)`: ONE atomic store step that persists the
+ *   seen-time record (height 0 / blockHash '' — a dropped tx cannot be re-fetched from a
+ *   pruned node), marks the tx pending + evaluated, and enqueues the `seen` event (null when
+ *   milestone 0 is not configured). Nothing here awaits the network; the outbox delivers.
+ *   recordSeen resolves false when a concurrent path (a block mining the tx, or a duplicate
+ *   evaluation) got there first — then there is nothing left to do — or when the evaluation
+ *   is older than MAX_EVALUATION_AGE_MS (the fence; the txid stays un-evaluated).
  *
- * When a tx enters `pending` we also persist its per-txid record (same hash shape
- * as maturing records, height 0 / blockHash '') so later `dropped`/mined transitions
- * still have hex+matched available — a dropped tx cannot be re-fetched from a pruned
- * node with no txindex. The `maturing` ZSET itself still only indexes mined txs.
+ * `startedAtMs` is when this evaluation's view of the tx was taken: ZMQ receipt for the
+ * rawtx path, the moment getrawtransaction was issued for the reparser. It is the fence's
+ * clock — a response parked for longer than the tombstone TTL must never land.
  */
-export function makeTxEvaluator(deps: TxEvaluatorDeps): (tx: DecodedTx) => Promise<void> {
-  const { store, sink, cfg } = deps
+export function makeTxEvaluator(deps: TxEvaluatorDeps): (tx: DecodedTx, startedAtMs: number) => Promise<void> {
+  const { store, cfg } = deps
 
-  return async function evaluateTx(tx: DecodedTx): Promise<void> {
+  return async function evaluateTx(tx: DecodedTx, startedAtMs: number): Promise<void> {
     if (await store.isEvaluated(tx.txid)) return
 
     const matched = await matchTx(tx, store)
@@ -45,49 +45,39 @@ export function makeTxEvaluator(deps: TxEvaluatorDeps): (tx: DecodedTx) => Promi
       return
     }
 
-    if (cfg.seenEnabled) {
-      const event: TxEvent = {
-        version: 1,
-        event: 'seen',
-        network: cfg.network,
-        txid: tx.txid,
-        confs: 0,
-        matched,
-        idempotencyKey: idem.seen(cfg.network, tx.txid),
-        timestamp: Date.now(),
-        blockHeight: null,
-        blockHash: null,
-        hex: tx.hex,
-      }
-      const delivered = await sink.deliver(event)
-      if (!delivered) {
-        // Deliberately NOT marked evaluated: the next mempool reparse re-evaluates
-        // this txid and retries the seen delivery.
-        log.warn(CTX, `seen delivery failed for ${tx.txid}; leaving un-evaluated for reparse retry`)
-        return
-      }
-    }
+    const event: TxEvent | null = cfg.seenEnabled
+      ? {
+          version: 1,
+          event: 'seen',
+          network: cfg.network,
+          txid: tx.txid,
+          confs: 0,
+          matched,
+          idempotencyKey: idem.seen(cfg.network, tx.txid),
+          timestamp: Date.now(),
+          blockHeight: null,
+          blockHash: null,
+          hex: tx.hex,
+        }
+      : null
 
-    // Record before pending: anything in `pending` must have hex+matched on hand
-    // for the dropped/mined transitions (see doc comment above).
-    await store.putRecord({
-      txid: tx.txid,
-      height: 0,
-      blockHash: '',
-      matched,
-      fired: [],
-      hex: tx.hex,
-    })
-    await store.addPending(tx.txid)
-    await store.markEvaluated(tx.txid)
+    const recorded = await store.recordSeen(
+      { txid: tx.txid, height: 0, blockHash: '', matched, fired: [], hex: tx.hex },
+      event,
+      startedAtMs,
+    )
+    if (!recorded) {
+      log.info(CTX, `${tx.txid} not recorded (tracked by a concurrent path, or a stale evaluation) — seen skipped`)
+    }
   }
 }
 
-/** ZMQ rawtx path: decode → evaluate. */
+/** ZMQ rawtx path: decode → evaluate, with startedAtMs = receipt time. */
 export function makeRawTxHandler(deps: RawTxHandlerDeps): (raw: Buffer) => Promise<void> {
   const evaluate = makeTxEvaluator(deps)
   return async function handleRawTx(raw: Buffer): Promise<void> {
+    const startedAtMs = Date.now()
     const tx = deps.decodeRawTx(raw, deps.cfg.network)
-    await evaluate(tx)
+    await evaluate(tx, startedAtMs)
   }
 }

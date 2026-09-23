@@ -3,12 +3,27 @@
  * Spec: docs/DESIGN.md "src/store/redis.ts" (and "Redis schema").
  *
  * INVARIANTS
- * - A `maturing:{txid}` record exists from SEEN-time onward (`putRecord`, height 0 /
+ * - A `maturing:{txid}` record exists from SEEN-time onward (`recordSeen`, height 0 /
  *   blockHash ''); the `maturing` ZSET only ever indexes MINED txs. `promoteToMaturing` =
- *   one MULTI (putRecord + ZADD + leave pending/limbo + mark evaluated), `removeMaturing` =
- *   deleteRecord + ZREM, `unindexMaturing` = ZREM only (the maturing→limbo transition keeps
+ *   one MULTI (HSET record + ZADD + leave pending/limbo + mark evaluated), `removeMaturing` =
+ *   DEL record + ZREM, `unindexMaturing` = ZREM only (the maturing→limbo transition keeps
  *   the record), `demoteToPending` = one MULTI (record back to height 0 + SADD pending +
  *   SADD evaluated + SREM limbo — evaluated so the next reparse does not re-fire `seen`).
+ * - OUTBOX: every transition that produces an event enqueues it ATOMICALLY with its state
+ *   mutation — `HSET outbox:{id}` + `ZADD outbox now id` + `ZADD outbox:created now id`
+ *   appended to the same MULTI (`enqueue`). `recordSeen` is the one transition that
+ *   legitimately races the block pipeline (a tx can be mined while its mempool evaluation
+ *   is in flight), so it is a Lua script instead of a MULTI: same atomicity, plus guards
+ *   that refuse to double-track an already-evaluated txid, overwrite an already-mined
+ *   record, or resurrect a TOMBSTONED txid (tracking ended: final milestone or conflict).
+ *   Nothing here awaits the network; delivery is the drainer's job (src/delivery/outbox.ts).
+ * - Event ids are monotonic (`makeEventId`): ms prefix + per-ms sequence + random suffix,
+ *   so redis' tie order for equal ZSET scores (by member) IS enqueue order.
+ * - EVALUATION FENCE: `recordSeen` refuses an evaluation older than MAX_EVALUATION_AGE_MS
+ *   (measured from ZMQ receipt / the reparser's RPC issue). Tombstones bound the STORE side
+ *   for TOMBSTONE_TTL_MS; the fence bounds the EVALUATOR side, so a response parked longer
+ *   than the tombstone can never land after the tombstone is pruned.
+ * - Single redis instance: multi-key MULTI/EVAL without hash tags — not Redis Cluster.
  * - Bounded reconnects: boot fails fast on a bad REDIS_URL (connect() rejects). At runtime,
  *   exhausting the retries is FATAL from inside the reconnect strategy: node-redis emits no
  *   terminal event when it gives up, it just leaves a closed client — with no command in
@@ -16,8 +31,9 @@
  *   (quit()) is fatal for the same reason.
  */
 
+import { randomBytes } from 'node:crypto'
 import { createClient } from 'redis'
-import type { MaturingRecord, Network, Tip } from '../lib/types'
+import type { ExpiredEvent, MaturingRecord, Network, Tip, TxEvent, WeirEvent } from '../lib/types'
 import { describeError, fatal, log } from '../lib/log'
 import { type Keys, keysFor } from './keys'
 
@@ -26,10 +42,6 @@ const CTX = 'store'
 /** Connection attempts before giving up (boot: connect() rejects; runtime: fatal). */
 const MAX_RECONNECTS = 5
 
-/**
- * Managed redis (Elasticache, Upstash, ACL-restricted users, ...) refuses CONFIG with a
- * command-access error. Anything else (connection loss mid-call) is NOT "blocked".
- */
 /**
  * Managed redis (Upstash, ElastiCache, ...) blocks CONFIG with an explicit command-access
  * denial. Only those messages count as "blocked"; an auth failure (WRONGPASS/NOAUTH — Upstash's
@@ -42,6 +54,106 @@ function isConfigBlocked(msg: string): boolean {
 }
 
 type Client = ReturnType<typeof createClient>
+type Multi = ReturnType<Client['multi']>
+
+let eventSeqMs = -1
+let eventSeq = 0
+
+/**
+ * Outbox event id: `<nowMs padded 15>-<seq within that ms, padded 8>-<8 hex random>`. ZSET
+ * ties (equal scores) sort by member, so ids enqueued in the same millisecond deliver in
+ * enqueue order; the sequence restarts at 0 whenever the millisecond changes.
+ */
+export function makeEventId(nowMs: number): string {
+  if (nowMs !== eventSeqMs) {
+    eventSeqMs = nowMs
+    eventSeq = 0
+  } else {
+    eventSeq++
+  }
+  return `${String(nowMs).padStart(15, '0')}-${String(eventSeq).padStart(8, '0')}-${randomBytes(4).toString('hex')}`
+}
+
+/**
+ * An evaluation older than this (from ZMQ receipt, or from the moment the reparser issued
+ * getrawtransaction) is refused by `recordSeen`. MUST stay far below the block pipeline's
+ * TOMBSTONE_TTL_MS: the tombstone covers the store for an hour, the fence guarantees no
+ * evaluation can outlive it.
+ */
+export const MAX_EVALUATION_AGE_MS = 600_000
+
+/** What the drainer reads back for one queued event (`outboxRead`). */
+export interface OutboxRecord {
+  event: WeirEvent
+  attempts: number
+  /** unix ms when the event was enqueued — the dead-letter age clock */
+  createdAt: number
+  lastError: string | null
+}
+
+/**
+ * recordSeen as ONE atomic script (see module doc). Returns 1 when the tx was recorded;
+ * -1 when the evaluation is STALE (now − startedAt > maxAge: the fence); 0 when it was
+ * skipped because a concurrent path already handled it: `evaluated` holds the txid (a
+ * duplicate evaluation), the record already has height > 0 (the block pipeline mined +
+ * promoted it between this evaluation's read and its write), or the txid is TOMBSTONED
+ * (tracking already ENDED — final milestone or conflict — and the record is gone, so the
+ * first two guards would let a stale evaluation resurrect it as a height-0 pending record
+ * and the next block would emit a false `dropped`).
+ * KEYS: record, pending, evaluated, outbox, outbox record (unused when ARGV[7] is ''), tombstones, outbox:created.
+ * ARGV: txid, height, blockHash, matched, fired, hex, eventId, payload, event, idempotencyKey, nowMs, startedAtMs, maxAgeMs.
+ */
+const RECORD_SEEN_LUA = `
+if tonumber(ARGV[11]) - tonumber(ARGV[12]) > tonumber(ARGV[13]) then return -1 end
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then return 0 end
+local h = redis.call('HGET', KEYS[1], 'height')
+if h and tonumber(h) > 0 then return 0 end
+if redis.call('ZSCORE', KEYS[6], ARGV[1]) then return 0 end
+redis.call('HSET', KEYS[1], 'height', ARGV[2], 'blockHash', ARGV[3], 'matched', ARGV[4], 'fired', ARGV[5], 'hex', ARGV[6])
+redis.call('SADD', KEYS[2], ARGV[1])
+redis.call('SADD', KEYS[3], ARGV[1])
+if ARGV[7] ~= '' then
+  redis.call('HSET', KEYS[5], 'payload', ARGV[8], 'event', ARGV[9], 'idempotencyKey', ARGV[10], 'attempts', '0', 'createdAt', ARGV[11])
+  redis.call('ZADD', KEYS[4], ARGV[11], ARGV[7])
+  redis.call('ZADD', KEYS[7], ARGV[11], ARGV[7])
+end
+return 1
+`.trim()
+
+/**
+ * outboxRetry: a NO-OP (0) when the hash is gone — a concurrent ack won the race and an
+ * HSET here would create a partial hash that throws on every later read.
+ * KEYS: outbox record, outbox. ARGV: attempts, lastError, nextAtMs, id.
+ */
+const OUTBOX_RETRY_LUA = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('HSET', KEYS[1], 'attempts', ARGV[1], 'lastError', ARGV[2])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+return 1
+`.trim()
+
+/**
+ * outboxDead, atomically: same no-op guard; HSET attempts/lastError; ZREM outbox + created;
+ * ZADD dead; then cap the dead set at deadMax by dropping the OLDEST overflow entries with
+ * their hashes (ZRANGE the overflow, DEL each hash, ZREMRANGEBYRANK).
+ * KEYS: outbox record, outbox, outbox:dead, outbox:created.
+ * ARGV: attempts, lastError, id, nowMs, deadMax, outbox hash key prefix.
+ */
+const OUTBOX_DEAD_LUA = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('HSET', KEYS[1], 'attempts', ARGV[1], 'lastError', ARGV[2])
+redis.call('ZREM', KEYS[2], ARGV[3])
+redis.call('ZREM', KEYS[4], ARGV[3])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[3])
+local n = redis.call('ZCARD', KEYS[3])
+local max = tonumber(ARGV[5])
+if n > max then
+  local overflow = redis.call('ZRANGE', KEYS[3], 0, n - max - 1)
+  for _, dead in ipairs(overflow) do redis.call('DEL', ARGV[6] .. dead) end
+  redis.call('ZREMRANGEBYRANK', KEYS[3], 0, n - max - 1)
+end
+return 1
+`.trim()
 
 /** MaturingRecord hash fields: height (string int), blockHash, matched (JSON), fired (JSON), hex. */
 function recordToHash(rec: MaturingRecord): Record<string, string> {
@@ -51,6 +163,17 @@ function recordToHash(rec: MaturingRecord): Record<string, string> {
     matched: JSON.stringify(rec.matched),
     fired: JSON.stringify(rec.fired),
     hex: rec.hex,
+  }
+}
+
+/** Outbox hash fields at enqueue time (lastError is only written by retry/dead). */
+function outboxHash(event: WeirEvent, nowMs: number): Record<string, string> {
+  return {
+    payload: JSON.stringify(event),
+    event: event.event,
+    idempotencyKey: event.idempotencyKey,
+    attempts: '0',
+    createdAt: String(nowMs),
   }
 }
 
@@ -204,18 +327,6 @@ export class Store {
     await this.client.sAdd(this.keys.evaluated, txid)
   }
 
-  async unmarkEvaluated(txid: string): Promise<void> {
-    await this.client.sRem(this.keys.evaluated, txid)
-  }
-
-  async addPending(txid: string): Promise<void> {
-    await this.client.sAdd(this.keys.pending, txid)
-  }
-
-  async removePending(txid: string): Promise<void> {
-    await this.client.sRem(this.keys.pending, txid)
-  }
-
   async pendingTxids(): Promise<string[]> {
     return this.client.sMembers(this.keys.pending)
   }
@@ -242,8 +353,8 @@ export class Store {
 
   /**
    * SDIFF current − evaluated — txids needing evaluation this reparse. Deliberately NOT
-   * minus a previous snapshot: a tx whose `seen` delivery failed is un-evaluated and must
-   * be retried on the next reparse even though the mempool did not change.
+   * minus a previous snapshot: `evaluated` alone decides (a dropped tx is un-evaluated
+   * again, so a rebroadcast re-fires `seen` even though the mempool "did not change").
    */
   async newMempoolTxids(): Promise<string[]> {
     return this.client.sDiff([this.keys.mempoolCurrent, this.keys.evaluated])
@@ -315,19 +426,113 @@ export class Store {
 
   // ── per-txid records (exist from seen-time; see module doc) ────────────────
 
-  /** HSET the record hash only — no ZSET index. Used when a tx enters `pending`. */
-  async putRecord(rec: MaturingRecord): Promise<void> {
-    await this.client.hSet(this.keys.maturingRecord(rec.txid), recordToHash(rec))
-  }
-
   async readRecord(txid: string): Promise<MaturingRecord | null> {
     const h = await this.client.hGetAll(this.keys.maturingRecord(txid))
     if (Object.keys(h).length === 0) return null
     return hashToRecord(txid, h)
   }
 
-  async deleteRecord(txid: string): Promise<void> {
-    await this.client.del(this.keys.maturingRecord(txid))
+  // ── transitions that ENQUEUE (state mutation + outbox, atomically) ─────────
+
+  /** Append `HSET outbox:{id}` + `ZADD outbox nowMs id` + `ZADD outbox:created nowMs id` to a MULTI (see module doc). */
+  private enqueue(multi: Multi, event: WeirEvent, nowMs: number): void {
+    const id = makeEventId(nowMs)
+    multi
+      .hSet(this.keys.outboxRecord(id), outboxHash(event, nowMs))
+      .zAdd(this.keys.outbox, { score: nowMs, value: id })
+      .zAdd(this.keys.outboxCreated, { score: nowMs, value: id })
+  }
+
+  /**
+   * A tx paying a watched address entered the mempool: HSET record (height 0), SADD
+   * pending, SADD evaluated, + enqueue `seen` when `event` is non-null (null when seen
+   * events are disabled). One Lua script, guarded (see RECORD_SEEN_LUA). Resolves false
+   * when a guard skipped it — a concurrent path already tracks (or mined) the tx — or when
+   * the evaluation is older than MAX_EVALUATION_AGE_MS (`startedAtMs` = ZMQ receipt / RPC
+   * issue time; warned): the txid stays un-evaluated and the next reparse redoes it.
+   */
+  async recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<boolean> {
+    const h = recordToHash(rec)
+    const nowMs = Date.now()
+    const id = event === null ? '' : makeEventId(nowMs)
+    const reply = await this.client.eval(RECORD_SEEN_LUA, {
+      keys: [
+        this.keys.maturingRecord(rec.txid),
+        this.keys.pending,
+        this.keys.evaluated,
+        this.keys.outbox,
+        id === '' ? this.keys.outbox : this.keys.outboxRecord(id),
+        this.keys.tombstones,
+        this.keys.outboxCreated,
+      ],
+      arguments: [
+        rec.txid,
+        h['height'] as string,
+        h['blockHash'] as string,
+        h['matched'] as string,
+        h['fired'] as string,
+        h['hex'] as string,
+        id,
+        event === null ? '' : JSON.stringify(event),
+        event === null ? '' : event.event,
+        event === null ? '' : event.idempotencyKey,
+        String(nowMs),
+        String(startedAtMs),
+        String(MAX_EVALUATION_AGE_MS),
+      ],
+    })
+    const code = Number(reply)
+    if (code === -1) {
+      log.warn(
+        CTX,
+        `refused stale evaluation of ${rec.txid}: started ${nowMs - startedAtMs}ms ago (fence ${MAX_EVALUATION_AGE_MS}ms) — left un-evaluated for the next reparse`,
+      )
+    }
+    return code === 1
+  }
+
+  /** A milestone was reached: HSET fired + enqueue `confirmed`, one MULTI. */
+  async markFired(txid: string, fired: number[], event: TxEvent): Promise<void> {
+    const multi = this.client.multi().hSet(this.keys.maturingRecord(txid), { fired: JSON.stringify(fired) })
+    this.enqueue(multi, event, Date.now())
+    await multi.exec()
+  }
+
+  /**
+   * A pending tx left the mempool unmined: SREM pending, SREM evaluated (a rebroadcast may
+   * legitimately re-fire `seen`), DEL record, + enqueue `dropped`, one MULTI.
+   */
+  async dropPending(txid: string, event: TxEvent): Promise<void> {
+    const multi = this.client
+      .multi()
+      .sRem(this.keys.pending, txid)
+      .sRem(this.keys.evaluated, txid)
+      .del(this.keys.maturingRecord(txid))
+    this.enqueue(multi, event, Date.now())
+    await multi.exec()
+  }
+
+  /**
+   * A watch passed its deadline unpaid: SREM addresses, ZREM expiries, + enqueue `expired`,
+   * one MULTI.
+   */
+  async expireWatch(addr: string, event: ExpiredEvent): Promise<void> {
+    const multi = this.client.multi().sRem(this.keys.addresses, addr).zRem(this.keys.expiries, addr)
+    this.enqueue(multi, event, Date.now())
+    await multi.exec()
+  }
+
+  /**
+   * Tracking ends without an event (the watch was removed mid-flight): SREM pending,
+   * SREM limbo, DEL record, one MULTI. The maturing index never holds such a tx.
+   */
+  async endTracking(txid: string): Promise<void> {
+    await this.client
+      .multi()
+      .sRem(this.keys.pending, txid)
+      .sRem(this.keys.limbo, txid)
+      .del(this.keys.maturingRecord(txid))
+      .exec()
   }
 
   // ── maturing (mined, below max milestone) ──────────────────────────────────
@@ -349,21 +554,66 @@ export class Store {
   }
 
   /**
-   * The ONE reorg demotion (maturing/limbo → pending), atomically (MULTI): HSET record back
-   * to height 0 / blockHash '' / fired [], SADD pending, SADD evaluated, SREM limbo. Marking
-   * it evaluated is essential: the tip prune forgot the txid from `evaluated` when it was
-   * mined, so without this the next mempool reparse would re-evaluate it and emit a second
-   * `seen` under the same idempotency key.
+   * The ONE reorg demotion (limbo → pending), atomically (MULTI): HSET record back to
+   * height 0 / blockHash '' / fired [], SADD pending, SADD evaluated, SREM limbo, + enqueue
+   * `demoted`. Marking it evaluated is essential: the tip prune forgot the txid from
+   * `evaluated` when it was mined, so without this the next mempool reparse would
+   * re-evaluate it and emit a second `seen` under the same idempotency key.
    */
-  async demoteToPending(rec: MaturingRecord): Promise<void> {
+  async demoteToPending(rec: MaturingRecord, event: TxEvent): Promise<void> {
     const demoted: MaturingRecord = { ...rec, height: 0, blockHash: '', fired: [] }
-    await this.client
+    const multi = this.client
       .multi()
       .hSet(this.keys.maturingRecord(rec.txid), recordToHash(demoted))
       .sAdd(this.keys.pending, rec.txid)
       .sAdd(this.keys.evaluated, rec.txid)
       .sRem(this.keys.limbo, rec.txid)
+    this.enqueue(multi, event, Date.now())
+    await multi.exec()
+  }
+
+  /**
+   * The terminal reorg outcome (limbo → gone): SREM pending, ZREM maturing, DEL record,
+   * SREM limbo, ZADD tombstones (tracking ENDED), + enqueue `conflicted`, one MULTI.
+   */
+  async conflict(txid: string, event: TxEvent): Promise<void> {
+    const nowMs = Date.now()
+    const multi = this.client
+      .multi()
+      .sRem(this.keys.pending, txid)
+      .zRem(this.keys.maturing, txid)
+      .del(this.keys.maturingRecord(txid))
+      .sRem(this.keys.limbo, txid)
+      .zAdd(this.keys.tombstones, { score: nowMs, value: txid })
+    this.enqueue(multi, event, nowMs)
+    await multi.exec()
+  }
+
+  /**
+   * The final-milestone cleanup (tracking ENDED): DEL record, ZREM maturing, ZADD
+   * tombstones score=nowMs, one MULTI. The tombstone stops a stale evaluation (a mempool
+   * RPC that read the tx before the block and returned after this cleanup) from
+   * resurrecting the txid as a height-0 pending record — the next block would report
+   * a false `dropped` for a payment that confirmed. `dropPending` deliberately does NOT
+   * tombstone: a rebroadcast may legitimately re-fire `seen`.
+   */
+  async finishMaturing(txid: string, nowMs: number): Promise<void> {
+    await this.client
+      .multi()
+      .del(this.keys.maturingRecord(txid))
+      .zRem(this.keys.maturing, txid)
+      .zAdd(this.keys.tombstones, { score: nowMs, value: txid })
       .exec()
+  }
+
+  /** ZSCORE tombstones — true when the txid's tracking ended within the tombstone TTL. */
+  async isTombstoned(txid: string): Promise<boolean> {
+    return (await this.client.zScore(this.keys.tombstones, txid)) !== null
+  }
+
+  /** ZREMRANGEBYSCORE tombstones -inf beforeMs — the tip-block prune. */
+  async pruneTombstones(beforeMs: number): Promise<void> {
+    await this.client.zRemRangeByScore(this.keys.tombstones, '-inf', beforeMs)
   }
 
   /** Every maturing txid with its inclusion height (ZSET score), ascending. */
@@ -378,11 +628,7 @@ export class Store {
     await this.client.zRem(this.keys.maturing, txids)
   }
 
-  async setMaturingFired(txid: string, fired: number[]): Promise<void> {
-    await this.client.hSet(this.keys.maturingRecord(txid), { fired: JSON.stringify(fired) })
-  }
-
-  /** deleteRecord + ZREM index, atomically (MULTI). */
+  /** DEL record + ZREM index, atomically (MULTI) — dangling-index cleanup (no tombstone; `finishMaturing` ends tracking). */
   async removeMaturing(txid: string): Promise<void> {
     await this.client
       .multi()
@@ -410,8 +656,9 @@ export class Store {
    * Nuclear option for the prune-window guard: downtime exceeded what the pruned node
    * can replay, so all in-flight tx tracking is unrecoverable. Clears every tracking
    * structure (maturing index + records, pending, limbo, evaluated, mempool scratch)
-   * while PRESERVING the watch set, expiries, tip and ring. Returns the txids whose
-   * tracking was lost so the caller can log them loudly.
+   * while PRESERVING the watch set, expiries, tip, ring AND the outbox (queued events are
+   * still owed — `maturing:*` never matches `outbox*`). Returns the txids whose tracking
+   * was lost so the caller can log them loudly.
    */
   async clearTracking(): Promise<string[]> {
     const lost = new Set<string>([
@@ -435,6 +682,76 @@ export class Store {
       this.keys.blockTxids,
     ])
     return [...lost]
+  }
+
+  // ── outbox (the drainer's surface; contracts under DESIGN "Outbox") ────────
+
+  /** Ids due at or before nowMs, ascending by score (ZRANGEBYSCORE -inf now LIMIT 0 limit). */
+  async outboxDue(nowMs: number, limit: number): Promise<string[]> {
+    return this.client.zRangeByScore(this.keys.outbox, '-inf', nowMs, { LIMIT: { offset: 0, count: limit } })
+  }
+
+  /** The queued event + retry bookkeeping; null when the hash is gone (dangling id). */
+  async outboxRead(id: string): Promise<OutboxRecord | null> {
+    const h = await this.client.hGetAll(this.keys.outboxRecord(id))
+    if (Object.keys(h).length === 0) return null
+    const payload = h['payload']
+    const createdAt = h['createdAt']
+    if (payload === undefined || createdAt === undefined) {
+      throw new Error(`[${CTX}] corrupt outbox record ${id}: missing fields (${Object.keys(h).join(',')})`)
+    }
+    const lastError = h['lastError']
+    return {
+      event: JSON.parse(payload) as WeirEvent,
+      attempts: Number.parseInt(h['attempts'] ?? '0', 10),
+      createdAt: Number.parseInt(createdAt, 10),
+      lastError: lastError === undefined || lastError === '' ? null : lastError,
+    }
+  }
+
+  /** Delivered (or dangling): DEL hash + ZREM queue + ZREM created, one MULTI. */
+  async outboxAck(id: string): Promise<void> {
+    await this.client
+      .multi()
+      .del(this.keys.outboxRecord(id))
+      .zRem(this.keys.outbox, id)
+      .zRem(this.keys.outboxCreated, id)
+      .exec()
+  }
+
+  /**
+   * Failed attempt, still within OUTBOX_MAX_AGE: HSET attempts/lastError + ZADD the next due
+   * time — one Lua, a no-op when the hash is gone (see OUTBOX_RETRY_LUA). Resolves false then.
+   */
+  async outboxRetry(id: string, nextAtMs: number, attempts: number, lastError: string): Promise<boolean> {
+    const reply = await this.client.eval(OUTBOX_RETRY_LUA, {
+      keys: [this.keys.outboxRecord(id), this.keys.outbox],
+      arguments: [String(attempts), lastError, String(nextAtMs), id],
+    })
+    return Number(reply) === 1
+  }
+
+  /**
+   * Given up: HSET attempts/lastError, ZREM queue + created, ZADD dead (score = nowMs), and
+   * the dead cap (oldest overflow dropped WITH their hashes) — one Lua, atomically; a no-op
+   * when the hash is gone (see OUTBOX_DEAD_LUA). Resolves false then.
+   */
+  async outboxDead(id: string, nowMs: number, attempts: number, lastError: string, deadMax: number): Promise<boolean> {
+    const reply = await this.client.eval(OUTBOX_DEAD_LUA, {
+      keys: [this.keys.outboxRecord(id), this.keys.outbox, this.keys.outboxDead, this.keys.outboxCreated],
+      arguments: [String(attempts), lastError, id, String(nowMs), String(deadMax), this.keys.outboxRecord('')],
+    })
+    return Number(reply) === 1
+  }
+
+  /** depth = ZCARD outbox, dead = ZCARD dead, oldestCreatedAt = the lowest score in `outbox:created` (exact). */
+  async outboxStats(): Promise<{ depth: number; oldestCreatedAt: number | null; dead: number }> {
+    const [depth, dead, oldest] = await Promise.all([
+      this.client.zCard(this.keys.outbox),
+      this.client.zCard(this.keys.outboxDead),
+      this.client.zRangeWithScores(this.keys.outboxCreated, 0, 0),
+    ])
+    return { depth, oldestCreatedAt: oldest[0]?.score ?? null, dead }
   }
 
   // ── meta ───────────────────────────────────────────────────────────────────

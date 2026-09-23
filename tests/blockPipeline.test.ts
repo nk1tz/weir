@@ -3,7 +3,7 @@ import { makeBlockHandler, makeBlockProcessor, type BlockPipelineDeps } from '..
 import { makeTxEvaluator } from '../src/engine/txPipeline'
 import { findForkPoint } from '../src/engine/reorg'
 import type { DecodedTx, MatchedOutput, TxEvent } from '../src/lib/types'
-import { ADDR, FakeChain, FakeSink, FakeStore, mkTx } from './fakes'
+import { ADDR, FakeChain, FakeStore, mkTx } from './fakes'
 
 // ─── helpers ─────────────────────────────────────────────────────────────────────────────
 
@@ -12,7 +12,6 @@ const MATCHED: MatchedOutput[] = [{ address: ADDR, vout: 0, valueSats: 5000 }]
 function setup(cfgOverrides: Partial<BlockPipelineDeps['cfg']> = {}) {
   const store = new FakeStore()
   const chain = new FakeChain()
-  const sink = new FakeSink()
   const cfg = {
     network: 'regtest' as const,
     confirmMilestones: [1, 3],
@@ -24,11 +23,10 @@ function setup(cfgOverrides: Partial<BlockPipelineDeps['cfg']> = {}) {
     cfg,
     store,
     rpc: chain.rpc(),
-    sink,
     decodeBlock: chain.decode,
   }
   const process = makeBlockProcessor(deps)
-  return { store, chain, sink, cfg, deps, process }
+  return { store, chain, cfg, deps, process }
 }
 
 /** Register `hash` as a block, set it as weir's tip and put it in the ring. */
@@ -38,7 +36,7 @@ function seedTip(store: FakeStore, chain: FakeChain, height: number, hash: strin
   store.ring.set(hash, height)
 }
 
-/** Leave a tx exactly as the tx pipeline would after a delivered `seen`. */
+/** Leave a tx exactly as the tx pipeline would after `recordSeen`. */
 function seedPending(store: FakeStore, tx: DecodedTx): void {
   store.pending.add(tx.txid)
   store.evaluated.add(tx.txid)
@@ -52,8 +50,9 @@ function seedPending(store: FakeStore, tx: DecodedTx): void {
   })
 }
 
-const confirmedEvents = (sink: FakeSink): TxEvent[] =>
-  sink.delivered.filter((e): e is TxEvent => e.event === 'confirmed')
+/** Every ENQUEUED confirmed event (tests/fakes.ts outbox), in enqueue order. */
+const confirmedEvents = (store: FakeStore): TxEvent[] =>
+  store.outboxEvents().filter((e): e is TxEvent => e.event === 'confirmed')
 
 // ─── tests ───────────────────────────────────────────────────────────────────────────────
 
@@ -68,7 +67,7 @@ describe('blockPipeline', () => {
   })
 
   it('connected block promotes pending → maturing and fires confirmed:1 with the correct idempotency key', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
@@ -84,7 +83,7 @@ describe('blockPipeline', () => {
     expect(rec.blockHash).toBe('b101')
     expect(rec.fired).toEqual([1])
 
-    const confirmed = confirmedEvents(sink)
+    const confirmed = confirmedEvents(store)
     expect(confirmed).toHaveLength(1)
     const ev = confirmed[0]!
     expect(ev.txid).toBe('tx1')
@@ -101,7 +100,7 @@ describe('blockPipeline', () => {
   })
 
   it('a matched tx never seen in the mempool still confirms', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx9 = mkTx('tx9') // never pending, never evaluated
@@ -111,7 +110,7 @@ describe('blockPipeline', () => {
 
     expect(store.maturingIndex.get('tx9')).toBe(101)
     expect(store.records.get('tx9')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1], hex: 'hex-tx9' })
-    const confirmed = confirmedEvents(sink)
+    const confirmed = confirmedEvents(store)
     expect(confirmed).toHaveLength(1)
     expect(confirmed[0]!.idempotencyKey).toBe('regtest:tx9:confirmed:1:b101')
   })
@@ -119,7 +118,7 @@ describe('blockPipeline', () => {
   it('promotion ignores the evaluated flag: evaluated with NO record (crash before addMaturing) still confirms', async () => {
     // Regression (a): a crash between markEvaluated and addMaturing left the tx "evaluated"
     // with no record; on block replay the never-seen branch skipped it — tracking lost.
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
@@ -130,19 +129,19 @@ describe('blockPipeline', () => {
 
     expect(store.maturingIndex.get('tx1')).toBe(101)
     expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] })
-    expect(confirmedEvents(sink).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
+    expect(confirmedEvents(store).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
   })
 
   it('a tx evaluated as no-match in the mempool, whose address is watched afterwards, confirms when mined', async () => {
     // Regression (b): the mempool evaluator marked it evaluated (no match at the time); the
     // watch arrived later; the never-seen branch then skipped it on mining — never confirmed.
-    const { store, chain, sink, process, cfg } = setup()
+    const { store, chain, process, cfg } = setup()
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
-    const evaluate = makeTxEvaluator({ store, sink, cfg: { network: cfg.network, seenEnabled: true } })
-    await evaluate(tx1) // nothing watched yet → evaluated, no match
+    const evaluate = makeTxEvaluator({ store, cfg: { network: cfg.network, seenEnabled: true } })
+    await evaluate(tx1, Date.now()) // nothing watched yet → evaluated, no match
     expect(store.evaluated.has('tx1')).toBe(true)
-    expect(sink.attempts).toHaveLength(0)
+    expect(store.outboxEvents()).toHaveLength(0)
 
     store.watches.add(ADDR) // the consumer starts watching after the tx was already in the mempool
     chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
@@ -150,7 +149,7 @@ describe('blockPipeline', () => {
     await process(chain.raw('b101'))
 
     expect(store.maturingIndex.get('tx1')).toBe(101)
-    expect(confirmedEvents(sink).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
+    expect(confirmedEvents(store).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
   })
 
   it('promotion is ONE step: right after it (before the tip prune) record+index are set, pending/limbo cleared, evaluated set', async () => {
@@ -190,14 +189,14 @@ describe('blockPipeline', () => {
   })
 
   it('interrupted after promotion, then the SAME block replayed: the record guard holds and confirmed fires once', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
     seedPending(store, tx1)
     chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
 
-    // Crash between the milestone sweep and the tip update (promotion + confirmed:1 are durable).
+    // Crash between the milestone sweep and the tip update (promotion + the enqueued confirmed:1 are durable).
     const setTip = store.setTip.bind(store)
     store.setTip = async () => {
       throw new Error('redis went away')
@@ -212,7 +211,7 @@ describe('blockPipeline', () => {
     store.setTip = setTip
     await process(chain.raw('b101'))
 
-    expect(confirmedEvents(sink).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101']) // once
+    expect(confirmedEvents(store).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101']) // once
     expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] }) // untouched
     expect(store.maturingIndex.get('tx1')).toBe(101)
     expect(store.tip).toEqual({ hash: 'b101', height: 101 })
@@ -220,7 +219,7 @@ describe('blockPipeline', () => {
   })
 
   it('milestone 3 fires two blocks after the inclusion block, then tracking ends', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
@@ -231,21 +230,42 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b101'))
     await process(chain.raw('b102'))
-    expect(confirmedEvents(sink)).toHaveLength(1) // confs=2 fires nothing new
+    expect(confirmedEvents(store)).toHaveLength(1) // confs=2 fires nothing new
 
     await process(chain.raw('b103'))
-    const confirmed = confirmedEvents(sink)
+    const confirmed = confirmedEvents(store)
     expect(confirmed).toHaveLength(2)
     expect(confirmed[1]!.confs).toBe(3)
     expect(confirmed[1]!.idempotencyKey).toBe('regtest:tx1:confirmed:3:b101')
     expect(confirmed[1]!.timestamp).toBe(1_700_000_103 * 1000)
-    // final removal: confs ≥ maxMilestone and all milestones fired
+    // final removal: confs ≥ maxMilestone and all milestones fired → tombstoned
+    expect(store.maturingIndex.has('tx1')).toBe(false)
+    expect(store.records.has('tx1')).toBe(false)
+    expect(store.tombstones.get('tx1')).toBeTypeOf('number')
+  })
+
+  it('the never-seen branch skips a tombstoned txid: a block replay after the final cleanup does not restart tracking', async () => {
+    const { store, chain, process } = setup({ confirmMilestones: [1], maxMilestone: 1 })
+    store.watches.add(ADDR)
+    seedTip(store, chain, 100, 'b100')
+    const tx1 = mkTx('tx1')
+    chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
+    await process(chain.raw('b101')) // confirmed:1 → final cleanup → tombstone
+    expect(confirmedEvents(store)).toHaveLength(1)
+    expect(store.tombstones.has('tx1')).toBe(true)
+
+    // crash before the tip write, same block replayed: the record is gone, so only the tombstone can tell
+    store.tip = { hash: 'b100', height: 100 }
+    store.ring.delete('b101')
+    await process(chain.raw('b101'))
+
+    expect(confirmedEvents(store)).toHaveLength(1) // not re-promoted, not re-fired
     expect(store.maturingIndex.has('tx1')).toBe(false)
     expect(store.records.has('tx1')).toBe(false)
   })
 
   it('a jump across two milestones fires both in one sweep', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 102, 'b102')
     // tx maturing since height 100 with nothing fired yet
@@ -256,7 +276,7 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b103')) // confs = 103 - 100 + 1 = 4
 
-    const confirmed = confirmedEvents(sink)
+    const confirmed = confirmedEvents(store)
     expect(confirmed.map((e) => e.idempotencyKey)).toEqual([
       'regtest:tx1:confirmed:1:b100',
       'regtest:tx1:confirmed:3:b100',
@@ -266,7 +286,7 @@ describe('blockPipeline', () => {
   })
 
   it('gap catch-up processes intermediate blocks in order', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
@@ -282,8 +302,8 @@ describe('blockPipeline', () => {
     expect(await store.ringHashAt(102)).toBe('b102')
     expect(await store.ringHashAt(103)).toBe('b103')
     expect(store.tip).toEqual({ hash: 'b103', height: 103 })
-    // milestones fired in block order during catch-up: 1 at b101's sweep, 3 at b103's
-    const confirmed = confirmedEvents(sink)
+    // milestones enqueued in block order during catch-up: 1 at b101's sweep, 3 at b103's
+    const confirmed = confirmedEvents(store)
     expect(confirmed.map((e) => e.idempotencyKey)).toEqual([
       'regtest:tx1:confirmed:1:b101',
       'regtest:tx1:confirmed:3:b101',
@@ -294,7 +314,7 @@ describe('blockPipeline', () => {
   })
 
   it('reorg with re-inclusion resets fired and re-fires with the new blockHash idempotency key', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     const tx1 = mkTx('tx1')
     chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
@@ -312,7 +332,7 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b102b'))
 
-    const confirmed = confirmedEvents(sink)
+    const confirmed = confirmedEvents(store)
     expect(confirmed).toHaveLength(1)
     expect(confirmed[0]!.idempotencyKey).toBe('regtest:tx1:confirmed:1:b101b')
     expect(confirmed[0]!.blockHash).toBe('b101b')
@@ -322,11 +342,11 @@ describe('blockPipeline', () => {
     expect(rec.fired).toEqual([1])
     expect(store.maturingIndex.get('tx1')).toBe(101)
     expect(store.tip).toEqual({ hash: 'b102b', height: 102 })
-    expect(sink.delivered.filter((e) => e.event === 'demoted' || e.event === 'conflicted')).toHaveLength(0)
+    expect(store.outboxEvents().filter((e) => e.event === 'demoted' || e.event === 'conflicted')).toHaveLength(0)
   })
 
   it('reorg demotion emits demoted with the old block fields and returns the tx to pending', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
     store.tip = { hash: 'b101a', height: 101 }
@@ -342,7 +362,7 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b101b'))
 
-    const demoted = sink.delivered.filter((e): e is TxEvent => e.event === 'demoted')
+    const demoted = store.outboxEvents().filter((e): e is TxEvent => e.event === 'demoted')
     expect(demoted).toHaveLength(1)
     expect(demoted[0]!.txid).toBe('tx1')
     expect(demoted[0]!.confs).toBe(0)
@@ -361,7 +381,7 @@ describe('blockPipeline', () => {
   })
 
   it('conflicted (gone from mempool and chain) emits with last confirmed depth and cleans up fully', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
     chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [mkTx('tx1')] }, { main: false })
@@ -375,7 +395,7 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b101b'))
 
-    const conflicted = sink.delivered.filter((e): e is TxEvent => e.event === 'conflicted')
+    const conflicted = store.outboxEvents().filter((e): e is TxEvent => e.event === 'conflicted')
     expect(conflicted).toHaveLength(1)
     expect(conflicted[0]!.confs).toBe(1) // last confirmed depth
     expect(conflicted[0]!.blockHeight).toBe(101)
@@ -389,7 +409,7 @@ describe('blockPipeline', () => {
   })
 
   it('dropped emits, removes pending, un-evaluates (seen can re-fire) and deletes the record', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
@@ -400,7 +420,7 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b101'))
 
-    const dropped = sink.delivered.filter((e): e is TxEvent => e.event === 'dropped')
+    const dropped = store.outboxEvents().filter((e): e is TxEvent => e.event === 'dropped')
     expect(dropped).toHaveLength(1)
     expect(dropped[0]!.txid).toBe('tx1')
     expect(dropped[0]!.confs).toBe(0)
@@ -416,7 +436,7 @@ describe('blockPipeline', () => {
   })
 
   it('TTL sweep emits expired and removes the watch', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     const addr = 'bcrt1qttlwatch'
     const expiresAtMs = Date.now() - 60_000
     store.watches.add(addr)
@@ -426,7 +446,7 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b101'))
 
-    const expired = sink.delivered.filter((e) => e.event === 'expired')
+    const expired = store.outboxEvents().filter((e) => e.event === 'expired')
     expect(expired).toHaveLength(1)
     expect(expired[0]!).toMatchObject({
       event: 'expired',
@@ -438,38 +458,10 @@ describe('blockPipeline', () => {
     expect(store.expiries.has(addr)).toBe(false)
   })
 
-  it('failed confirmed delivery is not added to fired and retries on the next block', async () => {
-    const { store, chain, sink, process } = setup()
-    store.watches.add(ADDR)
-    seedTip(store, chain, 100, 'b100')
-    const tx1 = mkTx('tx1')
-    seedPending(store, tx1)
-    chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
-    chain.addBlock({ hash: 'b102', prevHash: 'b101', height: 102, time: 1_700_000_102, txs: [] })
-
-    sink.failWhen = (ev) => ev.event === 'confirmed'
-    await process(chain.raw('b101'))
-
-    expect(confirmedEvents(sink)).toHaveLength(0)
-    expect(store.records.get('tx1')!.fired).toEqual([]) // failure NOT recorded as fired
-    expect(store.maturingIndex.get('tx1')).toBe(101) // still tracked
-
-    sink.failWhen = () => false
-    await process(chain.raw('b102'))
-
-    const confirmed = confirmedEvents(sink)
-    expect(confirmed).toHaveLength(1)
-    expect(confirmed[0]!.confs).toBe(1)
-    expect(confirmed[0]!.idempotencyKey).toBe('regtest:tx1:confirmed:1:b101') // same key as the failed attempt
-    expect(store.records.get('tx1')!.fired).toEqual([1])
-    const confirmedAttempts = sink.attempts.filter((e) => e.event === 'confirmed')
-    expect(confirmedAttempts).toHaveLength(2)
-  })
-
   it('a pending tx mined in a LATER missed block is NOT falsely dropped during catch-up', async () => {
     // Regression: the dropped check compares pending against the LIVE mempool, which is
     // meaningless for historical blocks — it must only run for the tip block.
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
@@ -484,8 +476,8 @@ describe('blockPipeline', () => {
 
     // the old behavior emitted dropped (at b101) then confirmed (at b102) — seen by
     // consumers as a payment that failed and then somehow confirmed anyway
-    expect(sink.delivered.filter((e) => e.event === 'dropped')).toHaveLength(0)
-    const confirmed = confirmedEvents(sink)
+    expect(store.outboxEvents().filter((e) => e.event === 'dropped')).toHaveLength(0)
+    const confirmed = confirmedEvents(store)
     expect(confirmed.map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b102'])
     expect(store.maturingIndex.get('tx1')).toBe(102)
     expect(store.pending.has('tx1')).toBe(false)
@@ -499,7 +491,7 @@ describe('blockPipeline', () => {
     // Reorg 1: b101z → b101b,b102b (tx1 re-included in b101b). Reorg 2 forks at b101b:
     // b102b → b102c,b103c. tx1 stays canonical in b101b — no conflicted/demoted, and
     // its milestone 3 fires at b103c under the b101b idempotency key.
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     const tx1 = mkTx('tx1')
     chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
@@ -535,8 +527,8 @@ describe('blockPipeline', () => {
       { height: 103, hash: 'b103c' },
     ])
     expect(store.limbo.size).toBe(0)
-    expect(sink.attempts.filter((e) => e.event === 'conflicted' || e.event === 'demoted')).toHaveLength(0)
-    expect(confirmedEvents(sink).map((e) => e.idempotencyKey)).toEqual([
+    expect(store.outboxEvents().filter((e) => e.event === 'conflicted' || e.event === 'demoted')).toHaveLength(0)
+    expect(confirmedEvents(store).map((e) => e.idempotencyKey)).toEqual([
       'regtest:tx1:confirmed:1:b101b',
       'regtest:tx1:confirmed:3:b101b',
     ])
@@ -561,7 +553,7 @@ describe('blockPipeline', () => {
     // Same root cause, observable end to end: with genesis invisible to the fork search the
     // walk never reached height 0, so the replacement block was treated as a gap and the
     // tx in the disconnected block stayed "maturing" — never demoted.
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     chain.addBlock({ hash: 'genesis', prevHash: '', height: 0, time: 1_700_000_000, txs: [] })
     chain.addBlock({ hash: 'b1a', prevHash: 'genesis', height: 1, time: 1_700_000_001, txs: [mkTx('tx1')] }, { main: false })
@@ -576,7 +568,7 @@ describe('blockPipeline', () => {
 
     await process(chain.raw('b1b'))
 
-    const demoted = sink.delivered.filter((e): e is TxEvent => e.event === 'demoted')
+    const demoted = store.outboxEvents().filter((e): e is TxEvent => e.event === 'demoted')
     expect(demoted.map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:demoted:b1a'])
     expect(store.maturingIndex.has('tx1')).toBe(false)
     expect(store.pending.has('tx1')).toBe(true)
@@ -586,7 +578,7 @@ describe('blockPipeline', () => {
   })
 
   it('downtime beyond the prune window resets tracking loudly instead of crash-looping', async () => {
-    const { store, chain, sink, process } = setup()
+    const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
     // in-flight state that will be unrecoverable
@@ -605,7 +597,7 @@ describe('blockPipeline', () => {
     await process(chain.raw('b104')) // must NOT throw
 
     // tracking wiped, no phantom events, watches intact, tip jumped forward
-    expect(sink.delivered).toHaveLength(0)
+    expect(store.outboxEvents()).toHaveLength(0)
     expect(store.pending.size).toBe(0)
     expect(store.maturingIndex.size).toBe(0)
     expect(store.records.size).toBe(0)

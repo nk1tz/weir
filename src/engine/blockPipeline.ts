@@ -12,11 +12,19 @@
  *   reported dropped).
  * - A tx's `maturing:{txid}` record exists from SEEN-time (height 0); the `maturing` ZSET
  *   only indexes MINED txs.
+ * - There are NO delivery-failure branches: every event is enqueued in the same store
+ *   transition as its state change (markFired, dropPending, expireWatch, demoteToPending,
+ *   conflict) and the outbox drainer retries it. The pipeline never holds a sink.
+ * - TOMBSTONES: when tracking ENDS (final milestone → `finishMaturing`; `conflict`) the txid
+ *   is tombstoned for TOMBSTONE_TTL_MS so a stale mempool evaluation (an RPC that read the
+ *   tx before the block and returned after the cleanup) cannot resurrect it — the next block
+ *   would otherwise report a false `dropped` for a payment that confirmed. The never-seen
+ *   promotion branch skips tombstoned txids for the same reason. `dropPending` never
+ *   tombstones: a rebroadcast may legitimately re-fire `seen`. Pruned on every tip block.
  */
 import type { DecodedBlock, ExpiredEvent, MaturingRecord, Network, TxEvent } from '../lib/types'
 import type { Rpc } from '../bitcoin/rpc'
 import type { Store } from '../store/redis'
-import type { Sink } from '../delivery/webhook'
 import { idem } from '../store/keys'
 import { fatal, log } from '../lib/log'
 import { matchAgainst } from './matcher'
@@ -27,6 +35,13 @@ const CTX = 'blockPipeline'
 /** SMISMEMBER argument cap per round trip when resolving a block's distinct output addresses. */
 const WATCHED_SUBSET_CHUNK = 1000
 
+/**
+ * How long an ended txid stays tombstoned. The stale window it guards against is one RPC
+ * round trip (getrawtransaction issued before the block, answered after the cleanup); an
+ * hour is generous. A constant, not config.
+ */
+export const TOMBSTONE_TTL_MS = 3_600_000
+
 export type BlockStore = ReorgStore &
   Pick<
     Store,
@@ -36,14 +51,19 @@ export type BlockStore = ReorgStore &
     | 'setBlockTxids'
     | 'pendingInBlock'
     | 'watchedSubset'
-    | 'unmarkEvaluated'
     | 'promoteToMaturing'
-    | 'setMaturingFired'
+    | 'markFired'
+    | 'removeMaturing'
+    | 'finishMaturing'
+    | 'isTombstoned'
+    | 'pruneTombstones'
     | 'replacePostBlockMempool'
     | 'droppedPending'
+    | 'dropPending'
     | 'pruneEvaluated'
     | 'dueExpiries'
-    | 'removeWatch'
+    | 'expireWatch'
+    | 'endTracking'
     | 'clearTracking'
   >
 
@@ -53,7 +73,6 @@ export interface BlockPipelineDeps {
   cfg: { network: Network; confirmMilestones: number[]; maxMilestone: number; ringSize: number }
   store: BlockStore
   rpc: BlockRpc
-  sink: Sink
   decodeBlock(raw: Buffer, network: Network): DecodedBlock
 }
 
@@ -64,7 +83,7 @@ export interface BlockPipelineDeps {
  * whatever a reorg left in limbo.
  */
 export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Promise<void> {
-  const { cfg, store, rpc, sink } = deps
+  const { cfg, store, rpc } = deps
 
   /** The block's distinct output addresses that are watched — one round trip per chunk. */
   async function watchedInBlock(block: DecodedBlock): Promise<Set<string>> {
@@ -98,9 +117,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
         if (pendingMined.has(tx.txid) || limbo.has(tx.txid)) {
           // Was tracked but no longer matches (watch removed mid-flight): end tracking quietly.
           log.info(CTX, `tracked ${tx.txid} mined but no longer matches any watch — dropping tracking`)
-          await store.removePending(tx.txid)
-          await store.removeLimbo(tx.txid)
-          await store.deleteRecord(tx.txid)
+          await store.endTracking(tx.txid)
         }
         continue
       }
@@ -124,6 +141,13 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
       } else {
         const existing = await store.readRecord(tx.txid)
         if (existing && existing.height > 0) continue // already maturing (e.g. block replay)
+        if (await store.isTombstoned(tx.txid)) {
+          // Tracking already ended for this txid (final milestone / conflicted) within the
+          // tombstone TTL: a block replay, or a reorg at exactly max-milestone depth. Not a
+          // new payment — do not restart tracking.
+          log.info(CTX, `${tx.txid} mined at ${block.hash}@${height} but its tracking already ended — skipping`)
+          continue
+        }
         log.info(CTX, `never-seen ${tx.txid} mined paying a watched address — maturing at ${block.hash}@${height}`)
       }
       await store.promoteToMaturing(rec)
@@ -156,21 +180,15 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
           idempotencyKey: idem.confirmed(net, rec.txid, m, rec.blockHash),
           timestamp: blockTimeMs,
         }
-        const ok = await sink.deliver(ev)
-        if (ok) {
-          // Sort, don't just push: a failed lower milestone can be retried AFTER a higher one
-          // succeeded (e.g. 3 delivered while 1 kept failing), so append order is not ascending.
-          fired.push(m)
-          fired.sort((a, b) => a - b)
-          await store.setMaturingFired(rec.txid, fired)
-        } else {
-          // Do NOT add to fired — the milestone is retried on the next block's sweep.
-          log.warn(CTX, `confirmed:${m} delivery failed for ${rec.txid} — will retry next block`)
-        }
+        // fired is recorded at ENQUEUE time — the outbox owns delivery retry. Kept sorted.
+        fired.push(m)
+        fired.sort((a, b) => a - b)
+        await store.markFired(rec.txid, [...fired], ev)
       }
-      // Final removal only once confs ≥ maxMilestone AND every milestone has fired.
+      // Final removal only once confs ≥ maxMilestone AND every milestone has been enqueued:
+      // record + index gone, txid tombstoned (one MULTI).
       if (confs >= cfg.maxMilestone && cfg.confirmMilestones.every((m) => fired.includes(m))) {
-        await store.removeMaturing(rec.txid) // deletes the record too
+        await store.finishMaturing(rec.txid, Date.now())
         log.info(CTX, `tracking ended for ${rec.txid} at ${confs} confs`)
       }
     }
@@ -197,11 +215,9 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
           idempotencyKey: idem.dropped(net, txid, height),
           timestamp: Date.now(),
         }
-        const ok = await sink.deliver(ev)
-        if (!ok) log.warn(CTX, `dropped delivery failed for ${txid} — best-effort one-shot, proceeding`)
-        await store.removePending(txid)
-        await store.unmarkEvaluated(txid) // a rebroadcast can legitimately fire `seen` again
-        await store.deleteRecord(txid)
+        // One MULTI: pending, evaluated (a rebroadcast can legitimately fire `seen` again),
+        // record, + `dropped` enqueued.
+        await store.dropPending(txid, ev)
         log.info(CTX, `dropped ${txid} — left the mempool without confirming`)
       }
 
@@ -215,15 +231,16 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
           idempotencyKey: idem.expired(net, address, expiresAtMs),
           timestamp: now,
         }
-        const ok = await sink.deliver(ev)
-        if (!ok) log.warn(CTX, `expired delivery failed for ${address} — best-effort one-shot, proceeding`)
-        await store.removeWatch(address) // also clears the expiry
+        await store.expireWatch(address, ev) // SREM addresses + ZREM expiries + `expired`, one MULTI
         log.info(CTX, `watch expired: ${address}`)
       }
     }
 
     // ── 6. prune / tip / ring ────────────────────────────────────────────────────────
-    if (isTip) await store.pruneEvaluated()
+    if (isTip) {
+      await store.pruneEvaluated()
+      await store.pruneTombstones(Date.now() - TOMBSTONE_TTL_MS)
+    }
     await store.setTip({ hash: block.hash, height })
     await store.ringPut(height, block.hash)
     await store.ringPrune(cfg.ringSize)

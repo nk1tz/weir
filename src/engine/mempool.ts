@@ -11,8 +11,8 @@ export interface MempoolReparserDeps {
   store: Pick<Store, 'replaceCurrentMempool' | 'newMempoolTxids' | 'clearCurrentMempool'>
   cfg: { network: Network }
   decodeRawTx(raw: Buffer | string, network: Network): DecodedTx
-  /** the txPipeline evaluator (makeTxEvaluator) */
-  evaluate(tx: DecodedTx): Promise<void>
+  /** the txPipeline evaluator (makeTxEvaluator); startedAtMs = when getrawtransaction was issued */
+  evaluate(tx: DecodedTx, startedAtMs: number): Promise<void>
 }
 
 const FETCH_CONCURRENCY = 32
@@ -36,7 +36,7 @@ async function mapBounded<T>(
 
 /**
  * Full mempool reparse: snapshot the node's mempool, evaluate every txid not already
- * evaluated (so a failed `seen` delivery is retried next time), then drop the snapshot.
+ * evaluated, then drop the snapshot.
  *
  * Mutex (held in the factory closure — one reparser instance exists per daemon):
  * overlapping invocations are skipped, not queued. Errors propagate to the caller
@@ -57,12 +57,14 @@ export function makeMempoolReparser(deps: MempoolReparserDeps): () => Promise<vo
       const fresh = await deps.store.newMempoolTxids()
 
       await mapBounded(fresh, FETCH_CONCURRENCY, async (txid) => {
+        // The fence clock starts BEFORE the RPC: what comes back is the node's view as of now.
+        const startedAtMs = Date.now()
         const verbose = await deps.rpc.getRawTransactionVerbose(txid)
         if (verbose === null) return // vanished between snapshot and fetch — skip
         // Mined between snapshot and fetch: the block pipeline owns it; a `seen` now would be false.
         if (verbose.blockhash !== undefined) return
         const tx = deps.decodeRawTx(verbose.hex, deps.cfg.network)
-        await deps.evaluate(tx)
+        await deps.evaluate(tx, startedAtMs)
       })
 
       await deps.store.clearCurrentMempool()

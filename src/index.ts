@@ -1,9 +1,15 @@
 /**
  * weir daemon entrypoint. Boot sequence per DESIGN.md "src/index.ts":
- *   loadConfig → Store.connect → preflight → reconcile (+ resolveLimbo) → startZmq
- *   (rawtx → txHandler, rawblock → blockHandler, gap → reparser) → initial mempool
- *   reparse (async) → startHeartbeat → admin server when ADMIN_TOKEN is set.
- * SIGINT/SIGTERM → close zmq, stop heartbeat, close admin, store.quit, exit 0.
+ *   loadConfig → Store.connect → preflight → startOutboxDrainer → ONE awaited drainOnce →
+ *   reconcile (+ resolveLimbo) → startZmq (rawtx → txHandler, rawblock → blockHandler,
+ *   gap → reparser) → initial mempool reparse (async) → startHeartbeat → admin server when
+ *   ADMIN_TOKEN is set.
+ * The drainer starts right after preflight and one pass is awaited BEFORE reconcile: events
+ * queued before a crash go out first, and their acks free redis memory before reconcile
+ * writes (a full redis would otherwise crash-loop at boot); if the endpoint is still down
+ * the pass just reschedules. Engine deps get NO sink (they enqueue through the Store); the
+ * sink goes only to the drainer and the heartbeat.
+ * SIGINT/SIGTERM → close zmq, stop heartbeat, close admin, await drainer.stop(), store.quit, exit 0.
  *
  * The startup banner never prints secrets: webhook target HOST only, and the RPC URL
  * never appears anywhere (it carries credentials).
@@ -17,6 +23,7 @@ import { Rpc } from './bitcoin/rpc'
 import { startZmq } from './bitcoin/zmq'
 import { decodeBlock, decodeRawTx, isValidAddress } from './bitcoin/decoder'
 import { WebhookSink } from './delivery/webhook'
+import { startOutboxDrainer } from './delivery/outbox'
 import { makeRawTxHandler, makeTxEvaluator } from './engine/txPipeline'
 import { makeMempoolReparser } from './engine/mempool'
 import { makeBlockHandler, makeBlockProcessor } from './engine/blockPipeline'
@@ -53,7 +60,6 @@ async function main(): Promise<void> {
   const sink = new WebhookSink({
     url: cfg.webhookUrl,
     secret: cfg.webhookSecret,
-    maxAttempts: cfg.webhookMaxRetries,
     timeoutMs: cfg.webhookTimeoutMs,
   })
 
@@ -66,14 +72,20 @@ async function main(): Promise<void> {
 
   await preflight({ cfg, store, rpc })
 
-  const processBlock = makeBlockProcessor({ cfg, store, rpc, sink, decodeBlock })
+  // Events still owed from before a restart go out now, ahead of the (possibly long) reconcile;
+  // their acks free redis memory before reconcile writes. A store failure here is fatal (boot).
+  const drainer = startOutboxDrainer({ cfg, store, sink })
+  const bootDelivered = await drainer.drainOnce()
+  log.info(CTX, `boot drain: ${bootDelivered} queued event(s) delivered before reconcile`)
+
+  const processBlock = makeBlockProcessor({ cfg, store, rpc, decodeBlock })
   await reconcile({ store, rpc, processBlock })
   // Crash-recovery: adjudicate reorg-displaced txs even when there was nothing to catch up
   // (a crash between limbo-rewind and resolution). No-op when limbo is empty.
-  await resolveLimbo({ cfg, store, rpc, sink })
+  await resolveLimbo({ cfg, store, rpc })
 
-  const evaluate = makeTxEvaluator({ store, sink, cfg })
-  const handleRawTx = makeRawTxHandler({ store, sink, cfg, decodeRawTx })
+  const evaluate = makeTxEvaluator({ store, cfg })
+  const handleRawTx = makeRawTxHandler({ store, cfg, decodeRawTx })
   const reparse = makeMempoolReparser({ rpc, store, cfg, decodeRawTx, evaluate })
   const handleBlock = makeBlockHandler(processBlock)
 
@@ -123,6 +135,7 @@ async function main(): Promise<void> {
       await zmq.close()
       heartbeat.stop()
       if (admin !== null) await admin.close()
+      await drainer.stop() // waits for an in-flight delivery pass
       await store.quit()
       log.info(CTX, 'shutdown complete')
       process.exit(0)

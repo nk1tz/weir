@@ -36,9 +36,15 @@ describe('loadConfig', () => {
       heartbeatInterval: 0,
       adminToken: null,
       adminPort: 8787,
-      webhookMaxRetries: 3,
       webhookTimeoutMs: 10000,
+      outboxMaxAgeSec: 259200,
+      outboxDeadMax: 1000,
     })
+  })
+
+  it('WEBHOOK_MAX_RETRIES no longer exists: retry is the outbox\'s job, bounded by OUTBOX_MAX_AGE', () => {
+    const cfg = loadConfig(env({ WEBHOOK_MAX_RETRIES: '5' })) as unknown as Record<string, unknown>
+    expect(cfg).not.toHaveProperty('webhookMaxRetries')
   })
 
   it('reads the optional vars', () => {
@@ -48,8 +54,9 @@ describe('loadConfig', () => {
         HEARTBEAT_INTERVAL: '60',
         ADMIN_TOKEN: 'tok',
         ADMIN_PORT: '0',
-        WEBHOOK_MAX_RETRIES: '5',
         WEBHOOK_TIMEOUT_MS: '2500',
+        OUTBOX_MAX_AGE: '3600',
+        OUTBOX_DEAD_MAX: '50',
       }),
     )
     expect(cfg).toMatchObject({
@@ -57,8 +64,9 @@ describe('loadConfig', () => {
       heartbeatInterval: 60,
       adminToken: 'tok',
       adminPort: 0,
-      webhookMaxRetries: 5,
       webhookTimeoutMs: 2500,
+      outboxMaxAgeSec: 3600,
+      outboxDeadMax: 50,
     })
   })
 
@@ -145,7 +153,7 @@ describe('loadConfig', () => {
     expect(loadConfig(env({ ADMIN_TOKEN: ' tok ' })).adminToken).toBe('tok')
   })
 
-  it.each(['WATCH_DEFAULT_TTL', 'HEARTBEAT_INTERVAL', 'ADMIN_PORT', 'WEBHOOK_MAX_RETRIES', 'WEBHOOK_TIMEOUT_MS'])(
+  it.each(['WATCH_DEFAULT_TTL', 'HEARTBEAT_INTERVAL', 'ADMIN_PORT', 'WEBHOOK_TIMEOUT_MS'])(
     '%s must be a non-negative integer',
     (name) => {
       expect(() => loadConfig(env({ [name]: 'abc' }))).toThrow(`${name} must be a non-negative integer, got "abc"`)
@@ -153,4 +161,12 @@ describe('loadConfig', () => {
       expect(() => loadConfig(env({ [name]: '1.5' }))).toThrow(`${name} must be a non-negative integer`)
     },
   )
+
+  it.each(['OUTBOX_MAX_AGE', 'OUTBOX_DEAD_MAX'])('%s must be a POSITIVE integer (0 would mean "dead-letter immediately" / "keep nothing")', (name) => {
+    expect(() => loadConfig(env({ [name]: '0' }))).toThrow(`${name} must be a positive integer, got "0"`)
+    expect(() => loadConfig(env({ [name]: '-1' }))).toThrow(`${name} must be a positive integer`)
+    expect(() => loadConfig(env({ [name]: 'abc' }))).toThrow(`${name} must be a positive integer`)
+    expect(() => loadConfig(env({ [name]: '1.5' }))).toThrow(`${name} must be a positive integer`)
+    expect(loadConfig(env({ [name]: '1' }))).toMatchObject({ [name === 'OUTBOX_MAX_AGE' ? 'outboxMaxAgeSec' : 'outboxDeadMax']: 1 })
+  })
 })

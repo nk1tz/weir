@@ -11,7 +11,7 @@ const MAX_TTL_SECONDS = 10 * 365 * 24 * 3600
 export interface AdminDeps {
   store: Pick<
     Store,
-    'addWatch' | 'removeWatch' | 'isWatched' | 'scanWatches' | 'watchCount' | 'getTip' | 'getExpiry'
+    'addWatch' | 'removeWatch' | 'isWatched' | 'scanWatches' | 'watchCount' | 'getTip' | 'getExpiry' | 'outboxStats'
   >
   isValidAddress(address: string): boolean
   /** cheap RPC liveness probe (e.g. getBlockCount); must reject when bitcoind is unreachable */
@@ -101,10 +101,18 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void>; por
     let rpcOk = true
     let tipHeight: number | null = null
     let watchCount = 0
+    let outboxDepth = 0
+    let outboxOldestAgeSec: number | null = null
+    let deadLetterCount = 0
     try {
       const tip = await deps.store.getTip()
       tipHeight = tip?.height ?? null
       watchCount = await deps.store.watchCount()
+      const outbox = await deps.store.outboxStats()
+      outboxDepth = outbox.depth
+      outboxOldestAgeSec =
+        outbox.oldestCreatedAt === null ? null : Math.max(0, Math.floor((Date.now() - outbox.oldestCreatedAt) / 1000))
+      deadLetterCount = outbox.dead
     } catch (err) {
       redisOk = false
       log.warn('admin', `health: redis check failed: ${describeError(err)}`)
@@ -118,6 +126,8 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void>; por
     const lastBlockAtMs = deps.lastBlockAtMs()
     const secondsSinceLastBlock =
       lastBlockAtMs === null ? null : Math.max(0, Math.floor((Date.now() - lastBlockAtMs) / 1000))
+    // `ok` is still redis && rpc: outbox depth is a signal for the operator, not a readiness
+    // failure — the daemon is healthy when the consumer's endpoint is the thing that is down.
     const ok = redisOk && rpcOk
     sendJson(res, ok ? 200 : 503, {
       ok,
@@ -126,6 +136,9 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void>; por
       tipHeight,
       secondsSinceLastBlock,
       watchCount,
+      outboxDepth,
+      outboxOldestAgeSec,
+      deadLetterCount,
     })
   }
 
