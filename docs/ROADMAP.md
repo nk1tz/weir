@@ -121,6 +121,8 @@ Fix:
 
 ### 4. Pinned, prebuilt images (repeatability)
 
+**DONE 2026-09-23** — `release.yml` pushes `ghcr.io/nk1tz/weir:<version>`, `:<major.minor>`, `:latest` on every `v*` tag; `docker-compose.prod.yml` is the standalone prod stack (weir by tag, `redis:7.4-alpine`, `bitcoin/bitcoin:31`), one directory + `.env` per network.
+
 Problem: `build: .` + `FROM node:22-alpine` is not reproducible and is a
 supply-chain exposure.
 

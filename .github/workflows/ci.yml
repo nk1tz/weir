@@ -35,4 +35,4 @@ jobs:
           REDIS_TEST_URL: redis://localhost:6390
       - run: pnpm build
       - name: docker compose config parses
-        run: cp .env.example .env && docker compose config -q
+        run: cp .env.example .env && docker compose config -q && docker compose -f docker-compose.prod.yml config -q

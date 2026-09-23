@@ -1,0 +1,69 @@
+# weir production stack: prebuilt weir image from GHCR + redis + bitcoind.
+# STANDALONE — not an override of docker-compose.yml. Always pass it with -f:
+#
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# One directory per stack, each its own compose project with its own .env:
+#   ~/weir-mainnet/.env   NETWORK=mainnet   BITCOIND_CONF=./docker/bitcoin-mainnet.conf
+#   ~/weir-regtest/.env   NETWORK=regtest   BITCOIND_CONF=./docker/bitcoin-regtest.conf
+#
+# Variables this file reads from .env (all optional; defaults in parentheses):
+#   WEIR_VERSION      tag of ghcr.io/nk1tz/weir        (latest)
+#   BITCOIND_VERSION  tag of bitcoin/bitcoin            (31)
+#   BITCOIND_CONF     bitcoin.conf to mount, read-only  (./docker/bitcoin-mainnet.conf)
+#
+# Upgrade weir:
+#   docker compose -f docker-compose.prod.yml pull weir && docker compose -f docker-compose.prod.yml up -d weir
+#
+# NO published ports: weir listens on nothing (unless ADMIN_TOKEN), redis and
+# bitcoind are reachable only on the compose network.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  weir:
+    image: ghcr.io/nk1tz/weir:${WEIR_VERSION:-latest}
+    env_file: .env
+    depends_on:
+      - redis
+      - bitcoind
+    restart: unless-stopped
+    # lets WEBHOOK_URL=http://host.docker.internal:... reach the host on Linux too
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging: *logging
+
+  redis:
+    image: redis:7.4-alpine
+    # appendonly: the watch set + chain view must survive restarts.
+    # noeviction: eviction would silently delete watches — weir's preflight refuses any other policy.
+    command: redis-server --appendonly yes --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    logging: *logging
+
+  bitcoind:
+    image: bitcoin/bitcoin:${BITCOIND_VERSION:-31}
+    # The image's entrypoint chowns the whole datadir; a read-only file mounted INSIDE it
+    # makes that chown fail and the container exit. So the conf lives outside the datadir
+    # and is passed with -conf. The datadir itself is a named volume the entrypoint owns.
+    command: ["bitcoind", "-conf=/etc/bitcoin/bitcoin.conf", "-datadir=/home/bitcoin/.bitcoin"]
+    volumes:
+      - ${BITCOIND_CONF:-./docker/bitcoin-mainnet.conf}:/etc/bitcoin/bitcoin.conf:ro
+      - bitcoind-data:/home/bitcoin/.bitcoin
+      # assumeutxo: put utxo-<height>.dat here, then
+      #   docker compose -f docker-compose.prod.yml exec bitcoind \
+      #     bitcoin-cli -conf=/etc/bitcoin/bitcoin.conf loadtxoutset /snapshots/utxo-<height>.dat
+      # Delete the file afterwards.
+      - ./snapshots:/snapshots:ro
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  redis-data:
+  bitcoind-data:
