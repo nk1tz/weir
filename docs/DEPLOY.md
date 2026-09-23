@@ -71,7 +71,7 @@ your app's config. Rotate by editing `.env` and `docker compose -f docker-compos
 up -d weir`. Watches and the outbox live in redis and survive.
 
 The mainnet `.env` also needs `NETWORK=mainnet`, the real `WEBHOOK_URL`, and
-`HEARTBEAT_INTERVAL=60` (see [Monitoring](../README.md#monitoring)).
+`HEARTBEAT_INTERVAL=60` (see [Monitoring](operations.md#monitoring)).
 
 ## 4. Mainnet node from a UTXO snapshot
 
@@ -153,4 +153,4 @@ scanners to hit the unauthenticated probes within minutes; they get `/ready` and
   it (and the chainstate, and `.env`, so treat snapshots as secret).
 - **Monitoring:** `HEARTBEAT_INTERVAL=60` and alert in the receiver on a missing
   heartbeat, `chainLag > 2`, `deadLetterCount > 0`, or `outboxDepth` growing. See
-  [README Monitoring](../README.md#monitoring). No inbound port is needed for any of it.
+  [operations.md](operations.md#monitoring). No inbound port is needed for any of it.

@@ -63,7 +63,7 @@ $ curl -s localhost:8787/ready
 {"ok":true,"redis":true,"rpc":true,"reconciled":true,"tipHeight":0,"nodeHeight":0,"chainLag":0,"watchCount":0,"outboxDepth":0,"outboxOldestAgeSec":null,"deadLetterCount":0,"lastZmqTxAgeSec":null,"lastZmqBlockAgeSec":null}
 ```
 
-No token needed for `/ready`, `/live` or `/metrics`. See the README's "Monitoring" section.
+No token needed for `/ready`, `/live` or `/metrics`. See [operations.md](operations.md#monitoring).
 
 ## 3. Start the event catcher
 
