@@ -1,8 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { makeRawTxHandler, makeTxEvaluator } from '../src/engine/txPipeline'
 import { makeMempoolReparser } from '../src/engine/mempool'
-import { TOMBSTONE_TTL_MS } from '../src/engine/blockPipeline'
-import { MAX_EVALUATION_AGE_MS } from '../src/store/redis'
 import type { DecodedTx, TxEvent } from '../src/lib/types'
 import { ADDR, FakeStore, mkTx } from './fakes'
 
@@ -40,7 +38,7 @@ describe('txPipeline', () => {
       ],
     }
 
-    await evaluate(tx, Date.now())
+    await evaluate(tx)
 
     expect(store.outboxEvents()).toHaveLength(1)
     const ev = store.outboxEvents()[0] as TxEvent
@@ -60,101 +58,29 @@ describe('txPipeline', () => {
     expect(store.records.get('tx1')).toMatchObject({ height: 0, blockHash: '', fired: [], hex: 'hex-tx1' })
   })
 
-  it('recordSeen guard: a tx mined (promoted) while its evaluation was in flight is NOT overwritten with a height-0 record', async () => {
-    // The evaluator read `isEvaluated` (false: the tip prune forgot the txid when it left the
-    // mempool) before the block pipeline promoted the tx. Its write must be a no-op.
+  it('a tx that is already tracked (mined record, no longer in `evaluated`) is a repeated sighting: nothing written, no seen', async () => {
+    // bitcoind re-publishes rawtx for every tx of a connected or disconnected block, after
+    // the tip prune forgot the txid from `evaluated`. `seen` is the unseen → pending
+    // transition only; a maturing/limbo record must never be put back to height 0.
     const { store, evaluate } = setup()
     store.watches.add(ADDR)
     const tx = mkTx('tx1')
-    const isEvaluated = store.isEvaluated.bind(store)
-    store.isEvaluated = async (txid) => {
-      const was = await isEvaluated(txid)
-      // the block lands between the evaluator's read and its write
-      await store.promoteToMaturing({ txid: 'tx1', height: 101, blockHash: 'b101', matched: [{ address: ADDR, vout: 0, valueSats: 5000 }], fired: [1], hex: tx.hex, inputs: [] })
-      await store.pruneEvaluated()
-      return was
-    }
+    store.maturingIndex.set('tx1', 101)
+    store.records.set('tx1', { txid: 'tx1', height: 101, blockHash: 'b101', matched: [{ address: ADDR, vout: 0, valueSats: 5000 }], fired: [1], hex: tx.hex, inputs: [] })
 
-    await evaluate(tx, Date.now())
+    await evaluate(tx)
 
     expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] })
     expect(store.pending.has('tx1')).toBe(false)
-    expect(store.outboxEvents()).toHaveLength(0) // no seen for a tx that is already confirmed
-  })
-
-  describe('evaluation fence', () => {
-    it('MAX_EVALUATION_AGE_MS stays far below TOMBSTONE_TTL_MS (the fence must outlast no tombstone)', () => {
-      expect(MAX_EVALUATION_AGE_MS).toBe(600_000)
-      expect(MAX_EVALUATION_AGE_MS * 6).toBeLessThanOrEqual(TOMBSTONE_TTL_MS)
-    })
-
-    it('an evaluation just under the fence records; one just over is refused and leaves the txid un-evaluated', async () => {
-      // The clock is pinned: the boundary is exact, and a millisecond tick between capturing
-      // `now` and the fence check must not turn the "under" case into a refusal.
-      vi.useFakeTimers()
-      vi.setSystemTime(1_700_000_000_000)
-      try {
-        const { store, evaluate } = setup()
-        store.watches.add(ADDR)
-        const now = Date.now()
-
-        await evaluate(mkTx('over'), now - MAX_EVALUATION_AGE_MS - 1)
-        expect(store.evaluated.has('over')).toBe(false) // the next reparse redoes it
-        expect(store.pending.has('over')).toBe(false)
-        expect(store.records.has('over')).toBe(false)
-        expect(store.outboxEvents()).toHaveLength(0)
-
-        await evaluate(mkTx('under'), now - MAX_EVALUATION_AGE_MS)
-        expect(store.evaluated.has('under')).toBe(true)
-        expect(store.pending.has('under')).toBe(true)
-        expect(seenEvents(store).map((e) => e.txid)).toEqual(['under'])
-
-        await evaluate(mkTx('over'), Date.now()) // a fresh evaluation of the refused txid succeeds
-        expect(seenEvents(store).map((e) => e.txid)).toEqual(['under', 'over'])
-      } finally {
-        vi.useRealTimers()
-      }
-    })
-
-    it('makeRawTxHandler stamps startedAtMs at receipt, before decoding', async () => {
-      vi.useFakeTimers()
-      vi.setSystemTime(1_700_000_000_000)
-      try {
-        const { store, cfg } = setup()
-        store.watches.add(ADDR)
-        const recordSeen = vi.spyOn(store, 'recordSeen')
-        const handler = makeRawTxHandler({
-          store,
-          cfg,
-          decodeRawTx: () => {
-            vi.setSystemTime(1_700_000_000_000 + 4000) // decoding takes "4s"
-            return mkTx('tx1')
-          },
-        })
-        await handler(Buffer.from('00', 'hex'))
-        expect(recordSeen).toHaveBeenCalledTimes(1)
-        expect(recordSeen.mock.calls[0]![2]).toBe(1_700_000_000_000)
-      } finally {
-        vi.useRealTimers()
-      }
-    })
-  })
-
-  it('recordSeen guard: two concurrent evaluations of the same tx (ZMQ + reparse) enqueue exactly one seen', async () => {
-    const { store, evaluate } = setup()
-    store.watches.add(ADDR)
-
-    await Promise.all([evaluate(mkTx('tx1'), Date.now()), evaluate(mkTx('tx1'), Date.now())])
-
-    expect(seenEvents(store).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:seen'])
-    expect(store.pending.has('tx1')).toBe(true)
+    expect(store.evaluated.has('tx1')).toBe(false)
+    expect(store.outboxEvents()).toHaveLength(0)
   })
 
   it('seen disabled (no 0 milestone): tracks silently — evaluated + pending + record, nothing enqueued', async () => {
     const { store, evaluate } = setup({ seenEnabled: false })
     store.watches.add(ADDR)
 
-    await evaluate(mkTx('tx1'), Date.now())
+    await evaluate(mkTx('tx1'))
 
     expect(store.outboxEvents()).toHaveLength(0)
     expect(store.pending.has('tx1')).toBe(true)
@@ -162,22 +88,22 @@ describe('txPipeline', () => {
     expect(store.records.has('tx1')).toBe(true)
   })
 
-  it('already-evaluated txs are skipped entirely', async () => {
+  it('already-evaluated txs are skipped entirely: a second sighting (ZMQ then reparse) enqueues nothing more', async () => {
     const { store, evaluate } = setup()
     store.watches.add(ADDR)
-    store.evaluated.add('tx1')
 
-    await evaluate(mkTx('tx1'), Date.now())
+    await evaluate(mkTx('tx1'))
+    await evaluate(mkTx('tx1'))
 
-    expect(store.outboxEvents()).toHaveLength(0)
-    expect(store.pending.has('tx1')).toBe(false)
+    expect(seenEvents(store).map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:seen'])
+    expect(store.pending.has('tx1')).toBe(true)
   })
 
-  it('no matched outputs → markEvaluated only', async () => {
+  it('no matched outputs → marked evaluated only', async () => {
     const { store, evaluate } = setup()
     // nothing watched
 
-    await evaluate(mkTx('tx1'), Date.now())
+    await evaluate(mkTx('tx1'))
 
     expect(store.outboxEvents()).toHaveLength(0)
     expect(store.evaluated.has('tx1')).toBe(true)
@@ -205,6 +131,13 @@ describe('txPipeline', () => {
 })
 
 describe('mempool reparser', () => {
+  beforeAll(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+  })
+  afterAll(() => {
+    vi.restoreAllMocks()
+  })
+
   function reparserSetup() {
     const store = new FakeStore()
     const cfg = { network: 'regtest' as const, seenEnabled: true }
@@ -235,7 +168,7 @@ describe('mempool reparser', () => {
     return { store, seed, mempool, reparse }
   }
 
-  it('evaluates only txids not already evaluated (current − evaluated), then drops the snapshot', async () => {
+  it('evaluates only txids not already evaluated (mempool − evaluated)', async () => {
     const { store, seed, mempool, reparse } = reparserSetup()
     store.watches.add(ADDR)
     const fresh = mkTx('fresh')
@@ -248,37 +181,6 @@ describe('mempool reparser', () => {
     await reparse()
 
     expect(seenEvents(store).map((e) => e.txid)).toEqual(['fresh'])
-    expect(store.mempoolCurrent.size).toBe(0)
-  })
-
-  it('the fence clock starts BEFORE getrawtransaction is issued (a slow RPC counts against the evaluation)', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(1_700_000_000_000)
-    try {
-      const store = new FakeStore()
-      const cfg = { network: 'regtest' as const, seenEnabled: true }
-      const startedAts: number[] = []
-      const tx = mkTx('tx1')
-      const reparse = makeMempoolReparser({
-        rpc: {
-          getRawMempool: async () => ['tx1'],
-          getRawTransactionVerbose: async () => {
-            vi.setSystemTime(1_700_000_000_000 + 30_000) // the node took 30s to answer
-            return { hex: tx.hex }
-          },
-        },
-        store,
-        cfg,
-        decodeRawTx: () => tx,
-        evaluate: async (_tx, startedAtMs) => {
-          startedAts.push(startedAtMs)
-        },
-      })
-      await reparse()
-      expect(startedAts).toEqual([1_700_000_000_000])
-    } finally {
-      vi.useRealTimers()
-    }
   })
 
   it('a txid that vanishes between snapshot and fetch is skipped, not fatal', async () => {
@@ -308,40 +210,18 @@ describe('mempool reparser', () => {
     expect(store.records.has('mined')).toBe(false)
   })
 
-  it('mutex: overlapping invocations are skipped, not queued', async () => {
-    const store = new FakeStore()
-    const cfg = { network: 'regtest' as const, seenEnabled: true }
-    let mempoolCalls = 0
-    let release!: () => void
-    const gate = new Promise<void>((r) => {
-      release = r
-    })
-    const reparse = makeMempoolReparser({
-      rpc: {
-        getRawMempool: async () => {
-          mempoolCalls++
-          await gate // hold the first run open
-          return []
-        },
-        getRawTransactionVerbose: async () => null,
-      },
-      store,
-      cfg,
-      decodeRawTx: () => {
-        throw new Error('unreachable')
-      },
-      evaluate: makeTxEvaluator({ store, cfg }),
-    })
+  it('evaluations run one after the other even though fetches are batched (two spenders of one prevout: the second replaces the first)', async () => {
+    const { store, seed, mempool, reparse } = reparserSetup()
+    store.watches.add(ADDR)
+    const prev = { txid: 'prev1', vout: 0 }
+    seed(mkTx('A', ADDR, 5000, [prev]))
+    seed(mkTx('B', ADDR, 4900, [prev]))
+    mempool.push('A', 'B')
 
-    const first = reparse()
-    const second = reparse() // must be skipped while the first holds the mutex
-    release()
-    await Promise.all([first, second])
-
-    expect(mempoolCalls).toBe(1)
-
-    // and after release, a fresh call runs again
     await reparse()
-    expect(mempoolCalls).toBe(2)
+
+    expect(store.outboxEvents().map((e) => e.event)).toEqual(['seen', 'dropped', 'seen'])
+    expect(store.pending.has('A')).toBe(false)
+    expect(store.pending.has('B')).toBe(true)
   })
 })

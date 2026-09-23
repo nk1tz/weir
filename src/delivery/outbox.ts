@@ -9,8 +9,9 @@
  * A dangling id (queue entry without a hash) is removed. The interval pass keeps taking
  * batches while they come back full (a backlog drains at line rate, not 50/s). EVERY pass
  * — interval or a direct drainOnce() — goes through one shared in-flight promise, so two
- * passes never run at once and never double-send. Store failures on the interval path are
- * fatal (background path); the sink never throws.
+ * passes never run at once: the drainer is the outbox's one writer (the engine only
+ * appends new ids), which is why ack/retry/dead are plain MULTIs. Store failures on the
+ * interval path are fatal (background path); the sink never throws.
  */
 import type { Store } from '../store/redis'
 import type { Sink } from './webhook'
@@ -79,11 +80,7 @@ export function startOutboxDrainer(deps: OutboxDrainerDeps): OutboxDrainer {
       const now = Date.now()
       const ageMs = now - rec.createdAt
       if (ageMs >= maxAgeMs) {
-        const applied = await store.outboxDead(id, now, attempts, result.error, cfg.outboxDeadMax)
-        if (!applied) {
-          log.warn(CTX, `outbox ${id} vanished before it could be dead-lettered (acked concurrently) — ignoring`)
-          continue
-        }
+        await store.outboxDead(id, now, attempts, result.error, cfg.outboxDeadMax)
         metrics.counters.inc('weir_events_dead_lettered_total')
         log.error(
           CTX,
@@ -93,11 +90,7 @@ export function startOutboxDrainer(deps: OutboxDrainerDeps): OutboxDrainer {
         continue
       }
       const delay = backoffMs(attempts)
-      const applied = await store.outboxRetry(id, now + delay, attempts, result.error)
-      if (!applied) {
-        log.warn(CTX, `outbox ${id} vanished before it could be rescheduled (acked concurrently) — ignoring`)
-        continue
-      }
+      await store.outboxRetry(id, now + delay, attempts, result.error)
       log.warn(
         CTX,
         `delivery failed (attempt ${attempts}) for ${rec.event.event} ${rec.event.idempotencyKey}: ${result.error} — retry in ${delay}ms`,

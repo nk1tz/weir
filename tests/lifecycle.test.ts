@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { makeBlockProcessor, TOMBSTONE_TTL_MS } from '../src/engine/blockPipeline'
+import { makeBlockProcessor } from '../src/engine/blockPipeline'
 import { makeMempoolReparser } from '../src/engine/mempool'
+import { makeEngineQueue } from '../src/engine/queue'
 import { makeTxEvaluator } from '../src/engine/txPipeline'
 import { startOutboxDrainer } from '../src/delivery/outbox'
 import type { DecodedTx, TxEvent, WeirEvent } from '../src/lib/types'
-import { MAX_EVALUATION_AGE_MS } from '../src/store/redis'
 import { ADDR, FakeChain, FakeSink, FakeStore, mkTx } from './fakes'
 
 /**
@@ -57,11 +57,9 @@ describe('lifecycle', () => {
   })
 
   it('seen → confirmed → reorg demotion → reparse enqueues exactly seen, confirmed, demoted — NO second seen', async () => {
-    // Regression: after mining, the tip prune forgets the txid from `evaluated` (it left the
-    // mempool). Demotion put it back in the mempool + pending WITHOUT re-marking it evaluated,
-    // so the next reparse re-evaluated it and emitted a duplicate `seen` (same idempotency
-    // key) while overwriting its record. Demotion must be one atomic step that also SADDs
-    // `evaluated`.
+    // After mining, the tip prune forgets the txid from `evaluated` (it left the mempool).
+    // Demotion puts it back in the mempool + pending AND re-marks it evaluated, so the next
+    // reparse does not re-fire `seen` (same idempotency key) or overwrite its record.
     const { store, chain, register, reparse, process } = wire()
     store.watches.add(ADDR)
     chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
@@ -76,7 +74,7 @@ describe('lifecycle', () => {
     expect(store.pending.has('tx1')).toBe(true)
 
     // 2. mined in b101a and gone from the mempool → confirmed:1; the tip prune drops it from `evaluated`
-    chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] }, { main: false })
+    chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
     chain.mempool = []
     await process(chain.raw('b101a'))
     expect(enqueued(store)).toEqual(['seen', 'confirmed'])
@@ -133,7 +131,7 @@ describe('lifecycle', () => {
       expect(store.outboxQueue.size).toBe(0)
 
       // confirmed:1 — but the endpoint is down: the event stays queued, the block pipeline never noticed
-      chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] }, { main: false })
+      chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
       chain.mempool = []
       sink.deliverResult = false
       await process(chain.raw('b101a'))
@@ -183,15 +181,12 @@ describe('lifecycle', () => {
     }
   })
 
-  describe('RACE: a block promotes a tx while the tx pipeline is evaluating the same tx', () => {
-    // Before the outbox, the evaluator awaited the webhook INSIDE the evaluation; a block
-    // arriving meanwhile promoted the tx, and the evaluator's late write put the record back
-    // to height 0 (tracking corrupted: confirmations lost). With no network await left, only
-    // the ordering of two store steps remains — and recordSeen refuses to overwrite a mined
-    // record, so BOTH orderings end with the record at the block height.
-
-    function race(cfgOverrides: Partial<{ confirmMilestones: number[]; maxMilestone: number }> = {}) {
-      const w = wire(cfgOverrides)
+  describe('one writer: a rawtx and the block that mines it, queued together, run in arrival order', () => {
+    // bitcoind publishes a tx's rawtx before the rawblock that includes it, and re-publishes
+    // rawtx for every tx of a connected or disconnected block. On the engine queue those are
+    // whole items, one after the other — there is no interleaving to guard against.
+    function race() {
+      const w = wire()
       w.store.watches.add(ADDR)
       w.chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
       w.store.tip = { hash: 'b100', height: 100 }
@@ -199,283 +194,60 @@ describe('lifecycle', () => {
       const tx1 = w.register(mkTx('tx1'))
       w.chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
       w.chain.mempool = []
-      return { ...w, tx1 }
+      return { ...w, tx1, engine: makeEngineQueue(vi.fn()) }
     }
 
-    it('evaluation parked mid-flight, block completes first: record stays at the block height, ONE confirmed, no stale seen', async () => {
-      const { store, chain, evaluate, process, tx1 } = race()
-      // Park the evaluator inside its match step (after it read `isEvaluated` = false).
-      let release!: () => void
-      const gate = new Promise<void>((r) => {
-        release = r
-      })
-      let parkedResolve!: () => void
-      const parked = new Promise<void>((r) => {
-        parkedResolve = r
-      })
-      const watchedSubset = store.watchedSubset.bind(store)
-      let gateNext = true
-      store.watchedSubset = async (addrs) => {
-        if (gateNext) {
-          gateNext = false
-          parkedResolve()
-          await gate
-        }
-        return watchedSubset(addrs)
-      }
-      const evaluation = evaluate(tx1, Date.now())
-      await parked
+    it('rawtx first, then the block: one seen + one confirmed, record at the block height', async () => {
+      const { store, chain, evaluate, process, tx1, engine } = race()
 
-      await process(chain.raw('b101')) // promotes tx1 → maturing@101, confirmed:1 enqueued, tip prune
-      expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] })
+      await Promise.all([engine.run(() => evaluate(tx1)), engine.run(() => process(chain.raw('b101')))])
 
-      release()
-      await evaluation // its recordSeen lands AFTER the promotion
-
-      expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] }) // never height 0
-      expect(store.maturingIndex.get('tx1')).toBe(101)
-      expect(store.pending.has('tx1')).toBe(false)
-      expect(store.outboxEvents().map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
-    })
-
-    it('evaluation lands first, block promotes right after: one seen + one confirmed, record at the block height', async () => {
-      const { store, chain, evaluate, process, tx1 } = race()
-      // The block is mid-flight (block txids + pending snapshot already read) when the
-      // evaluator runs to completion; the promotion then follows.
-      const promote = store.promoteToMaturing.bind(store)
-      let evaluation: Promise<void> | null = null
-      store.promoteToMaturing = async (rec) => {
-        evaluation = evaluate(tx1, Date.now())
-        await evaluation
-        expect(store.records.get('tx1')).toMatchObject({ height: 0, blockHash: '' }) // seen landed first
-        expect(store.pending.has('tx1')).toBe(true)
-        return promote(rec)
-      }
-
-      await process(chain.raw('b101'))
-
-      expect(evaluation).not.toBeNull()
       expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] })
       expect(store.maturingIndex.get('tx1')).toBe(101)
       expect(store.pending.has('tx1')).toBe(false)
       expect(store.outboxEvents().map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:seen', 'regtest:tx1:confirmed:1:b101'])
     })
 
-    it('in both orderings the next blocks confirm normally (tracking was never corrupted)', async () => {
-      const { store, chain, evaluate, process, tx1 } = race()
-      const promote = store.promoteToMaturing.bind(store)
-      store.promoteToMaturing = async (rec) => {
-        await evaluate(tx1, Date.now())
-        return promote(rec)
-      }
-      await process(chain.raw('b101'))
+    it('the block first, then a late rawtx for the same tx (a block re-publish): confirmed only — the tracked record is never put back to height 0', async () => {
+      const { store, chain, evaluate, process, tx1, engine } = race()
+
+      await Promise.all([engine.run(() => process(chain.raw('b101'))), engine.run(() => evaluate(tx1))])
+
+      expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] })
+      expect(store.maturingIndex.get('tx1')).toBe(101)
+      expect(store.pending.has('tx1')).toBe(false)
+      expect(store.outboxEvents().map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
+
+      // and the next blocks confirm normally (tracking was never corrupted)
       chain.addBlock({ hash: 'b102', prevHash: 'b101', height: 102, time: 1_700_000_102, txs: [] })
       chain.addBlock({ hash: 'b103', prevHash: 'b102', height: 103, time: 1_700_000_103, txs: [] })
-      await process(chain.raw('b102'))
-      await process(chain.raw('b103'))
-
-      expect(enqueued(store)).toEqual(['seen', 'confirmed', 'confirmed'])
+      await engine.run(() => process(chain.raw('b102')))
+      await engine.run(() => process(chain.raw('b103')))
+      expect(enqueued(store)).toEqual(['confirmed', 'confirmed'])
       expect(store.maturingIndex.has('tx1')).toBe(false) // tracking ended at 3 confs
       expect(store.records.has('tx1')).toBe(false)
     })
-
-    it('STALE EVALUATION after the final-milestone cleanup (milestones 0,1): confirmed:1 only — no seen, no false dropped', async () => {
-      // The reviewer's interleaving: a mempool RPC read tx1 before the block and answers after
-      // it. The block promotes, enqueues confirmed:1, hits the max milestone (1) → the record is
-      // DELETED and the tip prune forgets the txid. Without a tombstone the late evaluator would
-      // pass both other guards, recreate a height-0 pending record, enqueue `seen`, and the NEXT
-      // block would emit `dropped` for a payment that confirmed.
-      const { store, chain, evaluate, process, tx1 } = race({ confirmMilestones: [1], maxMilestone: 1 })
-      let release!: () => void
-      const gate = new Promise<void>((r) => {
-        release = r
-      })
-      let parkedResolve!: () => void
-      const parked = new Promise<void>((r) => {
-        parkedResolve = r
-      })
-      const watchedSubset = store.watchedSubset.bind(store)
-      let gateNext = true
-      store.watchedSubset = async (addrs) => {
-        if (gateNext) {
-          gateNext = false
-          parkedResolve()
-          await gate
-        }
-        return watchedSubset(addrs)
-      }
-      const evaluation = evaluate(tx1, Date.now())
-      await parked
-
-      await process(chain.raw('b101')) // promote → confirmed:1 → final cleanup (record gone, tombstoned) → prune
-      expect(store.records.has('tx1')).toBe(false)
-      expect(store.evaluated.has('tx1')).toBe(false)
-      expect(store.tombstones.has('tx1')).toBe(true)
-
-      release()
-      await evaluation // the stale write lands now
-
-      expect(store.records.has('tx1')).toBe(false) // NOT resurrected
-      expect(store.pending.has('tx1')).toBe(false)
-      expect(enqueued(store)).toEqual(['confirmed'])
-
-      // the next tip block: nothing pending, so nothing can be reported dropped
-      chain.addBlock({ hash: 'b102', prevHash: 'b101', height: 102, time: 1_700_000_102, txs: [] })
-      await process(chain.raw('b102'))
-      expect(enqueued(store)).toEqual(['confirmed'])
-      expect(store.outboxEvents().map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
-    })
   })
 
-  describe('tombstones', () => {
-    it('a conflicted tx cannot re-enter tracking through a stale seen', async () => {
-      const { store, chain, register, evaluate, process } = wire()
-      store.watches.add(ADDR)
-      const tx1 = register(mkTx('tx1'))
-      chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
-      chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] }, { main: false })
-      store.tip = { hash: 'b101a', height: 101 }
-      store.ring.set('b100', 100)
-      store.ring.set('b101a', 101)
-      store.maturingIndex.set('tx1', 101)
-      store.records.set('tx1', { txid: 'tx1', height: 101, blockHash: 'b101a', matched: [{ address: ADDR, vout: 0, valueSats: 5000 }], fired: [1], hex: tx1.hex })
-      chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
-      // not in the new chain, not in the mempool → conflicted (terminal)
-      await process(chain.raw('b101b'))
-      expect(enqueued(store)).toEqual(['conflicted'])
-      expect(store.tombstones.has('tx1')).toBe(true)
+  it('a rebroadcast after an eviction re-fires seen (drops are not terminal)', async () => {
+    const { store, chain, register, evaluate, process } = wire()
+    store.watches.add(ADDR)
+    const tx1 = register(mkTx('tx1'))
+    chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
+    store.tip = { hash: 'b100', height: 100 }
+    store.ring.set('b100', 100)
+    await evaluate(tx1)
+    chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [] })
+    chain.mempool = [] // gone without being mined
+    await process(chain.raw('b101'))
+    expect(enqueued(store)).toEqual(['seen', 'dropped'])
+    expect((store.outboxEvents()[1] as TxEvent).reason).toBe('evicted')
+    expect(store.evaluated.has('tx1')).toBe(false)
 
-      await evaluate(tx1, Date.now()) // a late/duplicate rawtx for the losing tx
+    await evaluate(tx1) // the rebroadcast
 
-      expect(enqueued(store)).toEqual(['conflicted'])
-      expect(store.pending.has('tx1')).toBe(false)
-      expect(store.records.has('tx1')).toBe(false)
-    })
-
-    it('tombstones are pruned after TOMBSTONE_TTL_MS at the next tip block; a genuinely new sighting is tracked again', async () => {
-      vi.useFakeTimers()
-      vi.setSystemTime(1_700_000_000_000)
-      const { store, chain, register, evaluate, process } = wire({ confirmMilestones: [1], maxMilestone: 1 })
-      store.watches.add(ADDR)
-      const tx1 = register(mkTx('tx1'))
-      chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
-      store.tip = { hash: 'b100', height: 100 }
-      store.ring.set('b100', 100)
-      chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
-      await process(chain.raw('b101'))
-      expect(store.tombstones.get('tx1')).toBe(1_700_000_000_000)
-
-      // within the TTL: still tombstoned after another tip block; a stale seen is refused
-      vi.setSystemTime(1_700_000_000_000 + TOMBSTONE_TTL_MS - 1)
-      chain.addBlock({ hash: 'b102', prevHash: 'b101', height: 102, time: 1_700_000_102, txs: [] })
-      await process(chain.raw('b102'))
-      expect(store.tombstones.has('tx1')).toBe(true)
-      await evaluate(tx1, Date.now())
-      expect(enqueued(store)).toEqual(['confirmed'])
-
-      // past the TTL: pruned by the tip block
-      vi.setSystemTime(1_700_000_000_000 + TOMBSTONE_TTL_MS)
-      chain.addBlock({ hash: 'b103', prevHash: 'b102', height: 103, time: 1_700_000_103, txs: [] })
-      await process(chain.raw('b103'))
-      expect(store.tombstones.size).toBe(0)
-      await evaluate(tx1, Date.now())
-      expect(enqueued(store)).toEqual(['confirmed', 'seen'])
-    })
-
-    it('EVALUATION FENCE: a mempool RPC parked past the tombstone TTL cannot land after the prune — confirmed:1 only', async () => {
-      // The reviewer's interleaving: the reparser issues getrawtransaction before the block;
-      // the response parks; the block mines the tx, fires confirmed:1 and finishes tracking
-      // (tombstoned); an hour passes and the tip prune drops the tombstone; the response
-      // arrives. The tombstone can no longer help — the fence (startedAtMs) refuses it.
-      vi.useFakeTimers()
-      vi.setSystemTime(1_700_000_000_000)
-      const { store, chain, register, evaluate, process } = wire({ confirmMilestones: [1], maxMilestone: 1 })
-      store.watches.add(ADDR)
-      const tx1 = register(mkTx('tx1'))
-      chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
-      store.tip = { hash: 'b100', height: 100 }
-      store.ring.set('b100', 100)
-      chain.mempool = ['tx1']
-      let release!: () => void
-      const gate = new Promise<void>((r) => {
-        release = r
-      })
-      // a reparser whose getrawtransaction parks until released (same store + evaluator)
-      const rpc = chain.rpc()
-      const reparseParked = makeMempoolReparser({
-        rpc: {
-          getRawMempool: rpc.getRawMempool,
-          getRawTransactionVerbose: async (txid) => {
-            await gate
-            return rpc.getRawTransactionVerbose(txid)
-          },
-        },
-        store,
-        cfg: { network: 'regtest' },
-        decodeRawTx: () => tx1,
-        evaluate,
-      })
-      const reparsing = reparseParked() // startedAtMs = now; parked inside getrawtransaction
-
-      // the block: promote → confirmed:1 → final cleanup → tombstone
-      chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
-      chain.mempool = []
-      await process(chain.raw('b101'))
-      expect(enqueued(store)).toEqual(['confirmed'])
-      expect(store.tombstones.has('tx1')).toBe(true)
-
-      // an hour later the tip prune drops the tombstone
-      vi.setSystemTime(1_700_000_000_000 + TOMBSTONE_TTL_MS)
-      chain.addBlock({ hash: 'b102', prevHash: 'b101', height: 102, time: 1_700_000_102, txs: [] })
-      await process(chain.raw('b102'))
-      expect(store.tombstones.size).toBe(0)
-
-      // the parked response finally arrives — fenced, not recorded, txid left un-evaluated
-      release()
-      await reparsing
-      expect(store.records.has('tx1')).toBe(false)
-      expect(store.pending.has('tx1')).toBe(false)
-      expect(store.evaluated.has('tx1')).toBe(false)
-      expect(enqueued(store)).toEqual(['confirmed'])
-
-      // and the next tip block has nothing pending to report dropped
-      chain.addBlock({ hash: 'b103', prevHash: 'b102', height: 103, time: 1_700_000_103, txs: [] })
-      await process(chain.raw('b103'))
-      expect(store.outboxEvents().map((e) => e.idempotencyKey)).toEqual(['regtest:tx1:confirmed:1:b101'])
-      expect(MAX_EVALUATION_AGE_MS).toBeLessThan(TOMBSTONE_TTL_MS)
-    })
-
-    it('dropped does NOT tombstone: a rebroadcast (an evaluation started AFTER the drop) re-fires seen; one started before it is refused', async () => {
-      vi.useFakeTimers()
-      vi.setSystemTime(1_700_000_000_000)
-      const { store, chain, register, evaluate, process } = wire()
-      store.watches.add(ADDR)
-      const tx1 = register(mkTx('tx1'))
-      chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
-      store.tip = { hash: 'b100', height: 100 }
-      store.ring.set('b100', 100)
-      await evaluate(tx1, Date.now())
-      chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [] })
-      chain.mempool = [] // gone without being mined
-      const beforeDrop = Date.now()
-      vi.setSystemTime(beforeDrop + 1000)
-      await process(chain.raw('b101'))
-      expect(enqueued(store)).toEqual(['seen', 'dropped'])
-      expect((store.outboxEvents()[1] as TxEvent).reason).toBe('evicted')
-      expect(store.tombstones.size).toBe(0)
-      expect(store.retired.get('tx1')).toBe(beforeDrop + 1000) // the retirement watermark, not a tombstone
-
-      await evaluate(tx1, beforeDrop) // a duplicate evaluation that was in flight when it dropped: refused
-      expect(enqueued(store)).toEqual(['seen', 'dropped'])
-      expect(store.pending.has('tx1')).toBe(false)
-      expect(store.evaluated.has('tx1')).toBe(false)
-
-      vi.setSystemTime(beforeDrop + 2000)
-      await evaluate(tx1, Date.now()) // a real rebroadcast
-
-      expect(enqueued(store)).toEqual(['seen', 'dropped', 'seen'])
-      expect(store.pending.has('tx1')).toBe(true)
-    })
+    expect(enqueued(store)).toEqual(['seen', 'dropped', 'seen'])
+    expect(store.pending.has('tx1')).toBe(true)
   })
 
   it('two milestones enqueued in the same millisecond deliver 1 then 3', async () => {

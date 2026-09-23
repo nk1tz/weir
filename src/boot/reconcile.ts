@@ -15,7 +15,7 @@ import { log } from '../lib/log'
 const CTX = 'reconcile'
 
 export interface ReconcileDeps {
-  store: Pick<Store, 'getTip' | 'setTip' | 'ringPut'>
+  store: Pick<Store, 'getTip' | 'setTip'>
   rpc: Pick<Rpc, 'getBestBlockHash' | 'getBlockHeader' | 'getBlockRaw'>
   /** the block pipeline's processor (makeBlockProcessor) — handles gap AND reorg */
   processBlock(raw: Buffer): Promise<void>
@@ -28,8 +28,7 @@ export async function reconcile(deps: ReconcileDeps): Promise<void> {
   if (tip === null) {
     // First run: start tracking from the node's current best block. Forward-only.
     const header = await deps.rpc.getBlockHeader(best)
-    await deps.store.ringPut(header.height, best)
-    await deps.store.setTip({ hash: best, height: header.height })
+    await deps.store.setTip({ hash: best, height: header.height }) // tip + ring, one MULTI
     log.info(CTX, `first run — initialized tip to ${best}@${header.height} (forward-only, no backfill)`)
     return
   }

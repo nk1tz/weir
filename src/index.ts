@@ -1,9 +1,14 @@
 /**
  * weir daemon entrypoint. Boot sequence per DESIGN.md "src/index.ts":
  *   loadConfig → Store.connect → preflight → admin server when ADMIN_TOKEN is set →
- *   startOutboxDrainer → ONE awaited drainOnce → reconcile (+ resolveLimbo; then
- *   `runtime.reconciled = true`) → startZmq (rawtx → txHandler, rawblock → blockHandler,
- *   gap → reparser) → initial mempool reparse (async) → periodic reparse timer → startHeartbeat.
+ *   startOutboxDrainer → ONE awaited drainOnce → the engine queue's first item: reconcile
+ *   + resolveLimbo (then `runtime.reconciled = true`) → startZmq (every rawtx, rawblock and
+ *   gap-triggered reparse is queued) → initial mempool reparse (queued) → periodic reparse
+ *   timer (queued) → startHeartbeat.
+ * ONE WRITER (DESIGN "Single writer"): every engine action goes through `engine.run`, so
+ * evaluations, blocks and reparses never interleave. The heartbeat and the admin server
+ * only READ engine state (and the admin writes the watch set, which the engine only reads);
+ * the outbox drainer touches outbox keys only. None of them is on the queue.
  * The admin server comes up BEFORE the boot drain and reconcile so the platform's probes
  * get answers during a long catch-up: `/live` 200, `/ready` 503 `{reconciled: false}` —
  * instead of a refused connection that looks like a dead process.
@@ -32,9 +37,10 @@ import { startZmq } from './bitcoin/zmq'
 import { decodeBlock, decodeRawTx, isValidAddress } from './bitcoin/decoder'
 import { WebhookSink } from './delivery/webhook'
 import { startOutboxDrainer } from './delivery/outbox'
+import { makeEngineQueue } from './engine/queue'
 import { makeRawTxHandler, makeTxEvaluator } from './engine/txPipeline'
 import { MEMPOOL_REPARSE_INTERVAL_MS, makeMempoolReparser } from './engine/mempool'
-import { makeBlockHandler, makeBlockProcessor } from './engine/blockPipeline'
+import { makeBlockProcessor } from './engine/blockPipeline'
 import { resolveLimbo } from './engine/reorg'
 import { startHeartbeat } from './engine/heartbeat'
 import { preflight } from './boot/preflight'
@@ -100,47 +106,44 @@ async function main(): Promise<void> {
   const bootDelivered = await drainer.drainOnce()
   log.info(CTX, `boot drain: ${bootDelivered} queued event(s) delivered before reconcile`)
 
+  // The one writer. Boot reconciliation is its first item; ZMQ opens only after it finishes,
+  // so nothing can be queued ahead of or during it.
+  const engine = makeEngineQueue()
   const processBlock = makeBlockProcessor({ cfg, store, rpc, decodeBlock })
-  await reconcile({ store, rpc, processBlock })
-  // Crash-recovery: adjudicate reorg-displaced txs even when there was nothing to catch up
-  // (a crash between limbo-rewind and resolution). No-op when limbo is empty.
-  await resolveLimbo({ cfg, store, rpc })
+  await engine.run(async () => {
+    await reconcile({ store, rpc, processBlock })
+    // Crash-recovery: adjudicate reorg-displaced txs even when there was nothing to catch up
+    // (a crash between limbo-rewind and resolution). No-op when limbo is empty.
+    await resolveLimbo({ cfg, store, rpc })
+  })
   runtime.reconciled = true
 
   const evaluate = makeTxEvaluator({ store, cfg })
   const handleRawTx = makeRawTxHandler({ store, cfg, decodeRawTx })
   const reparse = makeMempoolReparser({ rpc, store, cfg, decodeRawTx, evaluate })
-  const handleBlock = makeBlockHandler(processBlock)
 
-  // zmq's safeInvoke wraps every handler: a returned promise rejection is fatal (never
-  // unhandled, never swallowed) — including a gap-triggered reparse failing. Receipt times
-  // are stamped on the way in (before decoding) — /ready reports them as ages.
+  // Every handler is one engine-queue item; a rejection inside the queue is fatal (never
+  // unhandled, never swallowed). Receipt times are stamped on the way in (before decoding)
+  // — /ready reports them as ages.
   const zmq = await startZmq({
     url: cfg.bitcoinZmqUrl,
     onRawTx: (buf) => {
       runtime.lastZmqTxAt = Date.now()
-      return handleRawTx(buf)
+      return engine.run(() => handleRawTx(buf))
     },
     onRawBlock: (buf) => {
       runtime.lastZmqBlockAt = Date.now()
-      return handleBlock(buf)
+      return engine.run(() => processBlock(buf))
     },
-    onTxGap: () => reparse(),
+    onTxGap: () => engine.run(reparse),
   })
 
-  // Initial mempool reparse — deliberately not awaited (spec: async). A failure here is an
-  // unexpected internal error → fatal, per DESIGN's error policy.
-  reparse().catch((err: unknown) => {
-    log.error(CTX, 'initial mempool reparse failed')
-    fatal(CTX, err)
-  })
+  // Initial mempool reparse — queued, not awaited (spec: async).
+  void engine.run(reparse)
 
   // Periodic reparse — the retry safety net (DESIGN "Outpoint tracking" rule 7): picks up
-  // evaluations the fence refused and txs ZMQ missed without a sequence gap. Overlap is
-  // skipped by the reparser's mutex; a rejection is an unexpected internal error → fatal.
-  const reparseTimer = setInterval(() => {
-    reparse().catch((err: unknown) => fatal(CTX, err))
-  }, MEMPOOL_REPARSE_INTERVAL_MS)
+  // txs ZMQ missed without a sequence gap. Queued like everything else, so it cannot overlap.
+  const reparseTimer = setInterval(() => void engine.run(reparse), MEMPOOL_REPARSE_INTERVAL_MS)
   reparseTimer.unref()
   log.info(CTX, `periodic mempool reparse every ${MEMPOOL_REPARSE_INTERVAL_MS / 1000}s`)
 

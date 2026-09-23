@@ -4,15 +4,16 @@
  * INVARIANTS
  * - Nothing is adjudicated at detection time: a pruned/no-txindex node cannot answer
  *   "which block is txid X in now?". Displaced maturing txs go to the durable `limbo` SET
- *   (record kept), the ring/tip rewind to the fork point, and the replacement chain then
- *   processes as a plain connected walk (one hash per height, no second fork search).
+ *   (record kept), the ring/tip rewind to the fork point — ONE MULTI (`rewind`) — and the
+ *   replacement chain then processes as a plain connected walk (one hash per height, no
+ *   second fork search).
  * - Re-inclusion is discovered by the block pipeline's promotion step (no event; milestones
  *   re-fire under the new blockHash), and a PROVEN conflict (a new-chain tx spending one of
- *   a limbo tx's inputs) by its input scan — both leave limbo inside the block pipeline.
- *   `resolveLimbo` runs only after the TIP block finishes (and at boot), when the node's
- *   mempool reflects the new chain, for whatever is still in limbo: present → demoted,
- *   absent → conflicted by elimination (terminal). Each outcome is ONE store transition that also enqueues
- *   its event — nothing here awaits delivery.
+ *   a limbo tx's inputs) by its input scan — both leave limbo inside the block's MULTI.
+ *   `resolveLimbo` runs only after a block that is the node's tip (and at boot), when the
+ *   node's mempool reflects the new chain, for whatever is still in limbo: present →
+ *   demoted, absent → conflicted by elimination (terminal). Each outcome is ONE MULTI that
+ *   also enqueues its event — nothing here awaits delivery.
  * - Limbo is durable, so a crash between rewind and resolution re-resolves on the next
  *   block or boot.
  */
@@ -26,19 +27,7 @@ const CTX = 'reorg'
 
 export type ReorgStore = Pick<
   Store,
-  | 'ringHashAt'
-  | 'ringAll'
-  | 'ringRemoveAbove'
-  | 'setTip'
-  | 'maturingEntries'
-  | 'unindexMaturing'
-  | 'removeMaturing'
-  | 'addLimbo'
-  | 'limboTxids'
-  | 'removeLimbo'
-  | 'demoteToPending'
-  | 'conflict'
-  | 'readRecord'
+  'ringHashAt' | 'ringAll' | 'rewind' | 'maturingEntries' | 'limboTxids' | 'removeLimbo' | 'demoteToPending' | 'conflict' | 'readRecord'
 >
 
 export type ReorgRpc = Pick<Rpc, 'getBlockHeader' | 'getMempoolEntry'>
@@ -97,34 +86,26 @@ export async function findForkPoint(
 }
 
 /**
- * Step 1 of the limbo model: move every maturing tx included above the ancestor into the
- * persisted limbo SET (record kept), truncate the ring above the ancestor and rewind the
- * tip to it. After this the replacement chain connects like an ordinary gap walk.
+ * Step 1 of the limbo model, ONE MULTI: every maturing tx included above the ancestor moves
+ * to the persisted limbo SET (record kept), the ring is truncated above the ancestor and the
+ * tip rewinds to it. After this the replacement chain connects like an ordinary gap walk.
  */
 export async function enterLimboAndRewind(deps: ReorgDeps, ancestorHeight: number): Promise<void> {
-  const displaced = (await deps.store.maturingEntries()).filter((e) => e.height > ancestorHeight)
-
-  if (displaced.length > 0) {
-    const txids = displaced.map((e) => e.txid)
-    await deps.store.addLimbo(txids)
-    await deps.store.unindexMaturing(txids)
-    log.warn(CTX, `${displaced.length} maturing tx(s) displaced by reorg → limbo: ${txids.join(', ')}`)
-  }
-
+  const displaced = (await deps.store.maturingEntries()).filter((e) => e.height > ancestorHeight).map((e) => e.txid)
   const ancestorHash = await deps.store.ringHashAt(ancestorHeight)
   if (ancestorHash === null) {
     // findForkPoint only returns heights that exist in the ring, so this is corruption.
     throw new Error(`[${CTX}] ring has no entry at ancestor height ${ancestorHeight} — cannot rewind`)
   }
-  await deps.store.ringRemoveAbove(ancestorHeight)
-  await deps.store.setTip({ hash: ancestorHash, height: ancestorHeight })
+  await deps.store.rewind({ hash: ancestorHash, height: ancestorHeight }, displaced)
+  if (displaced.length > 0) log.warn(CTX, `${displaced.length} maturing tx(s) displaced by reorg → limbo: ${displaced.join(', ')}`)
   log.info(CTX, `rewound tip to fork point ${ancestorHash}@${ancestorHeight}`)
 }
 
 /**
  * Step 3 of the limbo model: adjudicate whatever the new chain did NOT re-include.
- * Runs after the tip block finishes processing (and at boot when already reconciled).
- * Mempool probe is now trustworthy — bitcoind has fully switched to the new chain.
+ * Runs after a block that is the node's tip (and at boot). The mempool probe is
+ * trustworthy then — bitcoind has fully switched to the new chain.
  */
 export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
   const leftover = await deps.store.limboTxids()
@@ -155,8 +136,6 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
         idempotencyKey: idem.demoted(net, txid, rec.blockHash),
         timestamp: Date.now(),
       }
-      // One MULTI: record back to height 0, pending, evaluated (so the next reparse does not
-      // re-fire `seen` — the tip prune forgot it when it was mined), out of limbo, + `demoted`.
       await deps.store.demoteToPending(rec, ev)
       log.info(CTX, `demoted ${txid} (was ${rec.blockHash}@${rec.height}) — back to pending`)
       continue
@@ -179,8 +158,7 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
       idempotencyKey: idem.conflicted(net, txid),
       timestamp: Date.now(),
     }
-    // One MULTI: pending, maturing index, record, limbo all cleared + `conflicted` enqueued.
-    await deps.store.conflict(txid, ev)
+    await deps.store.conflict(rec, ev)
     log.info(CTX, `conflicted ${txid} (was ${rec.blockHash}@${rec.height}) — tracking ended`)
   }
 }

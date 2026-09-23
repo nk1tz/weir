@@ -381,31 +381,6 @@ describe('outbox drainer', () => {
     expect(sink.delivered).toHaveLength(50)
   })
 
-  it('outboxRetry / outboxDead on a missing id are no-ops: nothing partial is ever created', async () => {
-    const { store } = setup()
-    await expect(store.outboxRetry('nope', T0 + 1000, 1, 'HTTP 503')).resolves.toBe(false)
-    await expect(store.outboxDead('nope', T0, 1, 'HTTP 503', 1000)).resolves.toBe(false)
-    expect(store.outbox.size).toBe(0)
-    expect(store.outboxQueue.size).toBe(0)
-    expect(store.outboxDeadSet.size).toBe(0)
-  })
-
-  it('a concurrent ack during a failed send leaves nothing behind (retry becomes a no-op, warned)', async () => {
-    const { store, sink, drainer } = setup()
-    const id = store.enqueue(ev('e1'), T0 - 1)
-    sink.send = async () => {
-      await store.outboxAck(id) // someone else delivered + acked it meanwhile
-      return { ok: false, error: 'HTTP 503' }
-    }
-
-    await expect(drainer.drainOnce()).resolves.toBe(0)
-
-    expect(store.outbox.has(id)).toBe(false)
-    expect(store.outboxQueue.has(id)).toBe(false)
-    expect(store.outboxCreated.has(id)).toBe(false)
-    expect(warnLog.mock.calls.some((c) => /vanished before it could be rescheduled/.test(String(c[0])))).toBe(true)
-  })
-
   it('outboxStats.oldestCreatedAt is EXACT: an old event rescheduled far ahead is still the oldest', async () => {
     const { store, sink, drainer } = setup()
     const old = store.enqueue(ev('old'), T0 - 600_000)

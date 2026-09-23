@@ -16,24 +16,18 @@ export interface Keys {
   blocks: string
   /** ZSET txid scored by inclusion height — the maturing sweep index */
   maturing: string
-  /** HASH per maturing tx (height, blockHash, matched json, fired json, hex) */
+  /** HASH per tracked tx (height, blockHash, matched json, fired json, hex, inputs json) — exists from seen-time */
   maturingRecord: (txid: string) => string
 
   /** SET watched txids seen in mempool, awaiting first confirmation */
   pending: string
   /** SET txids displaced by a reorg, awaiting re-resolution as the new chain is processed */
   limbo: string
-  /** SET txids already evaluated (skip on re-sight) */
+  /** SET txids the mempool reparse must not fetch again in the current mempool epoch (pruned at tip blocks) */
   evaluated: string
-  /** SET transient snapshot during a reparse */
-  mempoolCurrent: string
-  /** SET mempool right after a block, feeds the dropped check */
-  mempoolPostBlock: string
-  /** SET latest block's txids, intersection scratch space */
-  blockTxids: string
   /** SET per prevout — `outpoint:{txid}:{vout}` → claimant txids (pending + maturing spenders; replacement / proven-conflict detection) */
   outpointKey: (o: Outpoint) => string
-  /** `outpoint:` — the prefix every outpoint SET key starts with (SCAN pattern; the Lua scripts build keys from it) */
+  /** `outpoint:` — the prefix every outpoint SET key starts with (SCAN pattern) */
   outpointPrefix: string
 
   /** ZSET eventId scored by nextAttemptAt unix ms — the durable delivery queue */
@@ -44,10 +38,6 @@ export interface Keys {
   outboxDead: string
   /** ZSET eventId scored by createdAt unix ms — the exact "oldest queued event" index (mirrors `outbox` membership) */
   outboxCreated: string
-  /** ZSET txid scored by doneAt unix ms — txids whose tracking ENDED; a stale evaluation must not resurrect them */
-  tombstones: string
-  /** ZSET txid scored by exitAt unix ms — the RETIREMENT WATERMARK: txids dropped/replaced (not terminal); an evaluation that STARTED before exitAt must not resurrect them, a later one (a rebroadcast) may */
-  retired: string
 }
 
 export function keysFor(network: Network): Keys {
@@ -62,17 +52,12 @@ export function keysFor(network: Network): Keys {
     pending: `${p}:pending`,
     limbo: `${p}:limbo`,
     evaluated: `${p}:evaluated`,
-    mempoolCurrent: `${p}:mempool:current`,
-    mempoolPostBlock: `${p}:mempool:postBlock`,
-    blockTxids: `${p}:block:txids`,
     outpointKey: (o: Outpoint) => `${p}:outpoint:${outpointField(o)}`,
     outpointPrefix: `${p}:outpoint:`,
     outbox: `${p}:outbox`,
     outboxRecord: (eventId: string) => `${p}:outbox:${eventId}`,
     outboxDead: `${p}:outbox:dead`,
     outboxCreated: `${p}:outbox:created`,
-    tombstones: `${p}:tombstones`,
-    retired: `${p}:retired`,
   }
 }
 
