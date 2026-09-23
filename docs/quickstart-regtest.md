@@ -275,6 +275,29 @@ block), not a duplicate.
 Had the replacement chain excluded the tx instead, you'd have seen `demoted` (back to
 mempool) or `conflicted` (gone for good — a double-spend won).
 
+## End-to-end suite
+
+Everything above, plus the paths you cannot hit by hand in five minutes (RBF replacement,
+redirect, reorg → `demoted`, reorg + double-spend → proven `conflicted`, TTL expiry, webhook
+down, daemon restart mid-flight, `/ready` during catch-up), is scripted as the v0.2 gate:
+
+```console
+$ ./examples/regtest-e2e.sh
+== 1. happy path
+   ✓ seen → confirmed:1 → confirmed:3
+...
+== ALL SCENARIOS PASSED
+```
+
+It recreates the stack from scratch (`down -v`), starts `examples/catch.js` itself on :9090,
+drives bitcoind through nine scenarios, asserts the exact `[catch]` lines (event, txid,
+`reason`, `replacedBy`, `conflictingTxid`, block hash), checks that every `idempotencyKey`
+arrived exactly once and that weir logged no `[error]` line, then tears the stack down.
+Needs: docker compose v2, node ≥ 20 on the host, `.env` with `WEBHOOK_URL` pointing at
+`host.docker.internal:9090`, `WEBHOOK_SECRET` and `ADMIN_TOKEN` set. About two minutes.
+`KEEP_STACK=1` leaves the stack up for inspection; the catcher log is
+`/tmp/weir-e2e-catch.log` (`CATCH_LOG` overrides it).
+
 ## 8. Teardown
 
 ```console

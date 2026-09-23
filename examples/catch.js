@@ -61,7 +61,13 @@ function summarize(event) {
     case 'conflicted': {
       const sats = (event.matched || []).reduce((sum, m) => sum + m.valueSats, 0)
       const addrs = (event.matched || []).map((m) => m.address).join(',')
-      return `${event.event} txid=${event.txid} confs=${event.confs} sats=${sats} addr=${addrs}`
+      let line = `${event.event} txid=${event.txid} confs=${event.confs} sats=${sats} addr=${addrs}`
+      // optional verdict fields (dropped: reason/replacedBy; conflicted: reason/conflictingTxid)
+      if (event.reason) line += ` reason=${event.reason}`
+      if (event.replacedBy) line += ` replacedBy=${event.replacedBy}`
+      if (event.conflictingTxid) line += ` conflictingTxid=${event.conflictingTxid}`
+      if (event.blockHash) line += ` block=${event.blockHash}`
+      return line
     }
     case 'expired':
       return `expired address=${event.address}`

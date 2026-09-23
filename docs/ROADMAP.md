@@ -24,8 +24,12 @@ under-tested, with real bugs in that gap. Order of work:
    **Chain-lag health `/live` `/ready` `/metrics`** — DONE 2026-09-22 (spec: DESIGN.md
    "Health from chain lag"; 1 review round: write gating until reconciled, RPC deadlines,
    `!shuttingDown` in readiness, metrics registry type guard).
-6. **Full regtest E2E** — reorg via `invalidateblock`, restart mid-flight, webhook down
-   during a reorg. This is the v0.2 gate.
+6. **Full regtest E2E** — DONE 2026-09-22: `examples/regtest-e2e.sh`, nine scripted scenarios
+   against a real bitcoind 28 + redis (happy path, RBF bump, redirect, reorg → demoted →
+   re-confirmed, reorg + double-spend → proven `conflicted`, TTL expiry, webhook down, restart
+   mid-flight, `/ready` 503 → 200), asserting the exact events the catcher receives. Found no
+   weir defect: every event fired as DESIGN.md says, no duplicate idempotency keys, no stray
+   redis state, zero error lines. This is the v0.2 gate.
 
 Known bugs (from the reviews) are tracked against steps 2 and 4 above.
 
