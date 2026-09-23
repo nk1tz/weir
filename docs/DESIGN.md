@@ -41,11 +41,23 @@ the rules of this codebase:
   something is off the queue — put it on the queue; never add a condition.
 - A rejection inside a queue item is `fatal` (docker restarts the daemon, boot
   reconciliation heals). There is no "skip the failed item and keep going".
-- Boot reconciliation (reconcile → resolveLimbo) is the queue's FIRST item; ZMQ opens only
+- Boot reconciliation (reconcile, ending in settleTip) is the queue's FIRST item; ZMQ opens only
   after it finishes, so nothing can be queued ahead of or during it.
 - The queue is the reparser's mutex (the whole reparse body is one item) and the block
   handler's serialisation (a burst of blocks runs one at a time). Throughput is explicitly
   not a concern.
+- NODE STATE. The queue serialises weir's writers; it cannot stop bitcoind from moving
+  between a read and a write inside one item. One rule covers that, and it is a node
+  probe, never a Redis condition: A WRITE REFLECTS THE NODE AT WRITE TIME; HISTORICAL
+  PACKETS NEVER OVERWRITE A NEWER RECONCILED OUTCOME. Concretely: (a) the tip-only work
+  snapshots the mempool, then confirms `getbestblockhash` is still the stored tip, and
+  every step — limbo resolution included — decides from THAT snapshot, never a later
+  probe (`settleTip`); (b) boot reconciles until the stored tip is the node's best and
+  settles through that same path, never a separate resolution; (c) an evaluation about to
+  write what asserts "this tx is in the mempool" (a `seen`, or a `dropped`/`replaced` of a
+  claimant) asks `getmempoolentry` once first — absent → nothing is written, the packet is
+  history (a gap-triggered reparse already reconciled the node's newer state, or the tx
+  was mined/replaced meanwhile) and the block path or a later packet covers it.
 - Three components run OUTSIDE the queue and are not writers of engine state:
   - the heartbeat only READS (tip, watch count, memory, outbox stats) and sends directly;
   - the admin server READS engine state and probes, and writes ONLY the watch set
@@ -140,7 +152,7 @@ Transitions — every code path is one of these, and each is one MULTI:
 | from → to | trigger | event | written by |
 |---|---|---|---|
 | `unseen → pending` | mempool evaluation matches a watch | `seen` (when milestone 0) | `applyEvaluation` |
-| `unseen → unseen` | evaluation matches nothing; or a repeated sighting of a tracked txid | — (marked evaluated) | `applyEvaluation` / no-op |
+| `unseen → unseen` | evaluation matches nothing; or a repeated sighting of a tracked txid; or a historical packet (the tx is no longer in the node's mempool) | — (marked evaluated / nothing) | `applyEvaluation` / no-op |
 | `unseen → maturing(h)` | mined paying a watch without a mempool sighting (missed ZMQ, direct-to-block, dropped-then-mined, re-inclusion after `done` at exactly max-milestone depth) | — (milestones follow) | `applyBlock.promoted` |
 | `pending → maturing(h)` | mined | — | `applyBlock.promoted` |
 | `maturing(h) → maturing(h)` | block at depth ≥ a milestone m not yet fired | `confirmed` (confs m, key with blockHash) | `applyBlock.fired` |
@@ -150,8 +162,9 @@ Transitions — every code path is one of these, and each is one MULTI:
 | `maturing(h) → limbo` | its block is disconnected (reorg rewind) | — | `rewind` |
 | `limbo → maturing(h')` | re-included by the new chain | — (milestones re-fire under h') | `applyBlock.promoted` |
 | `limbo → gone` | a new-chain tx spends one of its inputs | `conflicted` reason `double-spend`, `conflictingTxid` | `applyBlock.conflicted` |
-| `limbo → pending` | still in limbo after the tip block, and in the node's mempool | `demoted` | `demoteToPending` (tip-only) |
-| `limbo → gone` | still in limbo after the tip block, not in the mempool | `conflicted` (by elimination) | `conflict` (tip-only) |
+| `limbo → pending` | still in limbo when the tip settles, and in the validated mempool snapshot | `demoted` | `demoteToPending` (tip-only, block path or boot) |
+| `limbo → gone` | still in limbo when the tip settles, absent from the snapshot | `conflicted` (by elimination) | `conflict` (tip-only, block path or boot) |
+| `maturing(h) → limbo` | boot finds the stored tip off the node's active chain (a reorg while weir was down, not yet built past) | — | `rewind` (reconcile) |
 | `pending \| limbo → gone` | mined but no longer paying any watch (watch removed or expired mid-flight) | — | `applyBlock.ended` |
 | `any → gone` | prune-window reset (downtime longer than the node's prune window) | — (logged loudly) | `resetTracking` |
 
@@ -170,9 +183,12 @@ Scenario → transitions (the nine E2E scenarios plus the two crash/burst cases)
 | 6 TTL expiry | `watched → expired` at the next tip block; a pending tx of that address would go `pending → gone` quietly when mined |
 | 7 webhook down | no state change: the events sit in the outbox and drain later |
 | 8 restart mid-flight | `pending` survives the restart; boot reconciliation walks the 3 missed blocks (non-tip, non-tip, tip): `pending → maturing(h)` (confirmed:1) → `done` (confirmed:3); tip-only work at the last block only |
+| 10 restart mid-reorg | `maturing(h) → limbo` by reconcile's rewind (the node's best is our tip's parent) → settle from the snapshot: `limbo → pending` (demoted, old block hash) → next block `pending → maturing(h')` (confirmed:1 under h') → `done` |
 | 9 /ready | no transition; the probe reads `runtime.reconciled` |
 | crash before exec | the block's MULTI never landed: NO transition, tip unchanged; boot reconciliation replays the block and every transition happens exactly once |
 | reorg burst | blocks B1..Bn queued back to back; each block's MULTI applies its own transitions (rewind, promotions, proven conflicts); the tip-only work (eviction, TTL, `evaluated` prune, limbo resolution) runs only at the block that equals `getbestblockhash` — earlier blocks defer it, so a limbo tx stays in limbo until the node's view is settled |
+| node moves during boot | reconcile processes best B1 (rewind: A → limbo); by its settle the node is at B2 → settle refuses (no resolution from a stale view); the next round processes B2, which re-includes A: `limbo → maturing` — never a false `conflicted` |
+| historical packet | reparse (queued ahead of the packets of a ZMQ gap) records C; the queued packet for B (replaced by C) finds B absent from the node's mempool → nothing written; C's packet → already evaluated |
 
 ## Outbox (durable delivery)
 
@@ -273,8 +289,8 @@ Rules:
    Every claimant of a spent outpoint is adjudicated (a field may have several). Running
    before promotion means a limbo tx cannot be both re-included and conflicted by one block.
    All of it lands in the block's ONE MULTI (`applyBlock`).
-5. `resolveLimbo` keeps its by-elimination fallback (`getmempoolentry` → demoted, else
-   conflicted) for txs the new chain neither re-included nor provably conflicted (e.g. an
+5. `resolveLimbo` keeps its by-elimination fallback (in the validated mempool snapshot →
+   demoted, else conflicted) for txs the new chain neither re-included nor provably conflicted (e.g. an
    input spent by a tx weir never decoded because it was below the ring floor).
 6. Payload additions (all OPTIONAL, additive — consumers ignoring them are unaffected):
    `dropped` gains `reason: 'replaced' | 'evicted'` (`evicted` is the residual verdict of the
@@ -303,7 +319,7 @@ they expose counts, never addresses or txids):
 - `GET /ready` → 200/503 `{ok, redis, rpc, reconciled, shuttingDown, tipHeight, nodeHeight,
   chainLag, watchCount, outboxDepth, outboxOldestAgeSec, deadLetterCount, lastZmqTxAgeSec,
   lastZmqBlockAgeSec}`. `ok` = redis ok AND rpc ok AND reconciled (boot finished reconcile +
-  resolveLimbo) AND NOT shuttingDown AND chainLag ≤ `READY_MAX_LAG`. The runtime flags are
+  settleTip) AND NOT shuttingDown AND chainLag ≤ `READY_MAX_LAG`. The runtime flags are
   read AFTER the async reads, so a shutdown that begins mid-probe still answers 503.
   Webhook/outbox state NEVER fails readiness: the daemon is healthy when the consumer is
   down. `nodeHeight` is one `getblockcount` per probe (short deadline, see src/bitcoin/rpc.ts);
@@ -347,7 +363,7 @@ interval; `chainLag > READY_MAX_LAG` persisting > 3 min; `weir_outbox_oldest_age
 300`; any `weir_events_dead_lettered_total` increase; redis memory > 80% of max.
 
 src/index.ts: a `Runtime` object `{reconciled, shuttingDown, lastZmqTxAt, lastZmqBlockAt}`
-replaces the `lastBlockAt` closure; reconciled is set after resolveLimbo; shuttingDown is
+replaces the `lastBlockAt` closure; reconciled is set after reconcile settles; shuttingDown is
 set first thing in shutdown() so `/live` flips before anything closes. The admin server
 starts right after preflight — BEFORE the boot drain and reconcile — so the probes answer
 during a long catch-up (`/live` 200, `/ready` 503 `{reconciled: false}`) instead of refusing
@@ -360,7 +376,7 @@ NEVER swallow errors silently. ONE fatal-error policy for BACKGROUND paths: an U
 error on a path where nobody is waiting for an answer — where a swallowed error would be a
 silent stall — crashes the process through `fatal()` (src/lib/log.ts — logs message + stack,
 `process.exit(1)`); docker restarts the daemon and boot reconciliation (reconcile →
-resolveLimbo → mempool reparse) heals. Fatal sites: the ZMQ subscriber loop failing, ANY
+settleTip → mempool reparse) heals. Fatal sites: the ZMQ subscriber loop failing, ANY
 engine-queue item rejecting (a rawtx evaluation, a block, a reparse — makeEngineQueue; no
 "skip the failed item and keep the queue alive"), a heartbeat tick rejecting, the redis
 client giving up reconnecting or ending unasked (src/store/redis.ts), the admin server's
@@ -562,16 +578,19 @@ yields 2 entries).
 ### src/engine/txPipeline.ts
 `export function makeTxEvaluator(deps): (tx: DecodedTx) => Promise<void>` and
 `export function makeRawTxHandler(deps): (raw: Buffer) => Promise<void>` (decode → evaluate).
-Runs as one engine-queue item. Evaluate — reads, then ONE MULTI (Outpoint tracking rule 3):
+Deps: `store`, `rpc: Pick<Rpc, 'getMempoolEntry'>`, `cfg`. Runs as one engine-queue item. Evaluate — reads, then ONE MULTI (Outpoint tracking rule 3):
 if `isEvaluated` → return. If `readRecord` is non-null → return: the tx is already tracked
 (pending, maturing or limbo) and this is a repeated sighting — bitcoind re-publishes `rawtx`
 for every tx of a connected AND a disconnected block, after the tip prune forgot the txid
 from `evaluated`; `seen` is the `unseen → pending` transition only, and a maturing/limbo
 record must never be put back to height 0. Replacement check: `outpointOwners(inputs)`,
 every distinct claimant ≠ this txid → its record (gone → skip; mined → warn, skip; unmined →
-a `dropped`/`replaced` for this evaluation's `dropped` list). Match. Build the `seen` TxEvent
-(confs 0, block fields null, timestamp now) when matched and seenEnabled. Then
-`applyEvaluation({txid, dropped, seen})` — one MULTI; nothing awaited from the network.
+a `dropped`/`replaced` for this evaluation's `dropped` list). Match. If there is anything to
+drop or a match: the NODE PROBE (Single writer) — `getMempoolEntry(txid)` null → log, return
+with NOTHING written (not even evaluated). Build the `seen` TxEvent (confs 0, block fields
+null, timestamp now) when matched and seenEnabled. Then `applyEvaluation({txid, dropped,
+seen})` — one MULTI; nothing awaited from the network. A non-matching, non-replacing tx never
+probes: it is just marked evaluated.
 
 ### src/engine/mempool.ts
 `export function makeMempoolReparser(deps): () => Promise<void>` — the whole body is one
@@ -601,19 +620,25 @@ a plain connected walk: no second fork search, one hash per height in the ring.
 Re-inclusion is discovered NATURALLY by the block pipeline's promotion step: a limbo txid
 found in a new block re-enters maturing (fresh height/blockHash, fired []) and leaves limbo —
 no event at re-inclusion; milestones re-fire on the sweep with new-blockhash idempotency keys.
-`export async function resolveLimbo(deps): Promise<void>` — runs in the tip-only work of a
-block that is the node's tip (and at boot): for each txid still in limbo (a PROVEN conflict
-— Outpoint tracking rule 4 — already left limbo inside the block's MULTI, so it is never
+`export async function resolveLimbo(deps, mempool: ReadonlySet<string>): Promise<void>` —
+runs only inside `settleTip` (a block that is the node's tip, or boot), with the mempool
+SNAPSHOT that path validated; it never probes the node itself (a live probe could describe
+a block that landed after the validation). For each txid still in limbo (a PROVEN conflict —
+Outpoint tracking rule 4 — already left limbo inside the block's MULTI, so it is never
 adjudicated twice),
-  - getMempoolEntry non-null → build `demoted` (confs 0, block fields = the OLD block,
+  - in the snapshot → build `demoted` (confs 0, block fields = the OLD block,
     timestamp now) and `demoteToPending(rec, ev)` (one MULTI, enqueues it);
   - else → build `conflicted` (confs = last confirmed depth or 0, old block fields) and
     `conflict(rec, ev)` (one MULTI: full cleanup + enqueue). Terminal.
 Because limbo is durable, a crash anywhere in the sequence re-resolves on the next block/boot.
 
 ### src/engine/blockPipeline.ts
-`export function makeBlockProcessor(deps): (raw: Buffer) => Promise<void>` used by both the ZMQ
-path (as an engine-queue item) and boot catch-up (reconcile, inside the queue's first item).
+`export function makeBlockPipeline(deps): { processBlock(raw: Buffer): Promise<void>; settleTip(): Promise<boolean> }`
+(`makeBlockProcessor(deps)` = its `processBlock` alone, what the ZMQ path queues). Boot
+(reconcile) uses both, inside the queue's first item. `settleTip` is the tip-only work for
+the STORED tip: snapshot `getrawmempool`, then `getbestblockhash`; equal to the stored tip →
+steps a–d below from that snapshot, true; otherwise nothing written, false (the node moved
+on; a newer block settles); no tip yet → true.
 Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
    If H is the tip or already in the ring → duplicate, skip (a replay after a crash that
@@ -650,14 +675,15 @@ Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
 4. `applyBlock({promoted, fired, finished, dropped, conflicted, ended, unindexed, tip: {H, h},
    ringKeep: ringSize})` — the block's ONE MULTI, tip and ring included. Crash before exec =
    nothing happened; boot reconciliation replays B. `weir_blocks_processed_total` after it.
-5. TIP-ONLY WORK — only when B is the node's CURRENT tip. The steps below consult live node
-   state (mempool, wall clock), which is wrong for a block that is not the node's tip: a
-   catch-up block (a pending tx mined in a LATER missed block would be falsely evicted) or a
-   queued burst during a reorg. So: `isTip` (false for the catch-up walk) → snapshot
-   `getRawMempool` FIRST, then `getBestBlockHash`; if it is not H → log, return (the next
-   tip block picks the work up). Snapshotting before the check means a block that lands
-   between the two calls invalidates the snapshot instead of poisoning it. Each step is its
-   own MULTI and safe to repeat:
+5. TIP-ONLY WORK — `settleTip`, only when `isTip` (false for the catch-up walk) and only
+   when B is the node's CURRENT tip. The steps below consult node state (mempool, wall
+   clock), which is wrong for a block that is not the node's tip: a catch-up block (a
+   pending tx mined in a LATER missed block would be falsely evicted) or a queued burst
+   during a reorg. Snapshot `getRawMempool` FIRST, then `getBestBlockHash`; if it is not H →
+   log, return (the next tip block picks the work up). Snapshotting before the check means a
+   block that lands between the two calls invalidates the snapshot instead of poisoning it;
+   every step below decides from the snapshot, never a later probe. Each step is its own
+   MULTI and safe to repeat:
    a. eviction check: every `pendingTxids()` member absent from the snapshot vanished
       without being mined (replacements were caught by the input scans, so this is the
       residual verdict): `dropPending({rec, event})` with `reason: 'evicted'`, key
@@ -666,7 +692,7 @@ Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
    b. TTL sweep: dueExpiries(now) → `expireWatch(addr, ev)`;
    c. `forgetEvaluated(evaluated − snapshot)` — the reparse dedupe list starts a new mempool
       epoch;
-   d. `resolveLimbo`.
+   d. `resolveLimbo(deps, snapshot)`.
 There are no delivery-failure branches in the engine: every event is enqueued in the same
 MULTI as its state change and the outbox retries it.
 
@@ -695,14 +721,22 @@ one-line log; throw Error (fatal) unless noted:
    (maxBytes/1.5 − 45MB) / 330 bytes; skip when maxBytes null).
 
 ### src/boot/reconcile.ts
-`export async function reconcile(deps): Promise<void>` — tip = getTip(). If null: initialize
-tip/ring to current best block (getBestBlockHash + header; `setTip`, one MULTI) — forward-only,
-no backfill. Else: node best = getBestBlockHash(); if same as tip.hash → done. Else: process
-blocks from tip → best via the blockPipeline's processor (handles gap, reorg, prune-window
-guard and — at the tip — limbo resolution via the same logic). reconcile takes no limbo dep:
-index.ts calls `resolveLimbo` unconditionally right after `reconcile` returns, inside the
-same queue item (a crash between limbo-rewind and resolution must not leave displaced txs
-unadjudicated until the next block; no-op when limbo is empty).
+`export async function reconcile(deps: {cfg, store, rpc, processBlock, settleTip}): Promise<void>`
+— rounds of (reconcileOnce → settleTip) until settle succeeds (the stored tip IS the node's
+best as of a validated snapshot), capped at 20 rounds (then the next ZMQ block's gap walk
+takes over, warned). reconcileOnce: tip = getTip(). If null: initialize tip/ring to the
+current best block (getBestBlockHash + header; `setTip`, one MULTI) — forward-only, no
+backfill. If best === tip.hash → nothing. Else, if the best block's height ≤ tip.height, the
+stored tip cannot be on the node's active chain (a reorg while weir was down that the node
+has not yet built past — e.g. `invalidateblock` with no replacement mined): `findForkPoint`
+from best, `enterLimboAndRewind` (one MULTI; `weir_reorgs_total`), and if the fork point IS
+best → nothing more to process. Otherwise (a gap, or a reorg the node has built past) hand
+the best block to the processor, whose connectivity step walks/rewinds by itself. Then
+`settleTip` — the same snapshot-validated path a tip block uses — resolves whatever is in
+limbo (a crash between rewind and resolution, or the rewind just made). There is NO separate
+boot-time limbo resolution: if the node advanced while we reconciled, settle refuses and the
+next round processes the new best (which may re-include a limbo tx) before anything is
+adjudicated.
 
 ### src/admin/server.ts
 `export function startAdminServer(deps, onFatal = fatal): {close(): Promise<void>; port: Promise<number>}` —
@@ -740,7 +774,8 @@ never fatal); a server `'error'` event (listen failure) → `fatal` (background 
 loadConfig → Store.connect → preflight → admin server if token (probes answer from here:
 `/live` 200, `/ready` 503 until reconciled) → startOutboxDrainer → ONE awaited `drainOnce()`
 (logged; acks free memory before reconcile writes under a full redis) → `makeEngineQueue()`
-→ the queue's first item, awaited: reconcile → resolveLimbo → `runtime.reconciled = true` →
++ `makeBlockPipeline` → the queue's first item, awaited: `reconcile` (which ends in
+`settleTip`) → `runtime.reconciled = true` →
 startZmq (rawtx → `engine.run(handleRawTx)`, rawblock → `engine.run(processBlock)`, gap →
 `engine.run(reparse)`; each receipt stamps `runtime.lastZmqTxAt` / `lastZmqBlockAt` before
 queuing) → initial mempool reparse (queued, not awaited) → periodic reparse timer

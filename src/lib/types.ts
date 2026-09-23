@@ -131,7 +131,7 @@ export interface Tip {
  * probes (`/live`, `/ready`, `/metrics`). Plain mutable fields — no I/O behind any of them.
  */
 export interface Runtime {
-  /** boot reconcile + resolveLimbo finished — before that /ready is 503 */
+  /** boot reconcile (ending in the tip settle) finished — before that /ready is 503 */
   reconciled: boolean
   /** set FIRST in shutdown(), so /live flips to 503 before anything closes */
   shuttingDown: boolean

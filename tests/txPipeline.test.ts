@@ -7,8 +7,10 @@ import { ADDR, FakeStore, mkTx } from './fakes'
 function setup(overrides: { seenEnabled?: boolean } = {}) {
   const store = new FakeStore()
   const cfg = { network: 'regtest' as const, seenEnabled: overrides.seenEnabled ?? true }
-  const evaluate = makeTxEvaluator({ store, cfg })
-  return { store, cfg, evaluate }
+  /** the node: every tx these tests evaluate is in its mempool (a packet is a mempool sighting) */
+  const rpc = { getMempoolEntry: async () => ({}) }
+  const evaluate = makeTxEvaluator({ store, rpc, cfg })
+  return { store, cfg, rpc, evaluate }
 }
 
 /** Every ENQUEUED seen event (tests/fakes.ts outbox), in enqueue order. */
@@ -117,6 +119,7 @@ describe('txPipeline', () => {
     const tx = mkTx('tx1')
     const handler = makeRawTxHandler({
       store,
+      rpc: { getMempoolEntry: async () => ({}) },
       cfg,
       decodeRawTx: (raw) => {
         expect(Buffer.isBuffer(raw)).toBe(true)
@@ -141,10 +144,10 @@ describe('mempool reparser', () => {
   function reparserSetup() {
     const store = new FakeStore()
     const cfg = { network: 'regtest' as const, seenEnabled: true }
-    const evaluate = makeTxEvaluator({ store, cfg })
     const hexToTx = new Map<string, DecodedTx>()
     const rpcTxs = new Map<string, { blockhash?: string; hex: string }>()
     const mempool: string[] = []
+    const evaluate = makeTxEvaluator({ store, rpc: { getMempoolEntry: async (txid: string) => (mempool.includes(txid) ? {} : null) }, cfg })
     /** register a tx with the fake node; `blockhash` = the node has mined it since the snapshot */
     const seed = (tx: DecodedTx, blockhash?: string) => {
       hexToTx.set(tx.hex, tx)

@@ -24,8 +24,10 @@
  * - TIP-ONLY WORK compares against the node's LIVE state (mempool, wall clock), which is
  *   wrong for a block that is not the node's current tip: a catch-up block (a pending tx
  *   mined in a LATER missed block would be falsely evicted) or a queued burst during a
- *   reorg. So after the block's MULTI it snapshots the mempool, then asks getbestblockhash,
- *   and runs only when that is this block. A skipped run is picked up by the next tip
+ *   reorg. So after the block's MULTI, `settleTip` snapshots the mempool, then asks
+ *   getbestblockhash, and runs only when that is the stored tip — and every step, limbo
+ *   resolution included, decides from THAT snapshot, never from a later probe. Boot calls
+ *   the same `settleTip` after reconciling. A skipped run is picked up by the next tip
  *   block; each step is its own MULTI and safe to repeat.
  * - A tx's `maturing:{txid}` record exists from SEEN-time (height 0); the `maturing` ZSET
  *   only indexes MINED txs.
@@ -71,12 +73,24 @@ export interface BlockPipelineDeps {
   decodeBlock(raw: Buffer, network: Network): DecodedBlock
 }
 
-/**
- * Returns the block processor used by both the ZMQ path (through the engine queue) and boot
- * catch-up (reconcile). Processes one raw block through the full pipeline sequence, pulling
- * any missed ancestor blocks over RPC first (gap/reorg handling).
- */
+export interface BlockPipeline {
+  /** one raw block through the full sequence, pulling any missed ancestor blocks over RPC first (gap/reorg handling) */
+  processBlock(raw: Buffer): Promise<void>
+  /**
+   * The tip-only work for the STORED tip, if the node agrees it is the tip: snapshot the
+   * mempool, then getbestblockhash; equal → eviction, TTL, evaluated prune, limbo
+   * resolution from that snapshot, resolves true. Otherwise nothing is written and it
+   * resolves false (the node moved on: a newer block will settle). No tip yet → true.
+   */
+  settleTip(): Promise<boolean>
+}
+
+/** The block processor alone — what the ZMQ path queues. */
 export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Promise<void> {
+  return makeBlockPipeline(deps).processBlock
+}
+
+export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
   const { cfg, store, rpc } = deps
 
   /** The block's distinct output addresses that are watched — one round trip per chunk. */
@@ -180,10 +194,9 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     }
   }
 
-  /** The tip-only work — each step its own MULTI, each safe to repeat at the next tip block. */
-  async function tipWork(block: DecodedBlock, height: number, mempool: string[]): Promise<void> {
+  /** The tip-only work at the stored tip `{hash, height}` — each step its own MULTI, each safe to repeat at the next tip block. */
+  async function tipWork(hash: string, height: number, inMempool: ReadonlySet<string>): Promise<void> {
     const net = cfg.network
-    const inMempool = new Set(mempool)
 
     // Eviction check: a pending tx absent from the live mempool vanished without being
     // mined. Replacements were caught by the input scans (mempool path or the block's), so
@@ -228,10 +241,23 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     // The reparse dedupe list forgets what left the mempool (mined or gone): a new mempool epoch.
     await store.forgetEvaluated((await store.evaluatedTxids()).filter((t) => !inMempool.has(t)))
 
-    // Whatever a reorg displaced and the new chain did not re-include gets adjudicated now
-    // (mempool → demoted, gone → conflicted). No-op when limbo is empty.
-    await resolveLimbo(deps)
-    log.info(CTX, `tip work done at ${block.hash}@${height}`)
+    // Whatever a reorg displaced and the new chain did not re-include gets adjudicated now,
+    // from the same snapshot (present → demoted, absent → conflicted). No-op when limbo is empty.
+    await resolveLimbo(deps, inMempool)
+    log.info(CTX, `tip work done at ${hash}@${height}`)
+  }
+
+  async function settleTip(): Promise<boolean> {
+    const tip = await store.getTip()
+    if (tip === null) return true
+    const mempool = new Set(await rpc.getRawMempool()) // snapshot BEFORE asking which block is best:
+    const best = await rpc.getBestBlockHash() // if best is still the tip, the snapshot belongs to it
+    if (best !== tip.hash) {
+      log.info(CTX, `${tip.hash}@${tip.height} is not the node's tip (best ${best}) — tip work deferred to the next block`)
+      return false
+    }
+    await tipWork(tip.hash, tip.height, mempool)
+    return true
   }
 
   async function processConnected(block: DecodedBlock, height: number, isTip: boolean): Promise<void> {
@@ -329,17 +355,13 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     log.info(CTX, `processed block ${block.hash}@${height} (${block.txs.length} txs)`)
 
     // ── tip-only work, only at the node's real tip ───────────────────────────────────
-    if (!isTip) return
-    const mempool = await rpc.getRawMempool() // snapshot BEFORE asking which block is best:
-    const best = await rpc.getBestBlockHash() // if best is still B, the snapshot belongs to B
-    if (best !== block.hash) {
-      log.info(CTX, `${block.hash}@${height} is not the node's tip (best ${best}) — tip work deferred to the next block`)
-      return
-    }
-    await tipWork(block, height, mempool)
+    if (isTip) await settleTip()
   }
 
   async function processOne(raw: Buffer, isTip: boolean): Promise<void> {
+    // A ZMQ duplicate or an old notification: the block is the tip or already in the ring.
+    // (A stored tip that the node no longer has is boot's case: reconcile rewinds to the
+    // node's chain BEFORE handing it a block — see src/boot/reconcile.ts.)
     const block = deps.decodeBlock(raw, cfg.network)
     const header = await rpc.getBlockHeader(block.hash)
     const height = header.height
@@ -403,5 +425,5 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     await processConnected(block, height, isTip)
   }
 
-  return (raw: Buffer) => processOne(raw, true)
+  return { processBlock: (raw: Buffer) => processOne(raw, true), settleTip }
 }

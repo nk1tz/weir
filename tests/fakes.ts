@@ -503,6 +503,7 @@ export class FakeChain {
   mainChain = new Map<number, string>()
   /** what getbestblockhash answers; null = the highest main-chain block */
   best: string | null = null
+  /** the live mempool: getrawmempool, and getmempoolentry for anything listed here (or in `mempoolEntries`) */
   mempool: string[] = []
   mempoolEntries = new Map<string, object>()
   rawTxs = new Map<string, { blockhash?: string; hex: string }>()
@@ -557,7 +558,7 @@ export class FakeChain {
       },
       getBlockRaw: async (hash: string) => this.raw(hash),
       getRawMempool: async () => [...this.mempool],
-      getMempoolEntry: async (txid: string) => this.mempoolEntries.get(txid) ?? null,
+      getMempoolEntry: async (txid: string) => this.mempoolEntries.get(txid) ?? (this.mempool.includes(txid) ? {} : null),
       getRawTransactionVerbose: async (txid: string) => this.rawTxs.get(txid) ?? null,
       getBlockchainInfo: async () => ({
         chain: 'regtest',

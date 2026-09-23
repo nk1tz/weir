@@ -45,7 +45,13 @@ under-tested, with real bugs in that gap. Order of work:
    `mempool:postBlock`, `block:txids`), 2 constants (`MAX_EVALUATION_AGE_MS`,
    `TOMBSTONE_TTL_MS`), 10 Lua scripts → 0, 21 Store methods (60 → 39), 70 test cases net
    (355 → 285, guard/race/Lua-text pins deleted, behavioural tests kept or rewritten), 644
-   source lines net (2505 → 1893 across the touched src files). DESIGN.md gained "Single writer"
+   source lines net (2505 → 1893 across the touched src files). Codex review then found
+   one class the rule did not cover — bitcoind moving between a read and a write INSIDE a
+   queue item — fixed without any Redis condition: limbo resolves from the tip path's
+   validated mempool snapshot (never a later probe); boot reconciles until the stored tip
+   is the node's best and settles through that same path (an off-chain stored tip is
+   rewound first); an evaluation confirms the tx is in the node's mempool before it writes
+   a `seen` or a replacement. E2E scenario 10 (restart mid-reorg) added. DESIGN.md gained "Single writer"
    and "Transaction lifecycle" (the state machine every code path is a transition of).
 
 Known bugs (from the reviews) are tracked against steps 2 and 4 above.
@@ -68,7 +74,7 @@ webhook is down past the retry budget, the event is lost and the state transitio
 completes anyway. These are the "reverse the money" events — the worst ones to lose.
 
 Fix:
-- Enqueue the event in the SAME Redis MULTI/Lua as the state mutation. This is the
+- Enqueue the event in the SAME Redis MULTI as the state mutation. This is the
   non-negotiable part.
 - A drainer delivers due entries (`nextAttemptAt` ZSET + per-event hash), backoff,
   delete on 2xx.

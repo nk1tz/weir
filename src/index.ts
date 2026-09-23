@@ -2,7 +2,8 @@
  * weir daemon entrypoint. Boot sequence per DESIGN.md "src/index.ts":
  *   loadConfig → Store.connect → preflight → admin server when ADMIN_TOKEN is set →
  *   startOutboxDrainer → ONE awaited drainOnce → the engine queue's first item: reconcile
- *   + resolveLimbo (then `runtime.reconciled = true`) → startZmq (every rawtx, rawblock and
+ *   (rewind to the node's chain if needed, catch up, then the snapshot-validated tip settle;
+ *   then `runtime.reconciled = true`) → startZmq (every rawtx, rawblock and
  *   gap-triggered reparse is queued) → initial mempool reparse (queued) → periodic reparse
  *   timer (queued) → startHeartbeat.
  * ONE WRITER (DESIGN "Single writer"): every engine action goes through `engine.run`, so
@@ -40,8 +41,7 @@ import { startOutboxDrainer } from './delivery/outbox'
 import { makeEngineQueue } from './engine/queue'
 import { makeRawTxHandler, makeTxEvaluator } from './engine/txPipeline'
 import { MEMPOOL_REPARSE_INTERVAL_MS, makeMempoolReparser } from './engine/mempool'
-import { makeBlockProcessor } from './engine/blockPipeline'
-import { resolveLimbo } from './engine/reorg'
+import { makeBlockPipeline } from './engine/blockPipeline'
 import { startHeartbeat } from './engine/heartbeat'
 import { preflight } from './boot/preflight'
 import { reconcile } from './boot/reconcile'
@@ -109,17 +109,14 @@ async function main(): Promise<void> {
   // The one writer. Boot reconciliation is its first item; ZMQ opens only after it finishes,
   // so nothing can be queued ahead of or during it.
   const engine = makeEngineQueue()
-  const processBlock = makeBlockProcessor({ cfg, store, rpc, decodeBlock })
-  await engine.run(async () => {
-    await reconcile({ store, rpc, processBlock })
-    // Crash-recovery: adjudicate reorg-displaced txs even when there was nothing to catch up
-    // (a crash between limbo-rewind and resolution). No-op when limbo is empty.
-    await resolveLimbo({ cfg, store, rpc })
-  })
+  const { processBlock, settleTip } = makeBlockPipeline({ cfg, store, rpc, decodeBlock })
+  // reconcile ends with the same settle step a tip block runs, so leftover limbo (a crash
+  // between rewind and resolution) is adjudicated from a validated mempool snapshot.
+  await engine.run(() => reconcile({ cfg, store, rpc, processBlock, settleTip }))
   runtime.reconciled = true
 
-  const evaluate = makeTxEvaluator({ store, cfg })
-  const handleRawTx = makeRawTxHandler({ store, cfg, decodeRawTx })
+  const evaluate = makeTxEvaluator({ store, rpc, cfg })
+  const handleRawTx = makeRawTxHandler({ store, rpc, cfg, decodeRawTx })
   const reparse = makeMempoolReparser({ rpc, store, cfg, decodeRawTx, evaluate })
 
   // Every handler is one engine-queue item; a rejection inside the queue is fatal (never

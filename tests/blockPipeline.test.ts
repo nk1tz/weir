@@ -136,7 +136,7 @@ describe('blockPipeline', () => {
     const { store, chain, process, cfg } = setup()
     seedTip(store, chain, 100, 'b100')
     const tx1 = mkTx('tx1')
-    const evaluate = makeTxEvaluator({ store, cfg: { network: cfg.network, seenEnabled: true } })
+    const evaluate = makeTxEvaluator({ store, rpc: chain.rpc(), cfg: { network: cfg.network, seenEnabled: true } })
     await evaluate(tx1) // nothing watched yet → evaluated, no match
     expect(store.evaluated.has('tx1')).toBe(true)
     expect(store.outboxEvents()).toHaveLength(0)

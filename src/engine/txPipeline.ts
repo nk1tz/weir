@@ -1,4 +1,5 @@
 import type { DecodedTx, MaturingRecord, Network, TxEvent } from '../lib/types'
+import type { Rpc } from '../bitcoin/rpc'
 import type { Drop, Store } from '../store/redis'
 import { idem } from '../store/keys'
 import { log } from '../lib/log'
@@ -9,6 +10,8 @@ const CTX = 'txPipeline'
 /** Structural deps — tests pass in-memory fakes (tests/fakes.ts). No sink: events are enqueued. */
 export interface TxEvaluatorDeps {
   store: Pick<Store, 'isEvaluated' | 'readRecord' | 'watchedSubset' | 'outpointOwners' | 'applyEvaluation'>
+  /** the one node probe of an evaluation: is this tx in the mempool NOW (asked only before a write) */
+  rpc: Pick<Rpc, 'getMempoolEntry'>
   cfg: { network: Network; seenEnabled: boolean }
 }
 
@@ -31,6 +34,12 @@ export interface RawTxHandlerDeps extends TxEvaluatorDeps {
  *   same MULTI as this tx's own outcome. A MINED claimant is never touched from the mempool
  *   (bitcoind does not relay a conflict with a confirmed tx; during reorg lag the block path
  *   adjudicates it): warned, skipped.
+ * - NODE STATE AT WRITE TIME (DESIGN "Single writer"): before it writes anything that
+ *   asserts "this tx is in the node's mempool" — a `seen`, or a `dropped`/`replaced` of a
+ *   claimant — the evaluation asks `getmempoolentry` once. Absent → no writes at all (not
+ *   even evaluated): the packet is historical (a gap-triggered reparse already reconciled
+ *   the node's newer state, or the tx was mined/replaced meanwhile); the block path or a
+ *   later packet covers it. A non-matching, non-replacing tx never probes.
  * - no matched outputs → marked evaluated only.
  * - matched → its seen-time record (height 0 / blockHash '' — a dropped tx cannot be
  *   re-fetched from a pruned node), pending, its claims, + `seen` (null when milestone 0 is
@@ -85,6 +94,10 @@ export function makeTxEvaluator(deps: TxEvaluatorDeps): (tx: DecodedTx) => Promi
 
     const dropped = await replacedClaimants(tx)
     const matched = await matchTx(tx, store)
+    if ((dropped.length > 0 || matched.length > 0) && (await deps.rpc.getMempoolEntry(tx.txid)) === null) {
+      log.info(CTX, `${tx.txid} is not in the node's mempool now (replaced or mined since this packet) — nothing written`)
+      return
+    }
     let seen: { rec: MaturingRecord; event: TxEvent | null } | null = null
     if (matched.length > 0) {
       const event: TxEvent | null = cfg.seenEnabled

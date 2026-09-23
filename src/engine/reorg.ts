@@ -10,10 +10,11 @@
  * - Re-inclusion is discovered by the block pipeline's promotion step (no event; milestones
  *   re-fire under the new blockHash), and a PROVEN conflict (a new-chain tx spending one of
  *   a limbo tx's inputs) by its input scan — both leave limbo inside the block's MULTI.
- *   `resolveLimbo` runs only after a block that is the node's tip (and at boot), when the
- *   node's mempool reflects the new chain, for whatever is still in limbo: present →
- *   demoted, absent → conflicted by elimination (terminal). Each outcome is ONE MULTI that
- *   also enqueues its event — nothing here awaits delivery.
+ *   `resolveLimbo` runs only inside the tip path (a block that is the node's tip, or boot's
+ *   settle step), and decides from the MEMPOOL SNAPSHOT that path validated against
+ *   getbestblockhash — never from a live probe, which could describe a newer block: present
+ *   in the snapshot → demoted, absent → conflicted by elimination (terminal). Each outcome
+ *   is ONE MULTI that also enqueues its event — nothing here awaits delivery.
  * - Limbo is durable, so a crash between rewind and resolution re-resolves on the next
  *   block or boot.
  */
@@ -30,7 +31,7 @@ export type ReorgStore = Pick<
   'ringHashAt' | 'ringAll' | 'rewind' | 'maturingEntries' | 'limboTxids' | 'removeLimbo' | 'demoteToPending' | 'conflict' | 'readRecord'
 >
 
-export type ReorgRpc = Pick<Rpc, 'getBlockHeader' | 'getMempoolEntry'>
+export type ReorgRpc = Pick<Rpc, 'getBlockHeader'>
 
 export interface ForkPointDeps {
   store: Pick<ReorgStore, 'ringAll' | 'ringHashAt'>
@@ -90,7 +91,10 @@ export async function findForkPoint(
  * to the persisted limbo SET (record kept), the ring is truncated above the ancestor and the
  * tip rewinds to it. After this the replacement chain connects like an ordinary gap walk.
  */
-export async function enterLimboAndRewind(deps: ReorgDeps, ancestorHeight: number): Promise<void> {
+export async function enterLimboAndRewind(
+  deps: { store: Pick<ReorgStore, 'maturingEntries' | 'ringHashAt' | 'rewind'> },
+  ancestorHeight: number,
+): Promise<void> {
   const displaced = (await deps.store.maturingEntries()).filter((e) => e.height > ancestorHeight).map((e) => e.txid)
   const ancestorHash = await deps.store.ringHashAt(ancestorHeight)
   if (ancestorHash === null) {
@@ -103,11 +107,12 @@ export async function enterLimboAndRewind(deps: ReorgDeps, ancestorHeight: numbe
 }
 
 /**
- * Step 3 of the limbo model: adjudicate whatever the new chain did NOT re-include.
- * Runs after a block that is the node's tip (and at boot). The mempool probe is
- * trustworthy then — bitcoind has fully switched to the new chain.
+ * Step 3 of the limbo model: adjudicate whatever the new chain did NOT re-include, from
+ * `mempool` — the snapshot the tip path took and then validated (getbestblockhash still
+ * equals the block it belongs to). A live re-probe here could see a block that landed after
+ * the validation and call a just-re-mined tx `conflicted`.
  */
-export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
+export async function resolveLimbo(deps: ReorgDeps, mempool: ReadonlySet<string>): Promise<void> {
   const leftover = await deps.store.limboTxids()
   if (leftover.length === 0) return
   const net = deps.cfg.network
@@ -120,8 +125,7 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
       continue
     }
 
-    const mempoolEntry = await deps.rpc.getMempoolEntry(txid)
-    if (mempoolEntry !== null) {
+    if (mempool.has(txid)) {
       // Demoted: back in the mempool. Block fields refer to the OLD (disconnected) block.
       const ev: TxEvent = {
         version: 1,
@@ -141,7 +145,7 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
       continue
     }
 
-    // Not re-included by the new chain, not in the mempool → conflicted BY ELIMINATION
+    // Not re-included by the new chain, not in the snapshot → conflicted BY ELIMINATION
     // (a PROVEN double-spend — the new chain spending one of its inputs — was already
     // adjudicated by the block pipeline's input scan and left limbo there). Terminal.
     const lastDepth = rec.fired.length > 0 ? Math.max(...rec.fired) : 0

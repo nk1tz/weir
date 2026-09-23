@@ -306,9 +306,9 @@ pnpm test:redis
 ```
 
 End to end against a real node: `examples/regtest-demo.sh` narrates one payment (see the
-quickstart); `examples/regtest-e2e.sh` is the full gate — nine scripted scenarios (RBF, redirect,
+quickstart); `examples/regtest-e2e.sh` is the full gate — ten scripted scenarios (RBF, redirect,
 reorg → demoted, reorg + double-spend → proven conflicted, TTL, webhook down, restart mid-flight,
-`/ready` during catch-up) against the compose regtest stack, asserting the exact events the
+`/ready` during catch-up, restart mid-reorg) against the compose regtest stack, asserting the exact events the
 catcher receives. It needs docker compose v2, node on the host, and `.env` with `WEBHOOK_SECRET`
 and `ADMIN_TOKEN` set; it recreates the stack (`down -v`) and takes about two minutes.
 

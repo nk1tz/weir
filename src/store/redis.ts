@@ -530,15 +530,15 @@ export class Store {
     this.noteEnqueued(event)
   }
 
-  /** A limbo entry whose record is gone (corruption cleanup): SREM limbo. */
+  /** A limbo entry whose record is gone (corruption cleanup): SREM limbo, one MULTI. */
   async removeLimbo(txid: string): Promise<void> {
-    await this.client.sRem(this.keys.limbo, txid)
+    await this.client.multi().sRem(this.keys.limbo, txid).exec()
   }
 
-  /** Forget txids from the reparse dedupe list (tip blocks: those no longer in the mempool). No-op on []. */
+  /** Forget txids from the reparse dedupe list (tip blocks: those no longer in the mempool), one MULTI. No-op on []. */
   async forgetEvaluated(txids: string[]): Promise<void> {
     if (txids.length === 0) return
-    await this.client.sRem(this.keys.evaluated, txids)
+    await this.client.multi().sRem(this.keys.evaluated, txids).exec()
   }
 
   /**

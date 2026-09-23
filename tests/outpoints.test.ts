@@ -24,7 +24,12 @@ function wire(cfgOverrides: Partial<{ confirmMilestones: number[]; maxMilestone:
     return tx
   }
   const rpc = chain.rpc()
-  const evaluate = makeTxEvaluator({ store, cfg })
+  const evaluateRaw = makeTxEvaluator({ store, rpc, cfg })
+  /** a rawtx packet: the tx is in the node's mempool when weir evaluates it */
+  const evaluate = async (tx: DecodedTx): Promise<void> => {
+    if (!chain.mempool.includes(tx.txid)) chain.mempool.push(tx.txid)
+    await evaluateRaw(tx)
+  }
   const reparse = makeMempoolReparser({
     rpc,
     store,
@@ -34,14 +39,14 @@ function wire(cfgOverrides: Partial<{ confirmMilestones: number[]; maxMilestone:
       if (!tx) throw new Error(`no fake tx for hex ${String(raw)}`)
       return tx
     },
-    evaluate,
+    evaluate: evaluateRaw,
   })
   const process = makeBlockProcessor({ cfg, store, rpc, decodeBlock: chain.decode })
   store.watches.add(ADDR)
   chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
   store.tip = { hash: 'b100', height: 100 }
   store.ring.set('b100', 100)
-  return { store, chain, rpc, register, evaluate, reparse, process }
+  return { store, chain, rpc, register, evaluate, evaluateRaw, reparse, process }
 }
 
 /** prevout `prevN:0` — two txs given the same one conflict */
@@ -160,6 +165,38 @@ describe('outpoint tracking', () => {
       expect(enqueued(store)).toEqual(['seen', 'dropped', 'seen'])
       expect(txEvents(store)[1]).toMatchObject({ txid: 'A', reason: 'replaced', replacedBy: 'B' })
       expect(store.pending.has('B')).toBe(true)
+    })
+
+    it('REGRESSION (historical packet after a gap reparse): a rawtx packet for a tx the node no longer holds writes NOTHING — the reconciled newer outcome stands', async () => {
+      // Chain A → B → C of replacements. onTxGap queues the reparse ahead of the packets that
+      // triggered it: the reparse evaluates C (the node's live mempool). The queued packet for
+      // B would then "replace" C by B, and C's own later packet would re-fire seen:C.
+      const { store, chain, register, evaluateRaw, reparse } = wire()
+      register(mkTx('A', ADDR, 5000, [O(1)]))
+      const b = register(mkTx('B', ADDR, 4900, [O(1)]))
+      const c = register(mkTx('C', ADDR, 4800, [O(1)]))
+      chain.mempool = ['C'] // A and B are gone from the node: C replaced them
+      await reparse()
+      expect(keysOf(store)).toEqual(['regtest:C:seen'])
+
+      await evaluateRaw(b) // the historical packet: B is not in the node's mempool now
+      await evaluateRaw(c) // C's packet: already evaluated
+
+      expect(keysOf(store)).toEqual(['regtest:C:seen']) // no dropped:C, no second seen
+      expect(store.pending.has('C')).toBe(true)
+      expect(store.pending.has('B')).toBe(false)
+      expect(store.evaluated.has('B')).toBe(false) // nothing written for B at all
+      expect(claims(store)).toEqual({ 'prev1:0': ['C'] })
+    })
+
+    it('a non-matching, non-replacing tx never probes the node (marked evaluated without getmempoolentry)', async () => {
+      const { store, rpc, evaluateRaw } = wire()
+      const probe = vi.spyOn(rpc, 'getMempoolEntry')
+
+      await evaluateRaw(mkTx('U', null, 1, [O(9)]))
+
+      expect(probe).not.toHaveBeenCalled()
+      expect(store.evaluated.has('U')).toBe(true)
     })
 
     it('a MATURING (mined) claimant is never touched by a mempool tx: warn, nothing emitted, claims untouched', async () => {

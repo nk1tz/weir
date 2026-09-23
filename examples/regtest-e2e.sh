@@ -3,7 +3,7 @@
 # regtest-e2e.sh — the v0.2 gate: weir against a REAL bitcoind + redis on regtest, driving
 # every lifecycle path and asserting the EXACT events examples/catch.js receives.
 #
-# Scenarios (each asserts events from the catcher's `[catch] <summary>` log lines):
+# Scenarios (ten; each asserts events from the catcher's `[catch] <summary>` log lines):
 #   1. happy path         seen → confirmed:1 → confirmed:3
 #   2. RBF fee-bump       A seen → B seen; A dropped reason=replaced replacedBy=B IMMEDIATELY (no block)
 #   3. redirect           A seen → bump pays nobody we watch → A dropped(replaced), no seen for B
@@ -17,12 +17,15 @@
 #   8. restart mid-flight seen → stop weir → mine 3 → start weir → confirmed:1 + confirmed:3 from
 #                         boot reconciliation (gap walk); no duplicate seen
 #   9. /ready             503 {reconciled:false} during boot catch-up, then 200 {reconciled:true} with chainLag 0
+#  10. restart mid-reorg   confirmed:1 → stop weir → invalidateblock (no replacement mined) → start weir →
+#                         boot rewinds to the node's chain: demoted (old hash) → empty block, then mine →
+#                         confirmed:1 under the new hash → confirmed:3
 # Global: no [error] lines from weir after boot, every idempotencyKey delivered exactly once.
 #
 # Requires: docker compose v2 (stack from the repo root, profile 'regtest'), node ≥ 20 on the
 # host (runs examples/catch.js), .env with WEBHOOK_URL=http://host.docker.internal:9090/webhook,
 # WEBHOOK_SECRET and ADMIN_TOKEN set. The stack is recreated from scratch (down -v) at start
-# and torn down at the end (KEEP_STACK=1 leaves it up). Runtime: ~2 minutes.
+# and torn down at the end (KEEP_STACK=1 leaves it up). Runtime: ~3 minutes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -190,6 +193,26 @@ READY="$(printf '%s\n' "$OBS" | grep '^200 ' | tail -1 | cut -d' ' -f2-)"
 [[ "$READY" == *"\"tipHeight\":$(bcli getblockcount)"* ]] || fail "tipHeight != node height: $READY"
 ok "observed: $SEQ; chainLag 0 at height $(bcli getblockcount)"
 
+step "10. restart mid-reorg: boot rewinds to the node's chain and resolves limbo"
+A10="$(bcli getnewaddress)"; watch_addr "$A10"; T10="$(bcli sendtoaddress "$A10" 0.25)"; expect_event "seen txid=$T10 "
+mine 1; H10="$(bcli getbestblockhash)"; expect_event "confirmed txid=$T10 confs=1 .* block=$H10"
+docker compose stop weir >/dev/null 2>&1
+bcli invalidateblock "$H10" >/dev/null   # weir is down: it never sees the disconnect, and no replacement is mined
+[ "$(bcli getmempoolentry "$T10" >/dev/null 2>&1 && echo yes)" = "yes" ] || fail "T10 did not return to the mempool after invalidateblock"
+docker compose start weir >/dev/null 2>&1
+expect_event "demoted txid=$T10 confs=0 .* block=$H10" 90
+wait_ready
+[ "$(rcli SCARD weir:regtest:limbo | tr -d '[:space:]')" = "0" ] || fail "limbo not empty after boot"
+mine_empty   # a replacement block at the same height WITHOUT the tx (re-mining T10 on the same coinbase would rebuild the invalidated block)
+expect_no_event "confirmed txid=$T10 confs=1 .* block=$(bcli getbestblockhash)" 2
+mine 1; H10B="$(bcli getbestblockhash)"; [ "$H10B" != "$H10" ] || fail "replacement block has the old hash"
+expect_event "confirmed txid=$T10 confs=1 .* block=$H10B" 30
+mine 2; expect_event "confirmed txid=$T10 confs=3 .* block=$H10B"
+[ "$(count_events "demoted txid=$T10 ")" = "1" ] || fail "expected exactly one demoted for T10"
+[ "$(count_events "confirmed txid=$T10 confs=1 ")" = "2" ] || fail "expected exactly two confirmed:1 for T10 (old + new block)"
+expect_no_event "conflicted txid=$T10 " 0
+ok "boot rewound $H10 → demoted → confirmed:1@$H10B → confirmed:3"
+
 step "global invariants"
 DUP="$(grep -h '"idempotencyKey"' "$CATCH_LOG" | sort | uniq -d)"
 [ -z "$DUP" ] || fail "idempotencyKey delivered more than once:"$'\n'"$DUP"
@@ -197,7 +220,7 @@ grep -q '\[catch\] BAD SIGNATURE' "$CATCH_LOG" && fail "catcher rejected a signa
 ERR_NOW="$(weir_errors)"
 if [ "$ERR_NOW" != "$ERR_BASE" ]; then docker compose logs --no-log-prefix weir 2>&1 | grep '\[error\]' | tail -n "$((ERR_NOW - ERR_BASE))" >&2; fail "weir logged $((ERR_NOW - ERR_BASE)) error line(s) after boot"; fi
 TOTALS="seen=$(count_events 'seen ') confirmed=$(count_events 'confirmed ') dropped=$(count_events 'dropped ') demoted=$(count_events 'demoted ') conflicted=$(count_events 'conflicted ') expired=$(count_events 'expired ')"
-[ "$TOTALS" = "seen=8 confirmed=12 dropped=2 demoted=1 conflicted=1 expired=1" ] || fail "event totals differ from the nine scenarios' exact expectation: $TOTALS"
+[ "$TOTALS" = "seen=9 confirmed=15 dropped=2 demoted=2 conflicted=1 expired=1" ] || fail "event totals differ from the ten scenarios' exact expectation: $TOTALS"
 ok "every idempotencyKey delivered exactly once, all signatures verified, no weir [error] lines after boot, exact event totals"
 
 step "ALL SCENARIOS PASSED"

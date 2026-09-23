@@ -25,7 +25,12 @@ function wire(cfgOverrides: Partial<{ confirmMilestones: number[]; maxMilestone:
     return tx
   }
   const rpc = chain.rpc()
-  const evaluate = makeTxEvaluator({ store, cfg })
+  const evaluateRaw = makeTxEvaluator({ store, rpc, cfg })
+  /** a rawtx packet: the tx is in the node's mempool when weir evaluates it */
+  const evaluate = async (tx: DecodedTx): Promise<void> => {
+    if (!chain.mempool.includes(tx.txid)) chain.mempool.push(tx.txid)
+    await evaluateRaw(tx)
+  }
   const reparse = makeMempoolReparser({
     rpc,
     store,
@@ -35,10 +40,10 @@ function wire(cfgOverrides: Partial<{ confirmMilestones: number[]; maxMilestone:
       if (!tx) throw new Error(`no fake tx for hex ${String(raw)}`)
       return tx
     },
-    evaluate,
+    evaluate: evaluateRaw,
   })
   const process = makeBlockProcessor({ cfg, store, rpc, decodeBlock: chain.decode })
-  return { store, chain, register, evaluate, reparse, process }
+  return { store, chain, rpc, register, evaluate, evaluateRaw, reparse, process }
 }
 
 const names = (events: WeirEvent[]): string[] => events.map((e) => e.event)
@@ -227,6 +232,39 @@ describe('lifecycle', () => {
       expect(store.maturingIndex.has('tx1')).toBe(false) // tracking ended at 3 confs
       expect(store.records.has('tx1')).toBe(false)
     })
+  })
+
+  it('REGRESSION (resolveLimbo discards the validated snapshot): a limbo tx that leaves the mempool after the tip snapshot is still resolved FROM the snapshot — demoted, never a live re-probe', async () => {
+    // The tip path snapshots getrawmempool, confirms best == B, then resolves limbo. A live
+    // getmempoolentry at that point could see a block that landed after the confirmation
+    // (the tx re-mined there) and say `conflicted` instead of `demoted`.
+    const { store, chain, rpc, register, evaluate, process } = wire()
+    store.watches.add(ADDR)
+    chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
+    store.tip = { hash: 'b100', height: 100 }
+    store.ring.set('b100', 100)
+    const tx1 = register(mkTx('tx1'))
+    await evaluate(tx1)
+    chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
+    chain.mempool = []
+    await process(chain.raw('b101a'))
+    chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
+    chain.mempool = ['tx1']
+    // the snapshot says tx1 is in the mempool; right after it is taken the node moves on (tx1 mined elsewhere)
+    const getRawMempool = rpc.getRawMempool
+    rpc.getRawMempool = async () => {
+      const snapshot = await getRawMempool()
+      chain.mempool = []
+      chain.mempoolEntries.clear()
+      return snapshot
+    }
+    const probe = vi.spyOn(rpc, 'getMempoolEntry')
+
+    await process(chain.raw('b101b'))
+
+    expect(enqueued(store)).toEqual(['seen', 'confirmed', 'demoted'])
+    expect(probe).not.toHaveBeenCalled() // the outcome came from the snapshot, not a later probe
+    expect(store.pending.has('tx1')).toBe(true)
   })
 
   it('a rebroadcast after an eviction re-fires seen (drops are not terminal)', async () => {
