@@ -1,6 +1,6 @@
 {
   "name": "weir",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Watch bitcoin addresses, get signed webhooks. Runs on a pruned node — no txindex, no address index.",
   "license": "MIT",
   "private": true,

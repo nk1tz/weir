@@ -16,7 +16,7 @@
 #   7. webhook down       stop catcher, pay + mine, outbox holds; restart catcher → drains to empty
 #   8. restart mid-flight seen → stop weir → mine 3 → start weir → confirmed:1 + confirmed:3 from
 #                         boot reconciliation (gap walk); no duplicate seen
-#   9. /ready             503 {reconciled:false} during boot catch-up, then 200 with chainLag 0
+#   9. /ready             503 {reconciled:false} during boot catch-up, then 200 {reconciled:true} with chainLag 0
 # Global: no [error] lines from weir after boot, every idempotencyKey delivered exactly once.
 #
 # Requires: docker compose v2 (stack from the repo root, profile 'regtest'), node ≥ 20 on the
@@ -140,7 +140,7 @@ expect_event "conflicted txid=$T5 confs=1 .* reason=double-spend conflictingTxid
 expect_no_event "demoted txid=$T5 " 2
 expect_no_event "dropped txid=$T5 " 0
 [ "$(rcli EXISTS "weir:regtest:maturing:$T5" | tr -d '[:space:]')" = "0" ] || fail "conflicted record still in redis"
-[ "$(rcli ZSCORE weir:regtest:tombstones "$T5" | tr -d '[:space:]')" != "" ] || fail "conflicted txid not tombstoned"
+[ "$(rcli SISMEMBER weir:regtest:limbo "$T5" | tr -d '[:space:]')" = "0" ] || fail "conflicted txid still in limbo"
 ok "conflicted, proven: conflictingTxid=$T6 mined in $H6"
 mine 3
 
@@ -176,11 +176,16 @@ ok "caught up 3 blocks on boot, milestones fired from the gap walk, no duplicate
 
 step "9. /ready: 503 while reconciling, 200 with chainLag 0 after"
 docker compose stop weir >/dev/null 2>&1; mine 150; docker compose start weir >/dev/null 2>&1
-# poll from inside the container every 50ms: refused (process booting) → 503 (admin up, reconciling) → 200
-SEQ="$(docker compose exec -T weir sh -c "for i in \$(seq 1 600); do s=\$(wget -qO- --server-response http://127.0.0.1:${PORT}/ready 2>&1 | grep -o 'HTTP/[0-9.]* [0-9][0-9][0-9]' | head -1 | awk '{print \$2}'); echo \"\${s:-refused}\"; [ \"\$s\" = 200 ] && exit 0; sleep 0.05; done; exit 1" | uniq | tr '\n' ' ')" || fail "/ready never returned 200 (observed: $SEQ)"
+# poll from inside the container (node's fetch gives status AND body): refused (process booting)
+# → 503 (admin up, reconciling) → 200. Every 503 body must say reconciled:false, the 200 body reconciled:true.
+PROBE_JS='fetch("http://127.0.0.1:"+process.env.PROBE_PORT+"/ready").then(async r=>{console.log(r.status,await r.text());process.exit(r.status===200?0:1)},()=>{console.log("refused");process.exit(1)})'
+OBS="$(docker compose exec -T -e PROBE_JS="$PROBE_JS" -e PROBE_PORT="$PORT" weir sh -c 'for i in $(seq 1 600); do node -e "$PROBE_JS" && exit 0; sleep 0.05; done; exit 1')" || fail "/ready never returned 200 (observed: $(printf '%s\n' "$OBS" | awk '{print $1}' | uniq | tr '\n' ' '))"
+SEQ="$(printf '%s\n' "$OBS" | awk '{print $1}' | uniq | tr '\n' ' ')"
 case "$SEQ" in *"503 "*"200"*) ;; *) fail "expected a 503 before the 200 (observed: $SEQ)";; esac
-READY="$(docker compose exec -T weir wget -qO- "http://127.0.0.1:${PORT}/ready")"
+printf '%s\n' "$OBS" | grep '^503 ' | grep -vq '"reconciled":false' && fail "a 503 body did not say reconciled:false"
+READY="$(printf '%s\n' "$OBS" | grep '^200 ' | tail -1 | cut -d' ' -f2-)"
 [[ "$READY" == *'"ok":true'* ]] || fail "/ready ok != true: $READY"
+[[ "$READY" == *'"reconciled":true'* ]] || fail "/ready 200 body did not say reconciled:true: $READY"
 [[ "$READY" == *'"chainLag":0'* ]] || fail "chainLag != 0 after catch-up: $READY"
 [[ "$READY" == *"\"tipHeight\":$(bcli getblockcount)"* ]] || fail "tipHeight != node height: $READY"
 ok "observed: $SEQ; chainLag 0 at height $(bcli getblockcount)"
