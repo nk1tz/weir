@@ -50,6 +50,8 @@ Working set (reconstructible): `pending`, `evaluated`, `mempool:current`, `mempo
 Reorg state (durable): `limbo` SET — txids whose inclusion block was disconnected by a reorg,
 awaiting re-resolution (re-included by the new chain / demoted to mempool / conflicted). Kept
 in redis so a crash mid-reorg finishes resolving on the next block or boot.
+Outpoints: `outpoints` HASH `{txid}:{vout}` → owning tracked txid (inputs of pending +
+maturing txs; see Outpoint tracking).
 Outbox (durable): `outbox` ZSET member=eventId score=nextAttemptAt-ms (the delivery queue);
 `outbox:{eventId}` HASH {payload(JSON WeirEvent), event, idempotencyKey, attempts, createdAt,
 lastError}; `outbox:created` ZSET member=eventId score=createdAt-ms (mirrors `outbox`
@@ -71,7 +73,8 @@ fenced.
 
 `seen | confirmed | dropped | demoted | conflicted | expired | heartbeat`.
 TxEvent payload: `{version:1, event, network, txid, confs, matched:[{address,vout,valueSats}],
-idempotencyKey, timestamp, blockHeight, blockHash, hex}`.
+idempotencyKey, timestamp, blockHeight, blockHash, hex}` plus, per Outpoint tracking rule 6,
+`reason`/`replacedBy` on `dropped` and `reason`/`conflictingTxid` on proven `conflicted`.
 `expired` is address-scoped: `{version:1, event:'expired', network, address, idempotencyKey, timestamp}`.
 `heartbeat`: `{version:1, event:'heartbeat', network, tipHeight, watchCount, memoryUsedPct,
 outboxDepth, outboxOldestAgeSec, deadLetterCount, idempotencyKey, timestamp}`.
@@ -146,6 +149,56 @@ hash was gone), `outboxStats(): Promise<{depth: number; oldestCreatedAt: number 
 (`oldestCreatedAt` = the lowest score in `outbox:created`, `ZRANGE 0 0 WITHSCORES` — exact
 and O(1)). Transition methods that enqueue are listed under src/store/redis.ts.
 
+## Outpoint tracking (replacement + proven conflicts)
+
+Why: weir discards the inputs of the transactions it tracks, so an RBF replacement is only
+noticed as `dropped` at the NEXT block (up to ~10 min), and `conflicted` is inferred from
+mempool absence rather than proven. Inputs are literal bytes in every tx weir already
+decodes — no txindex, no prevout resolution: weir only checks them against its OWN memory.
+
+Rules:
+1. `DecodedTx` carries `inputs: Outpoint[]` (`{txid, vout}`, prev-txid display-order hex);
+   the coinbase input (txid all zeros, vout 0xffffffff) is omitted. `MaturingRecord` carries
+   the same `inputs` so terminal cleanup can remove them.
+2. `weir:{net}:outpoints` HASH field=`{txid}:{vout}` → owning tracked txid. Written by
+   `recordSeen` (pending) and `promoteToMaturing` (never-seen mined txs); removed by every
+   transition that deletes the record (`dropPending`, `replacePending`, `conflict`,
+   `finishMaturing`, `endTracking`) — in the same Lua/MULTI. `demoteToPending` keeps them.
+   `clearTracking` wipes the hash.
+3. REPLACEMENT (mempool path, src/engine/txPipeline.ts): before matching outputs, the
+   evaluator looks up the tx's inputs (`outpointOwners(inputs)` — one HMGET, chunked at 1000).
+   Every distinct owner ≠ this txid that is currently PENDING is replaced NOW:
+   `replacePending(ownerTxid, event)` — one MULTI: SREM pending, SREM evaluated (the
+   original may legitimately return if the replacement is itself dropped), DEL record,
+   HDEL its outpoints, + enqueue `dropped` with `reason: 'replaced'`, `replacedBy: <this txid>`,
+   idempotency key `{net}:{owner}:dropped:replaced:{replacedBy}`. An owner that is MATURING
+   (mined) is never touched by a mempool tx — bitcoind would not have relayed a conflict with
+   a confirmed tx; log at warn and continue. Then the replacement is evaluated as usual (it
+   may pay a watched address → its own `seen`).
+4. BLOCK PATH (src/engine/blockPipeline.ts, step 2): collect every input of every block tx
+   (excluding coinbase), resolve owners with ONE chunked HMGET, then for each hit with
+   owner ≠ the spending txid:
+   - owner is PENDING → `replacePending(owner, ev)` with `replacedBy` = the confirmed
+     spender (a double-spend confirmed while ours sat in the mempool);
+   - owner is in LIMBO → PROVEN conflict: `conflict(owner, ev)` with
+     `conflictingTxid` = the spender, `reason: 'double-spend'`;
+   - owner is MATURING and not in limbo → impossible on a valid chain; log error, skip.
+   This runs before promotion so a limbo tx that is BOTH re-included and conflicted cannot
+   happen (a tx cannot be in a block whose other tx spends its inputs).
+5. `resolveLimbo` keeps its by-elimination fallback (`getmempoolentry` → demoted, else
+   conflicted) for txs the new chain neither re-included nor provably conflicted (e.g. an
+   input spent by a tx weir never decoded because it was below the ring floor).
+6. Payload additions (all OPTIONAL, additive — consumers ignoring them are unaffected):
+   `dropped` gains `reason: 'replaced' | 'evicted'` (`evicted` is the residual verdict of the
+   tip-block dropped check) and `replacedBy?: string`; `conflicted` gains
+   `reason?: 'double-spend'` and `conflictingTxid?: string` when proven.
+
+Store surface: `outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string>>`
+(outpoint key → owner txid, hits only), `replacePending(txid, event)`; `recordSeen`,
+`promoteToMaturing`, `dropPending`, `conflict`, `finishMaturing`, `endTracking` maintain the
+hash as in rule 2. Idempotency: `idem.replaced(net, txid, replacedBy)`; `conflicted` keeps
+its single key (one terminal verdict per txid).
+
 ## Module map and contracts
 
 All engine modules take a `deps` object (structural typing) so tests can pass in-memory fakes.
@@ -196,7 +249,8 @@ Pure, no I/O. Port the decode approach from
 `/Users/nate/Developer/blockhooksV2/packages/zmqapp/src/lib/decodeRawTransaction/index.ts`
 (same repo owner) with fixes:
 - `decodeRawTx(raw: Buffer | string, network: Network): DecodedTx` — txid via bitcoinjs
-  Transaction.getId(); EVERY output present in `outputs` with real `vout` index and `valueSats`;
+  Transaction.getId(); `inputs` = each `ins[i]` as `{txid: reversed-hex(hash), vout: index}`,
+  coinbase input omitted; EVERY output present in `outputs` with real `vout` index and `valueSats`;
   `address:null, scriptType:null` for unrecognized script types (never dropped from the array).
 - Script types: p2wpkh, p2wsh (bech32, witness v0 — use `bech32.toWords`/`bech32.encode`),
   p2tr (bech32m, witness v1), p2pkh, p2sh (base58check). FIX the upstream bug that mixed
