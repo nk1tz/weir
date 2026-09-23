@@ -15,8 +15,10 @@ const CTX = 'txPipeline'
 export function ancestorFeeRateSatVb(entry: MempoolEntry): number | undefined {
   const size = entry.ancestorsize
   const btc = entry.fees?.ancestor
-  if (typeof size !== 'number' || !(size > 0) || typeof btc !== 'number' || !Number.isFinite(btc)) return undefined
-  return Math.round((btc * 1e8 / size) * 10) / 10
+  if (typeof size !== 'number' || !Number.isFinite(size) || !(size > 0) || typeof btc !== 'number' || !Number.isFinite(btc)) return undefined
+  // integer sats first: 0.0000049 BTC * 1e8 is 489.99999… in floating point, and 490/200 = 2.45 must round to 2.5
+  const sats = Math.round(btc * 1e8)
+  return Math.round((sats * 10) / size) / 10
 }
 
 /** Structural deps — tests pass in-memory fakes (tests/fakes.ts). No sink: events are enqueued. */

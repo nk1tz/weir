@@ -73,6 +73,11 @@ describe('txPipeline', () => {
     const ev = store.outboxEvents()[0] as TxEvent
     expect(ev.event).toBe('seen')
     expect(ev.feeRateSatVb).toBe(10.4)
+    // rounding boundary: 490 sat / 200 vB = 2.45 → 2.5 (0.0000049 * 1e8 is 489.99999… in floating point)
+    const boundary = setup({ entry: { ancestorsize: 200, fees: { ancestor: 0.0000049 } } })
+    boundary.store.watches.add(ADDR)
+    await boundary.evaluate(mkTx('tx2'))
+    expect((boundary.store.outboxEvents()[0] as TxEvent).feeRateSatVb).toBe(2.5)
     expect(ev.idempotencyKey).toBe('regtest:tx1:seen')
   })
 
@@ -82,6 +87,7 @@ describe('txPipeline', () => {
       { ancestorsize: 226 } as MempoolEntry,
       { ancestorsize: 0, fees: { ancestor: 0.00002345 } },
       { ancestorsize: 226, fees: { ancestor: Number.NaN } },
+      { ancestorsize: Number.POSITIVE_INFINITY, fees: { ancestor: 0.00002345 } },
     ]) {
       const { store, evaluate } = setup({ entry })
       store.watches.add(ADDR)
