@@ -1,14 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { makeRawTxHandler, makeTxEvaluator } from '../src/engine/txPipeline'
+import { makeBlockProcessor } from '../src/engine/blockPipeline'
 import { makeMempoolReparser } from '../src/engine/mempool'
 import type { DecodedTx, TxEvent } from '../src/lib/types'
-import { ADDR, FakeStore, mkTx } from './fakes'
+import type { MempoolEntry } from '../src/bitcoin/rpc'
+import { ADDR, DEFAULT_MEMPOOL_ENTRY, FakeChain, FakeStore, mkTx } from './fakes'
 
-function setup(overrides: { seenEnabled?: boolean } = {}) {
+function setup(overrides: { seenEnabled?: boolean; entry?: MempoolEntry } = {}) {
   const store = new FakeStore()
   const cfg = { network: 'regtest' as const, seenEnabled: overrides.seenEnabled ?? true }
   /** the node: every tx these tests evaluate is in its mempool (a packet is a mempool sighting) */
-  const rpc = { getMempoolEntry: async () => ({}) }
+  const rpc = { getMempoolEntry: async () => overrides.entry ?? DEFAULT_MEMPOOL_ENTRY }
   const evaluate = makeTxEvaluator({ store, rpc, cfg })
   return { store, cfg, rpc, evaluate }
 }
@@ -49,6 +51,7 @@ describe('txPipeline', () => {
     expect(ev.idempotencyKey).toBe('regtest:tx1:seen')
     expect(ev.blockHeight).toBeNull()
     expect(ev.hex).toBe('hex-tx1')
+    expect(ev.feeRateSatVb).toBe(10) // DEFAULT_MEMPOOL_ENTRY: 1410 sat / 141 vB
     expect(ev.matched).toEqual([
       { address: ADDR, vout: 0, valueSats: 5000 },
       { address: ADDR, vout: 2, valueSats: 7000 },
@@ -58,6 +61,86 @@ describe('txPipeline', () => {
     expect(store.evaluated.has('tx1')).toBe(true)
     // seen-time record: height 0, blockHash '', so dropped/mined transitions have hex+matched
     expect(store.records.get('tx1')).toMatchObject({ height: 0, blockHash: '', fired: [], hex: 'hex-tx1' })
+  })
+
+  it('seen carries feeRateSatVb: the ancestor package rate from the probe entry, sat/vB rounded to one decimal; the idempotency key is unchanged', async () => {
+    // 0.00002345 BTC over 226 vB = 10.376… sat/vB → 10.4
+    const { store, evaluate } = setup({ entry: { ancestorsize: 226, fees: { ancestor: 0.00002345 } } })
+    store.watches.add(ADDR)
+
+    await evaluate(mkTx('tx1'))
+
+    const ev = store.outboxEvents()[0] as TxEvent
+    expect(ev.event).toBe('seen')
+    expect(ev.feeRateSatVb).toBe(10.4)
+    expect(ev.idempotencyKey).toBe('regtest:tx1:seen')
+  })
+
+  it('feeRateSatVb is OMITTED (not 0) when the node reports no usable fees or size', async () => {
+    for (const entry of [
+      {} as MempoolEntry,
+      { ancestorsize: 226 } as MempoolEntry,
+      { ancestorsize: 0, fees: { ancestor: 0.00002345 } },
+      { ancestorsize: 226, fees: { ancestor: Number.NaN } },
+    ]) {
+      const { store, evaluate } = setup({ entry })
+      store.watches.add(ADDR)
+
+      await evaluate(mkTx('tx1'))
+
+      const ev = store.outboxEvents()[0] as TxEvent
+      expect(ev.event).toBe('seen')
+      expect('feeRateSatVb' in ev).toBe(false)
+      expect(ev.idempotencyKey).toBe('regtest:tx1:seen')
+    }
+  })
+
+  it('dropped, confirmed, demoted and conflicted payloads never carry feeRateSatVb', async () => {
+    // the tx pipeline and the block pipeline over one FakeStore/FakeChain (as tests/lifecycle.test.ts)
+    const store = new FakeStore()
+    const chain = new FakeChain()
+    const cfg = { network: 'regtest' as const, seenEnabled: true, confirmMilestones: [1, 3], maxMilestone: 3, ringSize: 12 }
+    const evaluate = makeTxEvaluator({ store, rpc: chain.rpc(), cfg })
+    const process = makeBlockProcessor({ cfg, store, rpc: chain.rpc(), decodeBlock: chain.decode })
+    const byEvent = (name: TxEvent['event']) => store.outboxEvents().filter((e): e is TxEvent => e.event === name)
+    store.watches.add(ADDR)
+    chain.addBlock({ hash: 'b100', prevHash: '', height: 100, time: 1_700_000_100, txs: [] })
+    store.tip = { hash: 'b100', height: 100 }
+    store.ring.set('b100', 100)
+
+    // mempool path: A seen; B (same input) replaces it → dropped A + seen B, both with a fee-bearing probe entry
+    const fat = { ancestorsize: 226, fees: { ancestor: 0.00002345 } }
+    chain.mempool = ['A']
+    chain.setMempoolEntry('A', fat)
+    await evaluate(mkTx('A', ADDR, 5000, [{ txid: 'prev', vout: 0 }]))
+    const b = mkTx('B', ADDR, 5000, [{ txid: 'prev', vout: 0 }])
+    chain.mempool = ['B']
+    chain.setMempoolEntry('B', fat)
+    await evaluate(b)
+    expect(byEvent('seen').map((e) => e.feeRateSatVb)).toEqual([10.4, 10.4])
+    expect(byEvent('dropped').map((e) => e.txid)).toEqual(['A'])
+
+    // block path: b101a mines B → confirmed:1; b101b reorgs it out with B back in the mempool → demoted;
+    // b102 re-mines B → confirmed:1; b102x reorgs it out with B gone from the mempool → conflicted
+    chain.addBlock({ hash: 'b101a', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [b] })
+    chain.mempool = []
+    chain.mempoolEntries.clear()
+    await process(chain.raw('b101a'))
+    chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
+    chain.mempool = ['B']
+    await process(chain.raw('b101b'))
+    chain.addBlock({ hash: 'b102', prevHash: 'b101b', height: 102, time: 1_700_000_112, txs: [b] })
+    chain.mempool = []
+    await process(chain.raw('b102'))
+    chain.addBlock({ hash: 'b102x', prevHash: 'b101b', height: 102, time: 1_700_000_122, txs: [] })
+    await process(chain.raw('b102x'))
+
+    expect(byEvent('confirmed').map((e) => e.txid)).toEqual(['B', 'B'])
+    expect(byEvent('demoted').map((e) => e.txid)).toEqual(['B'])
+    expect(byEvent('conflicted').map((e) => e.txid)).toEqual(['B'])
+    for (const name of ['dropped', 'confirmed', 'demoted', 'conflicted'] as const) {
+      for (const e of byEvent(name)) expect('feeRateSatVb' in e).toBe(false)
+    }
   })
 
   it('a tx that is already tracked (mined record, no longer in `evaluated`) is a repeated sighting: nothing written, no seen', async () => {

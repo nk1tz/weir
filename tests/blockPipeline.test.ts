@@ -323,7 +323,7 @@ describe('blockPipeline', () => {
     store.records.set('tx1', { txid: 'tx1', height: 101, blockHash: 'b101a', matched: MATCHED, fired: [1], hex: 'hex-tx1' })
     // replacement block does NOT contain tx1; tx1 went back to the node's mempool
     chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
-    chain.mempoolEntries.set('tx1', { time: 1 })
+    chain.setMempoolEntry('tx1')
     chain.mempool = ['tx1']
 
     await process(chain.raw('b101b'))
@@ -661,7 +661,7 @@ describe('blockPipeline', () => {
     store.maturingIndex.set('tx1', 1)
     store.records.set('tx1', { txid: 'tx1', height: 1, blockHash: 'b1a', matched: MATCHED, fired: [1], hex: 'hex-tx1' })
     chain.addBlock({ hash: 'b1b', prevHash: 'genesis', height: 1, time: 1_700_000_011, txs: [] })
-    chain.mempoolEntries.set('tx1', { time: 1 })
+    chain.setMempoolEntry('tx1')
     chain.mempool = ['tx1']
 
     await process(chain.raw('b1b'))

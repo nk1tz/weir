@@ -1,11 +1,23 @@
 import type { DecodedTx, MaturingRecord, Network, TxEvent } from '../lib/types'
-import type { Rpc } from '../bitcoin/rpc'
+import type { MempoolEntry, Rpc } from '../bitcoin/rpc'
 import type { Drop, Store } from '../store/redis'
 import { idem } from '../store/keys'
 import { log } from '../lib/log'
 import { matchTx } from './matcher'
 
 const CTX = 'txPipeline'
+
+/**
+ * `seen.feeRateSatVb`: the ancestor package fee rate in sat/vB, one decimal, from the probe's
+ * mempool entry (`fees.ancestor` BTC / `ancestorsize` vbytes). undefined when the node did
+ * not report a usable size or fee — the field is then omitted, never 0.
+ */
+export function ancestorFeeRateSatVb(entry: MempoolEntry): number | undefined {
+  const size = entry.ancestorsize
+  const btc = entry.fees?.ancestor
+  if (typeof size !== 'number' || !(size > 0) || typeof btc !== 'number' || !Number.isFinite(btc)) return undefined
+  return Math.round((btc * 1e8 / size) * 10) / 10
+}
 
 /** Structural deps — tests pass in-memory fakes (tests/fakes.ts). No sink: events are enqueued. */
 export interface TxEvaluatorDeps {
@@ -94,12 +106,17 @@ export function makeTxEvaluator(deps: TxEvaluatorDeps): (tx: DecodedTx) => Promi
 
     const dropped = await replacedClaimants(tx)
     const matched = await matchTx(tx, store)
-    if ((dropped.length > 0 || matched.length > 0) && (await deps.rpc.getMempoolEntry(tx.txid)) === null) {
-      log.info(CTX, `${tx.txid} is not in the node's mempool now (replaced or mined since this packet) — nothing written`)
-      return
+    let entry: MempoolEntry | null = null
+    if (dropped.length > 0 || matched.length > 0) {
+      entry = await deps.rpc.getMempoolEntry(tx.txid)
+      if (entry === null) {
+        log.info(CTX, `${tx.txid} is not in the node's mempool now (replaced or mined since this packet) — nothing written`)
+        return
+      }
     }
     let seen: { rec: MaturingRecord; event: TxEvent | null } | null = null
     if (matched.length > 0) {
+      const feeRateSatVb = entry === null ? undefined : ancestorFeeRateSatVb(entry)
       const event: TxEvent | null = cfg.seenEnabled
         ? {
             version: 1,
@@ -113,6 +130,7 @@ export function makeTxEvaluator(deps: TxEvaluatorDeps): (tx: DecodedTx) => Promi
             blockHeight: null,
             blockHash: null,
             hex: tx.hex,
+            ...(feeRateSatVb === undefined ? {} : { feeRateSatVb }),
           }
         : null
       seen = { rec: { txid: tx.txid, height: 0, blockHash: '', matched, fired: [], hex: tx.hex, inputs: tx.inputs }, event }

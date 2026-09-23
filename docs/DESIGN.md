@@ -135,7 +135,10 @@ block scratch sets — set arithmetic happens in memory inside the queue item.
 `seen | confirmed | dropped | demoted | conflicted | expired | heartbeat`.
 TxEvent payload: `{version:1, event, network, txid, confs, matched:[{address,vout,valueSats}],
 idempotencyKey, timestamp, blockHeight, blockHash, hex}` plus, per Outpoint tracking rule 6,
-`reason`/`replacedBy` on `dropped` and `reason`/`conflictingTxid` on proven `conflicted`.
+`reason`/`replacedBy` on `dropped` and `reason`/`conflictingTxid` on proven `conflicted`, and
+`feeRateSatVb` on `seen` only: the ancestor package fee rate in sat/vB (one decimal), read from
+the `getmempoolentry` node probe the evaluation already makes before writing (txPipeline);
+omitted when the node reports no usable size or fee.
 `expired` is address-scoped: `{version:1, event:'expired', network, address, idempotencyKey, timestamp}`.
 It fires when the watch's lifetime ends, paid or not.
 `heartbeat`: `{version:1, event:'heartbeat', network, tipHeight, nodeHeight, chainLag, watchCount,
@@ -614,8 +617,9 @@ record must never be put back to height 0. Replacement check: `outpointOwners(in
 every distinct claimant ≠ this txid → its record (gone → skip; mined → warn, skip; unmined →
 a `dropped`/`replaced` for this evaluation's `dropped` list). Match. If there is anything to
 drop or a match: the NODE PROBE (Single writer) — `getMempoolEntry(txid)` null → log, return
-with NOTHING written (not even evaluated). Build the `seen` TxEvent (confs 0, block fields
-null, timestamp now) when matched and seenEnabled. Then `applyEvaluation({txid, dropped,
+with NOTHING written (not even evaluated); the entry it returns supplies `seen.feeRateSatVb`
+(`fees.ancestor` BTC / `ancestorsize` vB, one decimal). Build the `seen` TxEvent (confs 0, block
+fields null, timestamp now, feeRateSatVb) when matched and seenEnabled. Then `applyEvaluation({txid, dropped,
 seen})` — one MULTI; nothing awaited from the network. A non-matching, non-replacing tx never
 probes: it is just marked evaluated.
 

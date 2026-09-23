@@ -345,7 +345,7 @@ describe('outpoint tracking', () => {
       const d = mkTx('D', 'bcrt1qsomeoneelse', 5000, [O(1)])
       chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [d] })
       const probe = vi.spyOn(rpc, 'getMempoolEntry')
-      chain.mempoolEntries.set('A', { time: 1 }) // even if the node claimed A were in its mempool, the proof wins
+      chain.setMempoolEntry('A') // even if the node claimed A were in its mempool, the proof wins
 
       await process(chain.raw('b101b'))
 
@@ -506,7 +506,7 @@ describe('outpoint tracking', () => {
       chain.mempool = []
       await process(chain.raw('b101a'))
       chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
-      chain.mempoolEntries.set('A', { time: 1 })
+      chain.setMempoolEntry('A')
       chain.mempool = ['A']
       await process(chain.raw('b101b'))
       expect(enqueued(store)).toEqual(['seen', 'confirmed', 'demoted'])

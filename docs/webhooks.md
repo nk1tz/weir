@@ -106,6 +106,7 @@ second `seen`; forget the key when you process the `dropped`, or treat `seen` as
 | `reason` | string | only on `dropped` (`replaced` \| `evicted`) and proven `conflicted` (`double-spend`) |
 | `replacedBy` | string | only on `dropped` with `reason: 'replaced'` |
 | `conflictingTxid` | string | only on `conflicted` with `reason: 'double-spend'` |
+| `feeRateSatVb` | number | `seen` only: ancestor package fee rate in sat/vB, the figure miners score on |
 
 One tx paying two watched addresses yields one event with two `matched` entries.
 
@@ -114,7 +115,10 @@ One tx paying two watched addresses yields one event with two `matched` entries.
 A tx paying a watched address entered the mempool. Requires milestone `0` in
 `CONFIRMATION_MILESTONES`. Best-effort: a tx can be mined without weir ever seeing it
 unconfirmed (daemon restart, ZMQ gap, direct-to-block). Handler action: show "payment
-detected", start waiting for confirmations.
+detected", start waiting for confirmations. `feeRateSatVb` is the ancestor package fee rate
+(`getmempoolentry`) at detection: an RBF bump yields a new tx and a new `seen` with the new
+rate, but a later CPFP child (including one the recipient broadcasts) raises the package rate
+without a new event.
 
 ```json
 {
@@ -130,7 +134,8 @@ detected", start waiting for confirmations.
   "blockHash": null,
   "hex": "02000000000101…",
   "idempotencyKey": "mainnet:d4a3f0c9b8e2715a6f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a:seen",
-  "timestamp": 1758585600123
+  "timestamp": 1758585600123,
+  "feeRateSatVb": 12.3
 }
 ```
 

@@ -1,5 +1,6 @@
 import type { DecodedBlock, DecodedTx, ExpiredEvent, MaturingRecord, Outpoint, Tip, TxEvent, WeirEvent } from '../src/lib/types'
 import type { SendResult } from '../src/delivery/webhook'
+import type { MempoolEntry } from '../src/bitcoin/rpc'
 import { outpointField } from '../src/store/keys'
 import { type BlockWrites, type Claimant, type Drop, type EvaluationWrites, makeEventId, type OutboxRecord } from '../src/store/redis'
 import { metrics } from '../src/lib/metrics'
@@ -499,6 +500,9 @@ export interface FakeBlock {
   txs: DecodedTx[]
 }
 
+/** a plausible 1-in-2-out p2wpkh entry: 141 vB paying 1410 sat → 10.0 sat/vB (`seen.feeRateSatVb`) */
+export const DEFAULT_MEMPOOL_ENTRY: MempoolEntry = { ancestorsize: 141, fees: { ancestor: 0.0000141 } }
+
 /**
  * Settable fake of bitcoind's chain view for block-pipeline tests: blocks by hash, the
  * CURRENT main chain by height (what getblockhash and getbestblockhash answer), the live
@@ -512,9 +516,12 @@ export class FakeChain {
   mainChain = new Map<number, string>()
   /** what getbestblockhash answers; null = the highest main-chain block */
   best: string | null = null
-  /** the live mempool: getrawmempool, and getmempoolentry for anything listed here (or in `mempoolEntries`) */
+  /**
+   * the live mempool: getrawmempool, and getmempoolentry for anything listed here (answered
+   * with `DEFAULT_MEMPOOL_ENTRY`) or in `mempoolEntries` (a custom entry, see `setMempoolEntry`)
+   */
   mempool: string[] = []
-  mempoolEntries = new Map<string, object>()
+  mempoolEntries = new Map<string, MempoolEntry>()
   rawTxs = new Map<string, { blockhash?: string; hex: string }>()
   getBlockHashCalls: number[] = []
   pruned = false
@@ -524,6 +531,16 @@ export class FakeChain {
   /** set to make getblockcount reject (bitcoind unreachable) */
   blockCountError: Error | null = null
   getBlockCountCalls = 0
+
+  /**
+   * Make getmempoolentry answer for `txid` (whether or not it is in `mempool`) with the
+   * default entry, or with a custom one — e.g. `{ ancestorsize: 226, fees: { ancestor: 0.00002345 } }`,
+   * or `{}` cast for a node that reports no fees.
+   */
+  setMempoolEntry(txid: string, entry: MempoolEntry = DEFAULT_MEMPOOL_ENTRY): MempoolEntry {
+    this.mempoolEntries.set(txid, entry)
+    return entry
+  }
 
   addBlock(b: FakeBlock, opts: { main?: boolean } = {}): FakeBlock {
     this.blocks.set(b.hash, b)
@@ -575,7 +592,8 @@ export class FakeChain {
       },
       getBlockRaw: async (hash: string) => this.raw(hash),
       getRawMempool: async () => [...this.mempool],
-      getMempoolEntry: async (txid: string) => this.mempoolEntries.get(txid) ?? (this.mempool.includes(txid) ? {} : null),
+      getMempoolEntry: async (txid: string) =>
+        this.mempoolEntries.get(txid) ?? (this.mempool.includes(txid) ? DEFAULT_MEMPOOL_ENTRY : null),
       getRawTransactionVerbose: async (txid: string) => this.rawTxs.get(txid) ?? null,
       getBlockchainInfo: async () => ({
         chain: 'regtest',

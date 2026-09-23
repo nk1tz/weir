@@ -63,6 +63,7 @@ function summarize(event) {
       const addrs = (event.matched || []).map((m) => m.address).join(',')
       let line = `${event.event} txid=${event.txid} confs=${event.confs} sats=${sats} addr=${addrs}`
       // optional verdict fields (dropped: reason/replacedBy; conflicted: reason/conflictingTxid)
+      if (event.event === 'seen' && typeof event.feeRateSatVb === 'number') line += ` feeRate=${event.feeRateSatVb}sat/vB`
       if (event.reason) line += ` reason=${event.reason}`
       if (event.replacedBy) line += ` replacedBy=${event.replacedBy}`
       if (event.conflictingTxid) line += ` conflictingTxid=${event.conflictingTxid}`

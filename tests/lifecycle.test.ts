@@ -87,7 +87,7 @@ describe('lifecycle', () => {
 
     // 3. b101a is reorged out by b101b (tx1 not re-included); the node returns tx1 to its mempool → demoted
     chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
-    chain.mempoolEntries.set('tx1', { time: 1 })
+    chain.setMempoolEntry('tx1')
     chain.mempool = ['tx1']
     await process(chain.raw('b101b'))
     expect(enqueued(store)).toEqual(['seen', 'confirmed', 'demoted'])
@@ -149,7 +149,7 @@ describe('lifecycle', () => {
       // reorg while the endpoint is still down: demoted joins the queue; the pass retries the
       // confirmed once more (attempt 2) and pushes it BEHIND demoted (next-attempt order)
       chain.addBlock({ hash: 'b101b', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
-      chain.mempoolEntries.set('tx1', { time: 1 })
+      chain.setMempoolEntry('tx1')
       chain.mempool = ['tx1']
       vi.setSystemTime(Date.now() + 2000)
       await process(chain.raw('b101b'))

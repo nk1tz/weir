@@ -45,6 +45,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/** the subset of bitcoind's getmempoolentry result weir uses */
+export interface MempoolEntry {
+  /** vbytes of the tx and its unconfirmed ancestors */
+  ancestorsize: number
+  fees: {
+    /** BTC paid by the tx and its unconfirmed ancestors */
+    ancestor: number
+  }
+}
+
 export class Rpc {
   /** URL with credentials stripped — the actual fetch target. */
   private readonly endpoint: string
@@ -204,10 +214,14 @@ export class Rpc {
     }
   }
 
-  /** null when the tx is not in the mempool (RPC error code -5). */
-  async getMempoolEntry(txid: string): Promise<object | null> {
+  /**
+   * The mempool entry (null when the tx is not in the mempool: RPC error -5). Typed to what
+   * weir reads: the ancestor package size (vbytes) and its total fee (BTC), for `seen`'s
+   * `feeRateSatVb`.
+   */
+  async getMempoolEntry(txid: string): Promise<MempoolEntry | null> {
     try {
-      return (await this.call('getmempoolentry', [txid])) as object
+      return (await this.call('getmempoolentry', [txid])) as MempoolEntry
     } catch (err) {
       if (err instanceof RpcError && err.code === -5) return null
       throw err

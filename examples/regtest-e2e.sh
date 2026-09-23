@@ -20,7 +20,8 @@
 #  10. restart mid-reorg   confirmed:1 → stop weir → invalidateblock (no replacement mined) → start weir →
 #                         boot rewinds to the node's chain: demoted (old hash) → empty block, then mine →
 #                         confirmed:1 under the new hash → confirmed:3
-# Global: no [error] lines from weir after boot, every idempotencyKey delivered exactly once.
+# Global: no [error] lines from weir after boot, every idempotencyKey delivered exactly once,
+#         every seen carries feeRate=<n>sat/vB with n > 0.
 #
 # Requires: docker compose v2 (stack from the repo root, profile 'regtest'), node ≥ 20 on the
 # host (runs examples/catch.js), .env with WEBHOOK_URL=http://host.docker.internal:9090/webhook,
@@ -219,9 +220,14 @@ DUP="$(grep -h '"idempotencyKey"' "$CATCH_LOG" | sort | uniq -d)"
 grep -q '\[catch\] BAD SIGNATURE' "$CATCH_LOG" && fail "catcher rejected a signature"
 ERR_NOW="$(weir_errors)"
 if [ "$ERR_NOW" != "$ERR_BASE" ]; then docker compose logs --no-log-prefix weir 2>&1 | grep '\[error\]' | tail -n "$((ERR_NOW - ERR_BASE))" >&2; fail "weir logged $((ERR_NOW - ERR_BASE)) error line(s) after boot"; fi
+# every seen carries the ancestor package fee rate (regtest wallet txs pay real fees, so it is > 0)
+SEEN_NO_RATE="$(grep -E '\[catch\] seen ' "$CATCH_LOG" | grep -Ev ' feeRate=[0-9]+(\.[0-9]+)?sat/vB' || true)"
+[ -z "$SEEN_NO_RATE" ] || fail "seen line(s) without a numeric feeRate:"$'\n'"$SEEN_NO_RATE"
+SEEN_ZERO_RATE="$(grep -E '\[catch\] seen .* feeRate=0(\.0+)?sat/vB' "$CATCH_LOG" || true)"
+[ -z "$SEEN_ZERO_RATE" ] || fail "seen line(s) with feeRate=0:"$'\n'"$SEEN_ZERO_RATE"
 TOTALS="seen=$(count_events 'seen ') confirmed=$(count_events 'confirmed ') dropped=$(count_events 'dropped ') demoted=$(count_events 'demoted ') conflicted=$(count_events 'conflicted ') expired=$(count_events 'expired ')"
 [ "$TOTALS" = "seen=9 confirmed=15 dropped=2 demoted=2 conflicted=1 expired=1" ] || fail "event totals differ from the ten scenarios' exact expectation: $TOTALS"
-ok "every idempotencyKey delivered exactly once, all signatures verified, no weir [error] lines after boot, exact event totals"
+ok "every idempotencyKey delivered exactly once, all signatures verified, no weir [error] lines after boot, every seen carries feeRate > 0, exact event totals"
 
 step "ALL SCENARIOS PASSED"
 printf '   events: %s\n' "$TOTALS"

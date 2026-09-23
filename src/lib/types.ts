@@ -58,7 +58,10 @@ interface EventBase {
   timestamp: number
 }
 
-/** seen | confirmed | dropped | demoted | conflicted */
+/**
+ * seen | confirmed | dropped | demoted | conflicted — one shape; `feeRateSatVb` is `seen`
+ * only, the verdict fields (`reason`, `replacedBy`, `conflictingTxid`) are per event.
+ */
 export interface TxEvent extends EventBase {
   event: Exclude<EventType, 'expired' | 'heartbeat'>
   txid: string
@@ -68,6 +71,11 @@ export interface TxEvent extends EventBase {
   blockHeight: number | null
   blockHash: string | null
   hex: string
+  /**
+   * `seen` only: ancestor package fee rate in sat/vB (one decimal) from getmempoolentry at
+   * detection time; absent only if the node did not report fees
+   */
+  feeRateSatVb?: number
   /**
    * `dropped`: `replaced` (an input was spent by another tx weir saw — mempool or block) or
    * `evicted` (the residual verdict of the tip-block dropped check). `conflicted`:
