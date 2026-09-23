@@ -37,7 +37,7 @@ tracking window = reorg shield), `WATCH_DEFAULT_TTL` (0 = forever), `HEARTBEAT_I
 (0 = off), `ADMIN_TOKEN` (unset = no HTTP server *exists*), `ADMIN_PORT` (8787),
 `WEBHOOK_TIMEOUT_MS` (10000), `OUTBOX_MAX_AGE` (seconds an undelivered event is retried
 before it is dead-lettered; default 259200 = 3 days), `OUTBOX_DEAD_MAX` (dead-letter cap,
-default 1000). There is no `WEBHOOK_MAX_RETRIES`: retry is the outbox's job, bounded by age.
+default 1000), `READY_MAX_LAG` (chain-lag bound for /ready, default 2). There is no `WEBHOOK_MAX_RETRIES`: retry is the outbox's job, bounded by age.
 
 ## Redis schema (src/store/keys.ts — WRITTEN)
 
@@ -266,6 +266,57 @@ releases each collected record's own claims and DELs records + tracking keys, th
 and claims; one landing before it leaves no orphan claim) and `sweepOrphanRecords`
 (per-record conditional Lua that also releases the record's own claims). Idempotency: `idem.replaced(net, txid,
 replacedBy)`; `conflicted` keeps its single key (one terminal verdict per txid).
+
+## Health from chain lag (`/live`, `/ready`, `/metrics`)
+
+Why: `/health` returned 200 while ZMQ was disconnected or weir was blocks behind the node,
+and `secondsSinceLastBlock` was null after every restart and unreliable anyway (block
+intervals are Poisson — a 20-minute gap is normal). The signal that matters is CHAIN LAG:
+`nodeHeight − tipHeight`. Bitcoin knows about blocks weir has not processed, or it does not.
+
+Endpoints (all on the admin port, all UNAUTHENTICATED — they are for the platform's probes;
+they expose counts, never addresses or txids):
+- `GET /live` → 200 `{ok:true}` while the process is up and not shutting down; 503 during
+  shutdown. Never depends on redis, rpc, or the webhook: restarting weir because a
+  dependency is down fixes nothing.
+- `GET /ready` → 200/503 `{ok, redis, rpc, reconciled, tipHeight, nodeHeight, chainLag,
+  watchCount, outboxDepth, outboxOldestAgeSec, deadLetterCount, lastZmqTxAgeSec,
+  lastZmqBlockAgeSec}`. `ok` = redis ok AND rpc ok AND reconciled (boot finished reconcile +
+  resolveLimbo) AND chainLag ≤ `READY_MAX_LAG`. Webhook/outbox state NEVER fails readiness:
+  the daemon is healthy when the consumer is down. `nodeHeight` is one `getblockcount` per
+  probe; `chainLag` is null when either height is unknown.
+- `GET /health` → alias of `/ready` (kept for compatibility; `secondsSinceLastBlock` removed).
+- `GET /metrics` → Prometheus text exposition (text/plain; version=0.0.4), weir-native signals
+  only — host metrics are the platform's job:
+  gauges `weir_up 1`, `weir_tip_height`, `weir_node_height`, `weir_chain_lag`,
+  `weir_watch_count`, `weir_outbox_depth`, `weir_outbox_oldest_age_seconds`,
+  `weir_dead_letter_count`, `weir_redis_memory_used_bytes`, `weir_redis_memory_max_bytes`
+  (absent when unlimited), `weir_last_zmq_tx_timestamp_seconds`,
+  `weir_last_zmq_block_timestamp_seconds`, `weir_reconciled`;
+  counters `weir_events_enqueued_total{event="seen|confirmed|dropped|demoted|conflicted|expired"}`,
+  `weir_webhook_deliveries_total{result="ok|fail"}`, `weir_events_dead_lettered_total`,
+  `weir_blocks_processed_total`, `weir_reorgs_total`.
+  Hand-rolled formatter (no dependency); one `# TYPE` line per family.
+
+src/lib/metrics.ts: an in-process registry — `counters.inc(name, labels?)`,
+`gauges.set(name, value, labels?)`, `render(): string`. Process-local (counters reset on
+restart; that is what `_total` means). Incremented by: Store.enqueue (events_enqueued_total
+by event), the outbox drainer (deliveries_total, dead_lettered_total), the block pipeline
+(blocks_processed_total, reorgs_total), zmq.ts (last-message timestamps on every rawtx /
+rawblock). Gauges that need I/O (heights, watch count, outbox, memory) are computed at
+scrape time by the admin handler, not pushed.
+
+Heartbeat gains `nodeHeight` and `chainLag` (one getblockcount per tick) so a consumer can
+apply the stuck-pipeline rule without an independent chain source.
+
+Config: `READY_MAX_LAG` (default 2 — lag 1 is normal for a moment after every block; 2 means
+weir is genuinely behind). Docs (README "Monitoring"): alert on no heartbeat for 2× the
+interval; `chainLag > READY_MAX_LAG` persisting > 3 min; `weir_outbox_oldest_age_seconds >
+300`; any `weir_events_dead_lettered_total` increase; redis memory > 80% of max.
+
+src/index.ts: a `Runtime` object `{reconciled, shuttingDown, lastZmqTxAt, lastZmqBlockAt}`
+replaces the `lastBlockAt` closure; reconciled is set after resolveLimbo; shuttingDown is
+set first thing in shutdown() so `/live` flips before anything closes.
 
 ## Module map and contracts
 

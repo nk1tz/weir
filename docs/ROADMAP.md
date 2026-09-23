@@ -20,8 +20,9 @@ under-tested, with real bugs in that gap. Order of work:
    nothing awaits the network inside a transition (kills the `seen`/block race). One
    drainer, persisted backoff, capped dead-letter after OUTBOX_MAX_AGE. Heartbeat bypasses
    the outbox and reports it.
-5. **Outpoint tracking** — IN PROGRESS (branch v0.2/outpoints; spec: DESIGN.md "Outpoint
-   tracking"). Then **chain-lag `/live` `/ready` `/metrics`**.
+5. **Outpoint tracking** — DONE 2026-09-22 (claimant-SET model; 6 review rounds).
+   **Chain-lag health `/live` `/ready` `/metrics`** — IN PROGRESS (branch v0.2/health; spec:
+   DESIGN.md "Health from chain lag").
 6. **Full regtest E2E** — reorg via `invalidateblock`, restart mid-flight, webhook down
    during a reorg. This is the v0.2 gate.
 
