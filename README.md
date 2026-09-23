@@ -272,22 +272,6 @@ scrape_configs:
       - targets: ['weir:8787']
 ```
 
-## Alternatives
-
-| | weir | BlockCypher | electrs | Cyphernode |
-|---|---|---|---|---|
-| model | self-hosted daemon | hosted API | self-hosted index | self-hosted suite |
-| node requirements | pruned is fine | none (theirs) | unpruned + ~100GB index | full node stack |
-| push webhooks | yes, HMAC-signed | yes | no — Electrum protocol subscriptions over a socket | yes |
-| address history | no | yes | yes | some |
-| who sees your addresses | you | them | you | you |
-| moving parts | 1 daemon + redis | 0 (their uptime, their rate limits, their pricing) | electrs + clients | many containers |
-
-Use BlockCypher if you don't run a node and don't mind a third party learning your
-addresses. Use electrs if you need history or arbitrary-address queries and can afford a
-full index. Use Cyphernode if you want a whole self-hosted bitcoin backend. Use weir if
-you run a (pruned) node and just want to know when watched addresses get paid.
-
 ## Development
 
 ```sh
