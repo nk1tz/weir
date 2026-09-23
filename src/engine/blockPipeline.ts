@@ -25,7 +25,8 @@
  *   confirmations ≠ -1), checked twice: at the top of processOne, before any of its work
  *   (so a historical packet cannot even trigger a rewind), and immediately before its
  *   MULTI, after every read and all write preparation (a reorg during the reads or the
- *   catch-up walk means nothing is written) — for a ZMQ packet and for every walked block.
+ *   catch-up walk discards B's applyBlock writes; connectivity commits made before it
+ *   stand, each validated by its own probe) — for a ZMQ packet and for every walked block.
  * - TIP-ONLY WORK compares against the node's LIVE state (mempool, wall clock), which is
  *   wrong for a block that is not the node's current tip: a catch-up block (a pending tx
  *   mined in a LATER missed block would be falsely evicted) or a queued burst during a
@@ -367,9 +368,10 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
     // ── the block's ONE MULTI ────────────────────────────────────────────────────────
     // The final active-chain probe sits HERE, after every read and all write preparation and
     // immediately before the exec: a reorg that landed during the reads (or the catch-up walk
-    // before them) means this block's transitions describe a chain the node left — nothing
-    // is written. (The same check at the top of processOne keeps a historical packet from
-    // triggering a rewind at all.)
+    // before them) means this block's transitions describe a chain the node left — B's
+    // applyBlock writes are discarded. Preceding connectivity commits (a rewind, a tracking
+    // reset, walked blocks) stand: each was validated by its own probe. (The check at the
+    // top of processOne keeps a historical packet from triggering a rewind at all.)
     if ((await rpc.getBlockHeader(block.hash)).confirmations === -1) {
       log.warn(CTX, `${block.hash}@${height} left the node's active chain before it was applied — nothing applied`)
       return
@@ -411,7 +413,7 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
       }
       if (block.prevHash !== tip.hash) {
         // Gap or reorg — findForkPoint distinguishes them (a pure gap yields no disconnected).
-        const { ancestorHeight, disconnected } = await findForkPoint(deps, block.prevHash, height)
+        const { ancestorHeight, ancestorHash, disconnected } = await findForkPoint(deps, block.prevHash, height)
         if (disconnected.length > 0) {
           metrics.counters.inc('weir_reorgs_total')
           log.warn(
@@ -420,7 +422,7 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
               `${disconnected.length} block(s) disconnected`,
           )
           // Limbo + rewind (one MULTI): after this, the replacement chain is a plain connected walk.
-          await enterLimboAndRewind(deps, ancestorHeight)
+          await enterLimboAndRewind(deps, { height: ancestorHeight, hash: ancestorHash })
         } else {
           log.info(CTX, `gap: tip ${tip.hash}@${tip.height}, incoming @${height} — catching up ${ancestorHeight + 1}..${height - 1}`)
         }

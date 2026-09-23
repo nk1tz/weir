@@ -479,6 +479,7 @@ Methods: `getBlockCount(): Promise<number>`, `getBestBlockHash(): Promise<string
 `getBlockHash(height): Promise<string>`,
 `getBlockHeader(hash): Promise<{height: number; previousblockhash?: string; time: number; confirmations: number}>`
 (`confirmations` −1 = not on the active chain — the block pipeline's active-chain check),
+`getBlockHeaderIfKnown(hash)` (the same, or null on "not found" — boot's ring rebuild),
 `getBlockRaw(hash): Promise<Buffer>` (verbosity 0),
 `getRawMempool(): Promise<string[]>`,
 `getRawTransactionVerbose(txid): Promise<{blockhash?: string; hex: string} | null>` (null on "not found"),
@@ -547,7 +548,9 @@ mutation is ONE MULTI. Keys via `keysFor`. Types exported: `Claimant` (= `Pick<M
   (dangling entries); tipOps; ZREMRANGEBYRANK blocks (keep `ringKeep`). A tx promoted and
   finished in the same block nets out to gone with its `confirmed` events enqueued;
   `rewind(ancestor: Tip, displaced: string[])` — SADD limbo + ZREM maturing for the
-  displaced (records kept), ZREMRANGEBYSCORE blocks `(ancestor.height +inf`, tipOps;
+  displaced (records kept), ZREMRANGEBYSCORE blocks `(ancestor.height +inf`, tipOps (the
+  ancestor's verified hash lands at its height);
+  `rebuildRing(entries)` — DEL blocks + ZADD every entry (boot's ring normalisation);
   `dropPending(drop)` — dropOps (the tip-only eviction verdict, `reason: 'evicted'`);
   `demoteToPending(rec, event)` — HSET record back to height 0 / blockHash '' / fired [],
   SADD pending, SADD evaluated (the tx is in the mempool and evaluated: the reparse must not
@@ -628,17 +631,19 @@ that interval as the retry safety net (Outpoint tracking rule 7).
 
 ### src/engine/reorg.ts
 `export async function findForkPoint(deps, incomingPrevHash: string, incomingHeight: number):
-Promise<{ancestorHeight: number; disconnected: Array<{height: number; hash: string}>}>`
-— walk back from incomingPrevHash via getBlockHeader until a header's hash matches
-`ringHashAt(height)`; entries in the ring above the ancestor are the disconnected blocks.
+Promise<{ancestorHeight: number; ancestorHash: string; disconnected: Array<{height: number; hash: string}>}>`
+— walk back from incomingPrevHash via getBlockHeader until a header's hash matches the ring
+entry at its height (one hash per height); the matched height AND hash are returned, and the
+entries in the ring above the ancestor are the disconnected blocks.
 If the walk exits the ring (deeper than tracked), log loudly and treat ancestor = lowest ring
 entry (documented bound).
 Displaced-tx resolution is the LIMBO MODEL — on a pruned/no-txindex node there is no way to
 ask "which block is txid X in now?" at reorg time (getrawtransaction without a blockhash only
 answers for mempool txs), so weir never adjudicates at detection time:
-`export async function enterLimboAndRewind(deps, ancestorHeight): Promise<void>` — reads the
-maturing entries with inclusion height > ancestor and the ancestor's ring hash, then
-`store.rewind(ancestor, displaced)`: ONE MULTI (SADD limbo + ZREM maturing, records kept;
+`export async function enterLimboAndRewind(deps, ancestor: {height, hash}): Promise<void>` —
+takes the fork point findForkPoint VERIFIED (never re-selected from the ring by height),
+reads the maturing entries with inclusion height > ancestor, then `store.rewind(ancestor,
+displaced)`: ONE MULTI (SADD limbo + ZREM maturing, records kept;
 ring truncated above the ancestor; tip = ancestor). The replacement chain now processes as
 a plain connected walk: no second fork search, one hash per height in the ring.
 Re-inclusion is discovered NATURALLY by the block pipeline's promotion step: a limbo txid
@@ -669,8 +674,9 @@ Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
    node's active chain now (a historical packet) → warn, return, nothing applied — not even
    a rewind. The SAME probe runs a second time in step 4, after every read and all write
    preparation and immediately before `applyBlock`: a reorg that landed during the reads
-   (or the catch-up walk before them) means nothing is written. Both run for every block,
-   walked ones too.
+   (or the catch-up walk before them) means B's applyBlock writes are discarded; the
+   connectivity commits made before it (a rewind, a tracking reset, walked blocks) stand —
+   each was validated by its own probe. Both run for every block, walked ones too.
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
    If H is the tip, or the ring holds exactly H at h → duplicate, skip (a replay after a
    crash that happened AFTER the block's exec, or an old notification). A DIFFERENT hash at
@@ -706,8 +712,8 @@ Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
    timestamp = blockTime*1000 of B)}` — fired is recorded at ENQUEUE time; delivery retry is
    the outbox's job. When confs ≥ maxMilestone AND all milestones are fired → `finished`
    (tracking ends).
-4. the final active-chain probe (`getblockheader` confirmations −1 → nothing written, see
-   step 0), then `applyBlock({promoted, fired, finished, dropped, conflicted, ended,
+4. the final active-chain probe (`getblockheader` confirmations −1 → B's writes discarded,
+   see step 0), then `applyBlock({promoted, fired, finished, dropped, conflicted, ended,
    unindexed, tip: {H, h}, ringKeep: ringSize})` — the block's ONE MULTI, tip and ring
    included. Crash before exec =
    nothing happened; boot reconciliation replays B. `weir_blocks_processed_total` after it.
@@ -761,7 +767,16 @@ one-line log; throw Error (fatal) unless noted:
 best as of a validated snapshot). UNBOUNDED: it never resolves before that — `/ready` stays
 503 (`reconciled` is set only after it resolves) and every round logs the stored tip and the
 node's best with heights, so a node that never converges is visible instead of silently
-leaving an unprocessed block behind ZMQ's subscription. reconcileOnce: tip = getTip(). If null: initialize tip/ring to the
+leaving an unprocessed block behind ZMQ's subscription.
+FIRST, before any block work, `normalizeRing`: the ring invariant (one hash per height) is
+made true rather than tolerated. Data written before the invariant (v0.1; otherwise fully
+readable — records, sets, outbox, watches are unchanged) may hold two hashes at one height,
+which lets the fork search and the rewind disagree about the ancestor. If any height has more
+than one hash: warn, walk `getblockheader` from the stored tip down `ringSize` heights and
+`rebuildRing(entries)` (DEL + ZADDs, one MULTI). A stored tip the node does not know at all →
+the prune-window reset (`resetTracking` to the node's best, logged loudly), then the ring
+rebuilt from the best's ancestry the same way.
+Then reconcileOnce: tip = getTip(). If null: initialize tip/ring to the
 current best block (getBestBlockHash + header; `setTip`, one MULTI) — forward-only, no
 backfill. If best === tip.hash → nothing. Else, if the best block's height ≤ tip.height, the
 stored tip cannot be on the node's active chain (a reorg while weir was down that the node

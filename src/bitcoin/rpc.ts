@@ -174,6 +174,16 @@ export class Rpc {
     }
   }
 
+  /** getblockheader, or null when the node does not know the hash (RPC error code -5) — boot's ring rebuild. */
+  async getBlockHeaderIfKnown(hash: string): Promise<{ height: number; previousblockhash?: string; time: number; confirmations: number } | null> {
+    try {
+      return await this.getBlockHeader(hash)
+    } catch (err) {
+      if (err instanceof RpcError && err.code === -5) return null
+      throw err
+    }
+  }
+
   /** getblock verbosity 0 — raw serialized block. */
   async getBlockRaw(hash: string): Promise<Buffer> {
     const hex = (await this.call('getblock', [hash, 0])) as string

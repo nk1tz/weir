@@ -144,21 +144,69 @@ describe('reconcile', () => {
     expect(store.limbo.size).toBe(0)
   })
 
-  it('a ring written before the one-per-height invariant (two hashes at the tip height) still converges on boot', async () => {
-    const { store, chain, run } = setup()
+  it("REGRESSION (legacy ring): a ring written before the one-per-height invariant — b99, {a100, z100}, o101 — is rebuilt from the stored tip's ancestry at boot, so the fork search and the rewind agree; a tx mined in z100 is `demoted` when the node later reorgs to a100→a101→a102, never `confirmed:3:z100`", async () => {
+    const { store, chain, processBlock, run } = setup()
     chain.mainChain.clear()
     chain.addBlock({ hash: 'b99', prevHash: '', height: 99, time: 1_700_000_099, txs: [] })
-    chain.addBlock({ hash: 'a100', prevHash: 'b99', height: 100, time: 1_700_000_100, txs: [] })
-    chain.addBlock({ hash: 'z100', prevHash: 'b99', height: 100, time: 1_700_000_110, txs: [] }, { main: false })
-    store.tip = { hash: 'z100', height: 100 }
+    const t = mkTx('T')
+    chain.addBlock({ hash: 'a100', prevHash: 'b99', height: 100, time: 1_700_000_100, txs: [] }, { main: false })
+    chain.addBlock({ hash: 'z100', prevHash: 'b99', height: 100, time: 1_700_000_110, txs: [t] })
+    chain.addBlock({ hash: 'o101', prevHash: 'z100', height: 101, time: 1_700_000_111, txs: [] }, { main: false })
+    chain.addBlock({ hash: 'y101', prevHash: 'z100', height: 101, time: 1_700_000_121, txs: [] }) // the node's best: o101 was replaced
+    // weir's stored state from before the invariant: tip o101, BOTH a100 and z100 at 100, T maturing in z100
+    store.tip = { hash: 'o101', height: 101 }
     store.ring.set('b99', 99)
-    store.ring.set('a100', 100) // stale entry from the pre-invariant ring
+    store.ring.set('a100', 100)
     store.ring.set('z100', 100)
+    store.ring.set('o101', 101)
+    store.maturingIndex.set('T', 100)
+    store.records.set('T', { txid: 'T', height: 100, blockHash: 'z100', matched: MATCHED, fired: [1], hex: 'hex-T', inputs: [] })
+    chain.mempool = []
 
     await run()
 
-    expect(store.tip).toEqual({ hash: 'a100', height: 100 })
-    expect(await store.ringAll()).toEqual([{ height: 99, hash: 'b99' }, { height: 100, hash: 'a100' }])
+    // rebuilt from o101's ancestry (a100 gone), then o101 → y101 reorg: z100 kept as the fork point, T untouched
+    expect(await store.ringAll()).toEqual([{ height: 99, hash: 'b99' }, { height: 100, hash: 'z100' }, { height: 101, hash: 'y101' }])
+    expect(store.tip).toEqual({ hash: 'y101', height: 101 })
+    expect(store.maturingIndex.get('T')).toBe(100)
+    expect(events(store)).toEqual([])
+
+    // the node reorgs to a100 → a101 → a102: z100 is orphaned, T returns to the mempool
+    chain.mainChain.set(100, 'a100')
+    chain.addBlock({ hash: 'a101', prevHash: 'a100', height: 101, time: 1_700_000_131, txs: [] })
+    chain.addBlock({ hash: 'a102', prevHash: 'a101', height: 102, time: 1_700_000_132, txs: [] })
+    chain.mempool = ['T']
+    await processBlock(chain.raw('a102'))
+
+    expect(events(store)).toEqual(['demoted:T'])
+    expect(store.outboxEvents()[0]).toMatchObject({ blockHash: 'z100', idempotencyKey: 'regtest:T:demoted:z100' })
+    expect(store.outboxEvents().map((e) => e.idempotencyKey)).not.toContain('regtest:T:confirmed:3:z100')
+    expect(store.pending.has('T')).toBe(true)
+    expect(store.limbo.size).toBe(0)
+    expect(await store.ringAll()).toEqual([
+      { height: 99, hash: 'b99' },
+      { height: 100, hash: 'a100' },
+      { height: 101, hash: 'a101' },
+      { height: 102, hash: 'a102' },
+    ])
+  })
+
+  it('a stored tip the node does not know at all (legacy ring) falls back to the prune-window reset: tracking wiped, tip/ring jumped to the node\'s best', async () => {
+    const { store, chain, processBlock, run } = setup()
+    store.tip = { hash: 'ghost101', height: 101 } // no such block anywhere
+    store.ring.set('b100', 100)
+    store.ring.set('x101', 101)
+    store.ring.set('ghost101', 101)
+    store.pending.add('P')
+    store.records.set('P', { txid: 'P', height: 0, blockHash: '', matched: MATCHED, fired: [], hex: 'hex-P', inputs: [] })
+
+    await run()
+
+    expect(store.tip).toEqual({ hash: 'b102', height: 102 })
+    expect(await store.ringAll()).toEqual([{ height: 100, hash: 'b100' }, { height: 101, hash: 'b101' }, { height: 102, hash: 'b102' }]) // the best's ancestry, one per height
+    expect(store.pending.size).toBe(0)
+    expect(store.records.size).toBe(0)
+    expect(processBlock).not.toHaveBeenCalled()
   })
 
   it('REGRESSION (reconcile round cap): a node that keeps advancing is followed past 20 rounds — reconcile resolves only when the stored tip IS the best and settle succeeded', async () => {

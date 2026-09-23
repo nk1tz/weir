@@ -371,6 +371,13 @@ export class Store {
     await multi.exec()
   }
 
+  /** Boot's ring normalisation: DEL blocks + ZADD every entry, one MULTI (the entries come from the tip's header ancestry). */
+  async rebuildRing(entries: Array<{ height: number; hash: string }>): Promise<void> {
+    const multi = this.client.multi().del(this.keys.blocks)
+    if (entries.length > 0) multi.zAdd(this.keys.blocks, entries.map((e) => ({ score: e.height, value: e.hash })))
+    await multi.exec()
+  }
+
   async ringHashAt(height: number): Promise<string | null> {
     const hashes = await this.client.zRangeByScore(this.keys.blocks, height, height)
     return hashes[0] ?? null

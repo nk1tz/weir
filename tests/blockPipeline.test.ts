@@ -646,7 +646,7 @@ describe('blockPipeline', () => {
 
     const result = await findForkPoint(deps, 'genesis', 1)
 
-    expect(result).toEqual({ ancestorHeight: 0, disconnected: [] })
+    expect(result).toEqual({ ancestorHeight: 0, ancestorHash: 'genesis', disconnected: [] })
     expect(console.error).not.toHaveBeenCalled()
   })
 

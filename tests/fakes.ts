@@ -196,6 +196,11 @@ export class FakeStore {
       .sort((a, b) => a.height - b.height || (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0))
   }
 
+  /** DEL blocks + ZADD every entry */
+  async rebuildRing(entries: Array<{ height: number; hash: string }>): Promise<void> {
+    this.ring = new Map(entries.map((e) => [e.hash, e.height]))
+  }
+
   /** ZRANGEBYSCORE h h → first member (lexicographic tie order), null when none */
   async ringHashAt(height: number): Promise<string | null> {
     return this.ringSorted().find((e) => e.height === height)?.hash ?? null
@@ -549,6 +554,12 @@ export class FakeChain {
         return this.topHeight()
       },
       getBestBlockHash: async () => this.best ?? this.mainChain.get(this.topHeight()) ?? '',
+      getBlockHeaderIfKnown: async (hash: string) => {
+        const b = this.blocks.get(hash)
+        if (!b) return null
+        const confirmations = this.mainChain.get(b.height) === hash ? this.topHeight() - b.height + 1 : -1
+        return { height: b.height, previousblockhash: b.prevHash || undefined, time: b.time, confirmations }
+      },
       getBlockHeader: async (hash: string) => {
         const b = this.blocks.get(hash)
         if (!b) throw new Error(`getblockheader: unknown block ${hash}`)

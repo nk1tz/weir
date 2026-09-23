@@ -34,7 +34,7 @@ export type ReorgStore = Pick<
 export type ReorgRpc = Pick<Rpc, 'getBlockHeader'>
 
 export interface ForkPointDeps {
-  store: Pick<ReorgStore, 'ringAll' | 'ringHashAt'>
+  store: Pick<ReorgStore, 'ringAll'>
   rpc: Pick<ReorgRpc, 'getBlockHeader'>
 }
 
@@ -55,13 +55,13 @@ export async function findForkPoint(
   deps: ForkPointDeps,
   incomingPrevHash: string,
   incomingHeight: number,
-): Promise<{ ancestorHeight: number; disconnected: Array<{ height: number; hash: string }> }> {
+): Promise<{ ancestorHeight: number; ancestorHash: string; disconnected: Array<{ height: number; hash: string }> }> {
   // Snapshot the whole ring once (ascending): per-height hashes plus the walk's lower bound.
   // ringAll, not a range above 0: a fresh regtest ring holds genesis at height 0.
   const ring = await deps.store.ringAll()
   if (ring.length === 0) {
     log.error(CTX, 'ring is empty during fork-point search — cannot detect reorg, treating incoming block as connected')
-    return { ancestorHeight: incomingHeight - 1, disconnected: [] }
+    return { ancestorHeight: incomingHeight - 1, ancestorHash: incomingPrevHash, disconnected: [] }
   }
   const byHeight = new Map<number, string>(ring.map((e) => [e.height, e.hash]))
   const minHeight = ring[0]!.height
@@ -70,7 +70,7 @@ export async function findForkPoint(
   let height = incomingHeight - 1
   while (height >= minHeight) {
     if (byHeight.get(height) === hash) {
-      return { ancestorHeight: height, disconnected: ring.filter((e) => e.height > height) }
+      return { ancestorHeight: height, ancestorHash: hash, disconnected: ring.filter((e) => e.height > height) }
     }
     const header = await deps.rpc.getBlockHeader(hash)
     if (!header.previousblockhash) break // genesis — nothing further back
@@ -83,27 +83,24 @@ export async function findForkPoint(
     `reorg deeper than the tracked ring (ring floor height=${minHeight}) — treating lowest ring entry as ancestor; ` +
       'events for blocks below the ring are NOT replayed (documented bound)',
   )
-  return { ancestorHeight: minHeight, disconnected: ring.filter((e) => e.height > minHeight) }
+  return { ancestorHeight: minHeight, ancestorHash: ring[0]!.hash, disconnected: ring.filter((e) => e.height > minHeight) }
 }
 
 /**
  * Step 1 of the limbo model, ONE MULTI: every maturing tx included above the ancestor moves
  * to the persisted limbo SET (record kept), the ring is truncated above the ancestor and the
- * tip rewinds to it. After this the replacement chain connects like an ordinary gap walk.
+ * tip rewinds to it. `ancestor` is the fork point findForkPoint VERIFIED (height AND hash) —
+ * never re-selected from the ring by height. After this the replacement chain connects like
+ * an ordinary gap walk.
  */
 export async function enterLimboAndRewind(
-  deps: { store: Pick<ReorgStore, 'maturingEntries' | 'ringHashAt' | 'rewind'> },
-  ancestorHeight: number,
+  deps: { store: Pick<ReorgStore, 'maturingEntries' | 'rewind'> },
+  ancestor: { height: number; hash: string },
 ): Promise<void> {
-  const displaced = (await deps.store.maturingEntries()).filter((e) => e.height > ancestorHeight).map((e) => e.txid)
-  const ancestorHash = await deps.store.ringHashAt(ancestorHeight)
-  if (ancestorHash === null) {
-    // findForkPoint only returns heights that exist in the ring, so this is corruption.
-    throw new Error(`[${CTX}] ring has no entry at ancestor height ${ancestorHeight} — cannot rewind`)
-  }
-  await deps.store.rewind({ hash: ancestorHash, height: ancestorHeight }, displaced)
+  const displaced = (await deps.store.maturingEntries()).filter((e) => e.height > ancestor.height).map((e) => e.txid)
+  await deps.store.rewind(ancestor, displaced)
   if (displaced.length > 0) log.warn(CTX, `${displaced.length} maturing tx(s) displaced by reorg → limbo: ${displaced.join(', ')}`)
-  log.info(CTX, `rewound tip to fork point ${ancestorHash}@${ancestorHeight}`)
+  log.info(CTX, `rewound tip to fork point ${ancestor.hash}@${ancestor.height}`)
 }
 
 /**
