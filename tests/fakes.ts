@@ -548,7 +548,9 @@ export class FakeChain {
       getBlockHeader: async (hash: string) => {
         const b = this.blocks.get(hash)
         if (!b) throw new Error(`getblockheader: unknown block ${hash}`)
-        return { height: b.height, previousblockhash: b.prevHash || undefined, time: b.time }
+        // Core: confirmations = depth on the active chain, -1 when the block is not on it
+        const confirmations = this.mainChain.get(b.height) === hash ? this.topHeight() - b.height + 1 : -1
+        return { height: b.height, previousblockhash: b.prevHash || undefined, time: b.time, confirmations }
       },
       getBlockHash: async (height: number) => {
         this.getBlockHashCalls.push(height)

@@ -198,14 +198,20 @@ describe('lifecycle', () => {
       w.store.ring.set('b100', 100)
       const tx1 = w.register(mkTx('tx1'))
       w.chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
-      w.chain.mempool = []
       return { ...w, tx1, engine: makeEngineQueue(vi.fn()) }
     }
 
     it('rawtx first, then the block: one seen + one confirmed, record at the block height', async () => {
-      const { store, chain, evaluate, process, tx1, engine } = race()
+      const { store, chain, evaluateRaw, process, tx1, engine } = race()
+      chain.mempool = ['tx1'] // the packet arrives while tx1 is in the mempool; the block then mines it
 
-      await Promise.all([engine.run(() => evaluate(tx1)), engine.run(() => process(chain.raw('b101')))])
+      await Promise.all([
+        engine.run(() => evaluateRaw(tx1)),
+        engine.run(async () => {
+          chain.mempool = []
+          await process(chain.raw('b101'))
+        }),
+      ])
 
       expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] })
       expect(store.maturingIndex.get('tx1')).toBe(101)
@@ -214,10 +220,14 @@ describe('lifecycle', () => {
     })
 
     it('the block first, then a late rawtx for the same tx (a block re-publish): confirmed only — the tracked record is never put back to height 0', async () => {
-      const { store, chain, evaluate, process, tx1, engine } = race()
+      const { store, chain, rpc, evaluateRaw, process, tx1, engine } = race()
+      chain.mempool = [] // tx1 is MINED: genuinely absent from the node's mempool
+      const probe = vi.spyOn(rpc, 'getMempoolEntry')
 
-      await Promise.all([engine.run(() => process(chain.raw('b101'))), engine.run(() => evaluate(tx1))])
+      await Promise.all([engine.run(() => process(chain.raw('b101'))), engine.run(() => evaluateRaw(tx1))])
 
+      expect(probe).not.toHaveBeenCalled() // already tracked: the sighting is dismissed before any probe
+      expect(store.evaluated.has('tx1')).toBe(false) // nothing written by the late packet
       expect(store.records.get('tx1')).toMatchObject({ height: 101, blockHash: 'b101', fired: [1] })
       expect(store.maturingIndex.get('tx1')).toBe(101)
       expect(store.pending.has('tx1')).toBe(false)

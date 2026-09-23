@@ -111,7 +111,8 @@ async function main(): Promise<void> {
   const engine = makeEngineQueue()
   const { processBlock, settleTip } = makeBlockPipeline({ cfg, store, rpc, decodeBlock })
   // reconcile ends with the same settle step a tip block runs, so leftover limbo (a crash
-  // between rewind and resolution) is adjudicated from a validated mempool snapshot.
+  // between rewind and resolution) is adjudicated from a validated mempool snapshot. It
+  // resolves only once the stored tip IS the node's best: `reconciled` is never set before.
   await engine.run(() => reconcile({ cfg, store, rpc, processBlock, settleTip }))
   runtime.reconciled = true
 

@@ -95,6 +95,38 @@ describe('reconcile', () => {
     ])
   })
 
+  it('REGRESSION (reconcile round cap): a node that keeps advancing is followed past 20 rounds — reconcile resolves only when the stored tip IS the best and settle succeeded', async () => {
+    const { store, chain, rpc, processBlock, settleTip, run } = setup()
+    store.tip = { hash: 'b100', height: 100 }
+    store.ring.set('b100', 100)
+    chain.mainChain.delete(101)
+    chain.mainChain.delete(102)
+    chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [] })
+    // every time weir fetches the best block, the node has mined the next one — 25 times
+    let mined = 0
+    const getBlockRaw = rpc.getBlockRaw
+    rpc.getBlockRaw = async (hash: string) => {
+      const raw = await getBlockRaw(hash)
+      if (mined < 25) {
+        mined++
+        const h = 101 + mined
+        chain.addBlock({ hash: `b${h}`, prevHash: `b${h - 1}`, height: h, time: 1_700_000_000 + h, txs: [] })
+      }
+      return raw
+    }
+
+    await run()
+
+    expect(mined).toBe(25)
+    expect(processBlock).toHaveBeenCalledTimes(26) // b101 … b126, one per round
+    expect(settleTip).toHaveBeenCalledTimes(26)
+    expect(settleTip.mock.results.map((r) => r.value)).toHaveLength(26)
+    await expect(settleTip.mock.results[25]!.value).resolves.toBe(true) // only the last round settled
+    for (const r of settleTip.mock.results.slice(0, 25)) await expect(r.value).resolves.toBe(false)
+    expect(store.tip).toEqual({ hash: 'b126', height: 126 })
+    expect(await rpc.getBestBlockHash()).toBe('b126')
+  })
+
   it("REGRESSION (restart onto an ancestor): the stored tip is no longer on the node's chain and the node has NOT built past it — reconcile rewinds to the fork point and settles limbo from the mempool snapshot", async () => {
     // Mine A in 101, invalidateblock 101, restart weir before a replacement is mined: node
     // best = 100 (in our ring), stored tip = 101. Handing b100 to the processor would hit its

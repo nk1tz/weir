@@ -21,6 +21,10 @@
  *   `replaced`, replacedBy = spender); a MATURING owner outside limbo is impossible on a
  *   valid chain → error log, skipped. Running before promotion means a limbo tx can never be
  *   both re-included and conflicted.
+ * - A block is applied only while it is on the node's ACTIVE chain (getblockheader
+ *   confirmations ≠ -1), checked before any of its work (so a historical packet cannot
+ *   even trigger a rewind) and again right before its MULTI (a catch-up walk may have
+ *   taken a while) — for a ZMQ packet and for every walked block alike.
  * - TIP-ONLY WORK compares against the node's LIVE state (mempool, wall clock), which is
  *   wrong for a block that is not the node's current tip: a catch-up block (a pending tx
  *   mined in a LATER missed block would be falsely evicted) or a queued burst during a
@@ -250,10 +254,18 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
   async function settleTip(): Promise<boolean> {
     const tip = await store.getTip()
     if (tip === null) return true
-    const mempool = new Set(await rpc.getRawMempool()) // snapshot BEFORE asking which block is best:
-    const best = await rpc.getBestBlockHash() // if best is still the tip, the snapshot belongs to it
-    if (best !== tip.hash) {
-      log.info(CTX, `${tip.hash}@${tip.height} is not the node's tip (best ${best}) — tip work deferred to the next block`)
+    // getbestblockhash BEFORE and AFTER the snapshot, both must be the stored tip: a snapshot
+    // taken while the node was on another block, or one the node moved off right after, is
+    // discarded — nothing is written, the next block or reconcile round settles.
+    const before = await rpc.getBestBlockHash()
+    if (before !== tip.hash) {
+      log.info(CTX, `${tip.hash}@${tip.height} is not the node's tip (best ${before}) — tip work deferred`)
+      return false
+    }
+    const mempool = new Set(await rpc.getRawMempool())
+    const after = await rpc.getBestBlockHash()
+    if (after !== tip.hash) {
+      log.info(CTX, `node moved to ${after} while snapshotting the mempool at ${tip.hash}@${tip.height} — snapshot discarded, tip work deferred`)
       return false
     }
     await tipWork(tip.hash, tip.height, mempool)
@@ -261,6 +273,12 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
   }
 
   async function processConnected(block: DecodedBlock, height: number, isTip: boolean): Promise<void> {
+    // Right before applying — a catch-up walk may have taken a while, and the node may have
+    // moved off this block meanwhile (see the same check at the top of processOne).
+    if ((await rpc.getBlockHeader(block.hash)).confirmations === -1) {
+      log.warn(CTX, `${block.hash}@${height} left the node's active chain before it was applied — nothing applied`)
+      return
+    }
     const net = cfg.network
     const blockTimeMs = block.time * 1000
     const writes: BlockWrites = {
@@ -365,6 +383,14 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
     const block = deps.decodeBlock(raw, cfg.network)
     const header = await rpc.getBlockHeader(block.hash)
     const height = header.height
+    // NODE STATE (DESIGN "Single writer"): a block is applied only while it is on the node's
+    // ACTIVE chain now. A queued rawblock packet for a block the node has since orphaned (or a
+    // walked block reorged away meanwhile) would replay history on top of a newer reconciled
+    // outcome (its input scan would "replace" the mempool tx that actually won).
+    if (header.confirmations === -1) {
+      log.warn(CTX, `${block.hash}@${height} is not on the node's active chain (a historical packet) — nothing applied`)
+      return
+    }
 
     // ── connectivity ─────────────────────────────────────────────────────────────────
     const tip = await store.getTip()

@@ -57,7 +57,13 @@ the rules of this codebase:
   write what asserts "this tx is in the mempool" (a `seen`, or a `dropped`/`replaced` of a
   claimant) asks `getmempoolentry` once first — absent → nothing is written, the packet is
   history (a gap-triggered reparse already reconciled the node's newer state, or the tx
-  was mined/replaced meanwhile) and the block path or a later packet covers it.
+  was mined/replaced meanwhile) and the block path or a later packet covers it; (d) a block
+  is applied only while it is on the node's ACTIVE chain — `getblockheader` right before
+  its work, `confirmations` −1 → nothing applied — for a ZMQ rawblock packet and for every
+  block of a catch-up walk alike (a queued packet for a block the node has since orphaned
+  would otherwise replay its input scan over the mempool tx that actually won). The
+  snapshot check in (a) is `getbestblockhash` BEFORE and AFTER `getrawmempool`, both equal
+  to the stored tip, else the snapshot is discarded and nothing is written.
 - Three components run OUTSIDE the queue and are not writers of engine state:
   - the heartbeat only READS (tip, watch count, memory, outbox stats) and sends directly;
   - the admin server READS engine state and probes, and writes ONLY the watch set
@@ -152,7 +158,7 @@ Transitions — every code path is one of these, and each is one MULTI:
 | from → to | trigger | event | written by |
 |---|---|---|---|
 | `unseen → pending` | mempool evaluation matches a watch | `seen` (when milestone 0) | `applyEvaluation` |
-| `unseen → unseen` | evaluation matches nothing; or a repeated sighting of a tracked txid; or a historical packet (the tx is no longer in the node's mempool) | — (marked evaluated / nothing) | `applyEvaluation` / no-op |
+| `unseen → unseen` | evaluation matches nothing; or a repeated sighting of a tracked txid; or a historical packet (the tx is no longer in the node's mempool); or any block packet not on the node's active chain | — (marked evaluated / nothing) | `applyEvaluation` / no-op |
 | `unseen → maturing(h)` | mined paying a watch without a mempool sighting (missed ZMQ, direct-to-block, dropped-then-mined, re-inclusion after `done` at exactly max-milestone depth) | — (milestones follow) | `applyBlock.promoted` |
 | `pending → maturing(h)` | mined | — | `applyBlock.promoted` |
 | `maturing(h) → maturing(h)` | block at depth ≥ a milestone m not yet fired | `confirmed` (confs m, key with blockHash) | `applyBlock.fired` |
@@ -275,8 +281,12 @@ Rules:
    path adjudicates it — rule 4): warn, skip. Then match outputs; the whole outcome — SADD
    evaluated, every drop (SREM pending, SREM evaluated, release, DEL record, enqueue), and
    when matched the seen record (HSET height 0, SADD pending, claims, enqueue `seen`) — is
-   `applyEvaluation`, one MULTI. Two spenders of one outpoint are evaluated one after the
-   other (the queue), so the second always finds the first as a claimant and replaces it.
+   `applyEvaluation`, one MULTI — but only after the node probe (src/engine/txPipeline.ts):
+   the tx must be in the node's mempool at write time, else nothing is written. Two spenders
+   of one outpoint are evaluated one after the other (the queue): the second finds the
+   first as a claimant and replaces it when the node still holds the second; a packet for a
+   spender the node has already dropped (a historical packet behind a gap reparse) writes
+   nothing, so the reconciled claimant stands.
 4. BLOCK PATH (src/engine/blockPipeline.ts, the input scan, before promotion): collect every
    input of every block tx (excluding coinbase), `outpointOwners` once, then for each owner
    ≠ its spender (the owner's record read for the payload; gone → skip):
@@ -455,7 +465,8 @@ network failure for retry purposes, so a call's total budget is bounded at attem
 timeout + backoff. A stalled node is a rejection, never a hang.
 Methods: `getBlockCount(): Promise<number>`, `getBestBlockHash(): Promise<string>`,
 `getBlockHash(height): Promise<string>`,
-`getBlockHeader(hash): Promise<{height: number; previousblockhash?: string; time: number}>`,
+`getBlockHeader(hash): Promise<{height: number; previousblockhash?: string; time: number; confirmations: number}>`
+(`confirmations` −1 = not on the active chain — the block pipeline's active-chain check),
 `getBlockRaw(hash): Promise<Buffer>` (verbosity 0),
 `getRawMempool(): Promise<string[]>`,
 `getRawTransactionVerbose(txid): Promise<{blockhash?: string; hex: string} | null>` (null on "not found"),
@@ -636,10 +647,15 @@ Because limbo is durable, a crash anywhere in the sequence re-resolves on the ne
 `export function makeBlockPipeline(deps): { processBlock(raw: Buffer): Promise<void>; settleTip(): Promise<boolean> }`
 (`makeBlockProcessor(deps)` = its `processBlock` alone, what the ZMQ path queues). Boot
 (reconcile) uses both, inside the queue's first item. `settleTip` is the tip-only work for
-the STORED tip: snapshot `getrawmempool`, then `getbestblockhash`; equal to the stored tip →
-steps a–d below from that snapshot, true; otherwise nothing written, false (the node moved
-on; a newer block settles); no tip yet → true.
+the STORED tip: `getbestblockhash` (must be the stored tip), snapshot `getrawmempool`,
+`getbestblockhash` again (must still be the stored tip) → steps a–d below from that snapshot,
+true; on either mismatch nothing is written and the snapshot is discarded, false (the node
+moved; a newer block or the next reconcile round settles); no tip yet → true.
 Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
+0. active chain: the same `getblockheader` answers `confirmations`; −1 → B is not on the
+   node's active chain now (a historical packet, or a walked block reorged away meanwhile)
+   → warn, return, nothing applied — not even a rewind. Re-checked right before step 2's
+   MULTI (a catch-up walk may have taken a while). Runs for every block, walked ones too.
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
    If H is the tip or already in the ring → duplicate, skip (a replay after a crash that
    happened AFTER the block's exec). If P === tip.hash → connected. Else: findForkPoint (a
@@ -679,10 +695,9 @@ Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
    when B is the node's CURRENT tip. The steps below consult node state (mempool, wall
    clock), which is wrong for a block that is not the node's tip: a catch-up block (a
    pending tx mined in a LATER missed block would be falsely evicted) or a queued burst
-   during a reorg. Snapshot `getRawMempool` FIRST, then `getBestBlockHash`; if it is not H →
-   log, return (the next tip block picks the work up). Snapshotting before the check means a
-   block that lands between the two calls invalidates the snapshot instead of poisoning it;
-   every step below decides from the snapshot, never a later probe. Each step is its own
+   during a reorg. `getBestBlockHash` before AND after `getRawMempool`, both must be H, else
+   log, return with the snapshot discarded (the next tip block picks the work up); every
+   step below decides from the snapshot, never a later probe. Each step is its own
    MULTI and safe to repeat:
    a. eviction check: every `pendingTxids()` member absent from the snapshot vanished
       without being mined (replacements were caught by the input scans, so this is the
@@ -723,8 +738,10 @@ one-line log; throw Error (fatal) unless noted:
 ### src/boot/reconcile.ts
 `export async function reconcile(deps: {cfg, store, rpc, processBlock, settleTip}): Promise<void>`
 — rounds of (reconcileOnce → settleTip) until settle succeeds (the stored tip IS the node's
-best as of a validated snapshot), capped at 20 rounds (then the next ZMQ block's gap walk
-takes over, warned). reconcileOnce: tip = getTip(). If null: initialize tip/ring to the
+best as of a validated snapshot). UNBOUNDED: it never resolves before that — `/ready` stays
+503 (`reconciled` is set only after it resolves) and every round logs the stored tip and the
+node's best with heights, so a node that never converges is visible instead of silently
+leaving an unprocessed block behind ZMQ's subscription. reconcileOnce: tip = getTip(). If null: initialize tip/ring to the
 current best block (getBestBlockHash + header; `setTip`, one MULTI) — forward-only, no
 backfill. If best === tip.hash → nothing. Else, if the best block's height ≤ tip.height, the
 stored tip cannot be on the node's active chain (a reorg while weir was down that the node

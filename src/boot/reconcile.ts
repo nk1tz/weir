@@ -14,8 +14,10 @@
  * - Then `settleTip`: the tip-only work (eviction, TTL, evaluated prune, limbo resolution)
  *   from a mempool snapshot validated against getbestblockhash. If the node moved on while
  *   we reconciled, settle refuses and the loop goes again — boot never resolves limbo from
- *   a view of the node that a block it has not processed could contradict. Bounded: after
- *   MAX_ROUNDS the next ZMQ block (a gap walk) takes over.
+ *   a view of the node that a block it has not processed could contradict. UNBOUNDED: it
+ *   returns only once settle succeeded (stored tip == the node's best, snapshot validated);
+ *   until then `/ready` stays 503 and each round logs both heights, so a node that never
+ *   converges is visible rather than silently left with an unprocessed block.
  *
  * Spec: docs/DESIGN.md "src/boot/reconcile.ts".
  */
@@ -27,9 +29,6 @@ import { log } from '../lib/log'
 import { metrics } from '../lib/metrics'
 
 const CTX = 'reconcile'
-
-/** rounds of reconcile + settle before giving the node up as still moving */
-const MAX_ROUNDS = 20
 
 export interface ReconcileDeps {
   cfg: { network: Network }
@@ -81,17 +80,17 @@ async function reconcileOnce(deps: ReconcileDeps): Promise<void> {
   await deps.processBlock(raw)
 }
 
+/** Resolves only once the stored tip is the node's best and the tip is settled — never before. */
 export async function reconcile(deps: ReconcileDeps): Promise<void> {
   for (let round = 1; ; round++) {
     await reconcileOnce(deps)
     if (await deps.settleTip()) {
-      log.info(CTX, 'reconcile complete')
+      log.info(CTX, `reconcile complete (${round} round${round === 1 ? '' : 's'})`)
       return
     }
-    if (round >= MAX_ROUNDS) {
-      log.warn(CTX, `node still advancing after ${round} reconcile rounds — the next block settles the tip`)
-      return
-    }
-    log.info(CTX, `node advanced during reconcile (round ${round}) — reconciling again`)
+    const tip = await deps.store.getTip()
+    const best = await deps.rpc.getBestBlockHash()
+    const bestHeight = (await deps.rpc.getBlockHeader(best)).height
+    log.info(CTX, `round ${round}: node advanced during reconcile — stored tip ${tip?.hash ?? 'none'}@${tip?.height ?? '-'}, node best ${best}@${bestHeight}; reconciling again`)
   }
 }

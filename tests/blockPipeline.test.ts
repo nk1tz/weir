@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { makeBlockProcessor, type BlockPipelineDeps } from '../src/engine/blockPipeline'
+import { makeBlockPipeline, makeBlockProcessor, type BlockPipelineDeps } from '../src/engine/blockPipeline'
 import { makeTxEvaluator } from '../src/engine/txPipeline'
 import { findForkPoint } from '../src/engine/reorg'
 import { metrics } from '../src/lib/metrics'
@@ -478,6 +478,92 @@ describe('blockPipeline', () => {
     expect(store.outboxEvents().map((e) => e.event)).toEqual(['confirmed', 'expired'])
     expect(store.maturingIndex.get('tx1')).toBe(102)
     expect(store.watches.has(addr)).toBe(false)
+  })
+
+  it('REGRESSION (historical rawblock packet): a queued block that is no longer on the node\'s active chain writes NOTHING — the reconciled newer outcome stands', async () => {
+    // A (spends prev1, pays the watch) was mined in a101, then orphaned: the node is on
+    // x101 → x102 and C (a conflicting spend of prev1) sits in its mempool. A gap reparse
+    // recorded C. The a101 packet, queued behind the reparse, must not replay history: its
+    // input scan would drop C "replacedBy A" and promote A on a chain the node left.
+    const { store, chain, process, cfg } = setup()
+    store.watches.add(ADDR)
+    seedTip(store, chain, 100, 'b100')
+    const prev = { txid: 'prev1', vout: 0 }
+    const a = mkTx('A', ADDR, 5000, [prev])
+    const c = mkTx('C', ADDR, 4900, [prev])
+    chain.addBlock({ hash: 'a101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [a] }, { main: false })
+    chain.addBlock({ hash: 'x101', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] })
+    chain.addBlock({ hash: 'x102', prevHash: 'x101', height: 102, time: 1_700_000_112, txs: [] })
+    chain.mempool = ['C']
+    const evaluate = makeTxEvaluator({ store, rpc: chain.rpc(), cfg: { network: cfg.network, seenEnabled: true } })
+    await evaluate(c) // the reparse's view of the node
+    expect(store.outboxEvents().map((e) => e.event)).toEqual(['seen'])
+
+    await process(chain.raw('a101')) // the historical packet
+
+    expect(store.outboxEvents().map((e) => e.event)).toEqual(['seen']) // no dropped:C, no confirmed:A
+    expect(store.pending.has('C')).toBe(true)
+    expect(store.records.has('A')).toBe(false)
+    expect(store.tip).toEqual({ hash: 'b100', height: 100 })
+    expect(store.outpoints.get('prev1:0')).toEqual(new Set(['C']))
+
+    // the same rule inside a catch-up walk: a walked block the node reorgs away mid-walk is skipped too
+    const getBlockRaw = chain.rpc().getBlockRaw
+    const rpc = chain.rpc()
+    rpc.getBlockRaw = async (hash: string) => {
+      const raw = await getBlockRaw(hash)
+      if (hash === 'x101') {
+        chain.addBlock({ hash: 'y101', prevHash: 'b100', height: 101, time: 1_700_000_121, txs: [] })
+        chain.mainChain.delete(102)
+      }
+      return raw
+    }
+    const walk = makeBlockProcessor({ cfg, store, rpc, decodeBlock: chain.decode })
+    await walk(chain.raw('x102')) // gap: walks x101 — reorged away as it is fetched — then x102 itself, now off-chain
+    expect(store.tip).toEqual({ hash: 'b100', height: 100 })
+    expect(store.outboxEvents().map((e) => e.event)).toEqual(['seen'])
+  })
+
+  it('REGRESSION (snapshot gate window): the tip is settled only when getbestblockhash is the stored tip BEFORE and AFTER the mempool snapshot — a snapshot taken around a move is discarded, a limbo tx is never conflicted from it', async () => {
+    const { store, chain, cfg } = setup()
+    store.watches.add(ADDR)
+    seedTip(store, chain, 100, 'b100')
+    chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [] })
+    store.tip = { hash: 'b101', height: 101 }
+    store.ring.set('b101', 101)
+    const a = mkTx('A')
+    store.limbo.add('A') // displaced by a reorg, back in the node's mempool
+    store.records.set('A', { txid: 'A', height: 100, blockHash: 'b100x', matched: MATCHED, fired: [1], hex: 'hex-A', inputs: [] })
+    chain.mempool = ['A']
+    const rpc = chain.rpc()
+    const { settleTip, processBlock } = makeBlockPipeline({ cfg, store, rpc, decodeBlock: chain.decode })
+
+    // (a) the node moved off the tip before settle looked: the first best read already disagrees
+    const getBest = rpc.getBestBlockHash
+    let calls = 0
+    rpc.getBestBlockHash = async () => (++calls === 1 ? 'b102x' : getBest())
+    const snapshots = vi.spyOn(rpc, 'getRawMempool')
+    expect(await settleTip()).toBe(false)
+    expect(snapshots).not.toHaveBeenCalled()
+    expect(store.limbo.has('A')).toBe(true)
+    expect(store.outboxEvents()).toHaveLength(0)
+
+    // (b) the node mines A in b102x WHILE the snapshot is taken: the after-read disagrees, the snapshot (A absent) is discarded
+    rpc.getBestBlockHash = getBest
+    rpc.getRawMempool = async () => {
+      chain.mempool = []
+      chain.addBlock({ hash: 'b102x', prevHash: 'b101', height: 102, time: 1_700_000_102, txs: [a] })
+      return []
+    }
+    expect(await settleTip()).toBe(false)
+    expect(store.limbo.has('A')).toBe(true)
+    expect(store.outboxEvents()).toHaveLength(0) // never `conflicted` from a snapshot that missed A
+
+    // the block that actually mined A then re-includes it
+    rpc.getRawMempool = async () => [...chain.mempool]
+    await processBlock(chain.raw('b102x'))
+    expect(store.outboxEvents().map((e) => e.idempotencyKey)).toEqual(['regtest:A:confirmed:1:b102x'])
+    expect(store.limbo.size).toBe(0)
   })
 
   it('a second reorg inside the ring finds the fork point and leaves a still-canonical tx alone', async () => {

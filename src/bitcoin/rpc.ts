@@ -164,11 +164,13 @@ export class Rpc {
     return (await this.call('getblockhash', [height])) as string
   }
 
-  async getBlockHeader(hash: string): Promise<{ height: number; previousblockhash?: string; time: number }> {
+  /** `confirmations` is -1 when the block is not on the node's active chain (Core semantics). */
+  async getBlockHeader(hash: string): Promise<{ height: number; previousblockhash?: string; time: number; confirmations: number }> {
     return (await this.call('getblockheader', [hash])) as {
       height: number
       previousblockhash?: string
       time: number
+      confirmations: number
     }
   }
 
