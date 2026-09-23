@@ -61,11 +61,7 @@ curl -X POST localhost:8787/watches -H 'authorization: Bearer <ADMIN_TOKEN>' \
 
 ## Receive events
 
-Events arrive as JSON POSTs with an `x-weir-signature` header:
-
-```
-x-weir-signature: t=<unix seconds>, v1=<hex hmac_sha256(secret, "<t>." + rawBody)>
-```
+Events arrive as JSON POSTs; every POST carries an `x-weir-signature` HMAC header.
 
 Delivery is at-least-once from a durable outbox, and retries reorder events. Dedupe on
 `idempotencyKey` in the same database transaction as the credit or reversal you perform,

@@ -86,5 +86,7 @@ Honest edges, beyond the [is-not list](../README.md#what-weir-is-not):
 - **Redis is the source of truth for watches.** Persistence is on (AOF) in the shipped
   compose file; if you run your own redis, losing it loses the watch set.
 - **Downtime is safe for the chain, not the mempool.** Boot reconciliation replays missed
-  blocks, so confirmations are never lost — but mempool-only activity during downtime
-  (a tx seen and dropped) is unobservable.
+  blocks, so confirmations survive downtime as long as the node still holds those blocks:
+  past a pruned node's prune window weir resets tracking, logs it, and skips the
+  unavailable history. Mempool-only activity during downtime (a tx seen and dropped) is
+  unobservable.

@@ -22,7 +22,7 @@ http.createServer((req, res) => {
   req.on('end', () => {
     const body = Buffer.concat(chunks).toString('utf8')
     const m = /^t=(\d+), v1=([0-9a-f]{64})$/.exec(req.headers['x-weir-signature'] ?? '')
-    const stale = !m || Math.abs(Date.now() / 1000 - Number(m[1])) > 300 // reject replays
+    const stale = !m || Math.abs(Math.floor(Date.now() / 1000) - Number(m[1])) > 300 // reject replays
     const expect = m && crypto.createHmac('sha256', SECRET).update(`${m[1]}.${body}`).digest('hex')
     if (stale || !crypto.timingSafeEqual(Buffer.from(m[2], 'hex'), Buffer.from(expect, 'hex'))) {
       res.writeHead(401).end()

@@ -31,8 +31,9 @@ redis-cli ZADD weir:mainnet:expiries 1767225600000 bc1qar0srrr7xfkvy5l643lydnw9r
 When the deadline passes, weir removes the address from both keys and emits an `expired`
 event (paid or not): the watch's lifetime ends, whatever happened to it. A tx already
 confirmed keeps firing its remaining milestones; one still unconfirmed stops being tracked
-once mined. The sweep runs when weir processes a tip block, so the event fires at the first
-block after the deadline. Payload: [webhooks.md](webhooks.md#expired).
+once mined. The sweep runs on every successful tip settlement (each processed block, and
+boot reconciliation), so the event fires at the next settlement after the deadline.
+Payload: [webhooks.md](webhooks.md#expired).
 
 To renew, `ZADD` a later score. To make a watch permanent, `ZREM` it from `expiries`.
 
@@ -43,18 +44,22 @@ redis-cli SREM weir:mainnet:addresses bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
 redis-cli ZREM weir:mainnet:expiries bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
 ```
 
-A tx already confirmed keeps firing its remaining milestones; one still unconfirmed stops
-being tracked once mined.
+A tx already confirmed keeps firing its remaining milestones. One still unconfirmed is
+re-matched when mined: if no output pays a remaining watch, tracking ends quietly; if
+another output does, it confirms with `matched` recomputed.
 
 ## Rules
 
 - Redis is the source of truth for watches. Lose redis, lose the watch set (the shipped
   compose file enables AOF persistence).
-- `maxmemory-policy` must be `noeviction`; weir refuses to start otherwise. Under memory
-  pressure writes fail loudly instead of watches vanishing.
-- The `SADD` path has no boot window: redis accepts the watch immediately and the next
-  block weir processes sees it. (The admin API's write routes wait for boot reconciliation
-  instead.)
+- `maxmemory-policy` must be `noeviction`. A detected eviction policy is fatal at boot;
+  when redis blocks `CONFIG` (managed redis) weir warns and continues, so the operator must
+  enforce it. Under memory pressure writes fail loudly instead of watches vanishing.
+- The `SADD` path has no boot gate: redis accepts the watch immediately and the next block
+  weir processes sees it. One exception: on first boot weir initialises its tip to the
+  node's best block without processing that block's txs, so a watch written before
+  first-boot initialisation is not guaranteed coverage of a payment mined in that block.
+  (The admin API's write routes wait for boot reconciliation instead.)
 - Every other `weir:{network}:*` key is the daemon's memory: read if curious, never write.
 
 ## The daemon's keys
@@ -70,11 +75,11 @@ list is [DESIGN.md](DESIGN.md) "Redis schema".
 | `maturing:{txid}` | HASH | the per-tx record (height, block hash, matched outputs, fired milestones, hex, inputs) |
 | `pending` | SET | txids seen in the mempool, awaiting first confirmation |
 | `limbo` | SET | txids whose block a reorg disconnected, awaiting re-resolution |
-| `evaluated` | SET | mempool txids already evaluated since the last tip block (reparse dedupe) |
+| `evaluated` | SET | mempool txids already evaluated (reparse dedupe); pruned at each tip block to the txids still in the mempool |
 | `outpoint:{txid}:{vout}` | SET | claimant txids per spent prevout (replacement and double-spend detection) |
-| `outbox` | ZSET | queued event ids scored by next attempt time: the delivery queue |
-| `outbox:{eventId}` | HASH | one queued event: payload, attempts, createdAt, lastError |
-| `outbox:created` | ZSET | queued event ids scored by enqueue time (the "oldest queued" index) |
-| `outbox:dead` | ZSET | dead-lettered event ids scored by give-up time, capped at `OUTBOX_DEAD_MAX` |
+| `outbox` | ZSET | queued event ids scored by next attempt time (unix ms): the delivery queue |
+| `outbox:{eventId}` | HASH | one event: `payload`, `event`, `idempotencyKey`, `attempts`, `createdAt`; `lastError` absent until a failure. Dead-lettered events keep the same hash |
+| `outbox:created` | ZSET | queued event ids scored by enqueue time (unix ms): the "oldest queued" index |
+| `outbox:dead` | ZSET | dead-lettered event ids scored by give-up time (unix ms), capped at `OUTBOX_DEAD_MAX` |
 
 All keys are prefixed `weir:{network}:`.

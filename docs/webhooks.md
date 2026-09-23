@@ -25,7 +25,7 @@ The lines that matter, from [examples/receiver.js](../examples/receiver.js):
 
 ```js
 const m = /^t=(\d+), v1=([0-9a-f]{64})$/.exec(req.headers['x-weir-signature'] ?? '')
-const stale = !m || Math.abs(Date.now() / 1000 - Number(m[1])) > 300 // reject replays
+const stale = !m || Math.abs(Math.floor(Date.now() / 1000) - Number(m[1])) > 300 // reject replays
 const expect = m && crypto.createHmac('sha256', SECRET).update(`${m[1]}.${body}`).digest('hex')
 if (stale || !crypto.timingSafeEqual(Buffer.from(m[2], 'hex'), Buffer.from(expect, 'hex'))) {
   res.writeHead(401).end()
@@ -81,7 +81,10 @@ crash between your 2xx and the outbox ack re-sends the event. Therefore:
 | `heartbeat` | `{network}:heartbeat:{timestampMs}` |
 
 A re-mined tx's second `confirmed:1` has a different key because it embeds the block hash.
-Dedupe on the key, not on `(txid, event)`.
+Dedupe on the key, not on `(txid, event)`. The one key that repeats: a tx that was
+`dropped` and then rebroadcast fires a second `seen` with the ORIGINAL
+`{network}:{txid}:seen` key. A consumer that dedupes on the key forever will discard that
+second `seen`; forget the key when you process the `dropped`, or treat `seen` as advisory.
 
 ## Transaction event payload
 
@@ -94,10 +97,10 @@ Dedupe on the key, not on `(txid, event)`.
 | `network` | string | `mainnet` \| `testnet` \| `signet` \| `regtest` |
 | `txid` | string | transaction id, display-order hex |
 | `confs` | number | `0` for `seen`/`dropped`/`demoted`; the milestone for `confirmed`; the last milestone fired for `conflicted` (`0` if none) |
-| `matched` | array | every output paying a watched address: `{address, vout, valueSats}` |
+| `matched` | `{address: string, vout: number, valueSats: number}[]` | every output paying a watched address; `[]` on an `evicted` drop whose stored record is missing |
 | `blockHeight` | number \| null | `null` while unconfirmed; for `demoted`/`conflicted`, the height of the block that was orphaned |
 | `blockHash` | string \| null | same rule as `blockHeight` |
-| `hex` | string | the raw transaction |
+| `hex` | string | the raw transaction; `""` on an `evicted` drop whose stored record is missing |
 | `idempotencyKey` | string | see above |
 | `timestamp` | number | unix ms; `confirmed` and proven `conflicted` use the block time, the others use wall-clock time |
 | `reason` | string | only on `dropped` (`replaced` \| `evicted`) and proven `conflicted` (`double-spend`) |
@@ -157,8 +160,10 @@ action: credit at whichever depth matches your risk tolerance.
 
 ## dropped
 
-A seen tx left the mempool without being mined. Handler action: roll back "payment
-detected"; a rebroadcast fires a fresh `seen`.
+A tracked unconfirmed tx left the mempool without being mined. It does not require a prior
+`seen`: with milestone `0` disabled weir still tracks pending txs and can emit `dropped`.
+Handler action: roll back "payment detected". With milestone `0` enabled, a rebroadcast
+fires a fresh `seen` (same key as the first, see above).
 
 | `reason` | when | extra field |
 |---|---|---|
@@ -241,8 +246,10 @@ by elimination). Handler action: reverse any credit, alert a human.
 
 A TTL'd watch reached the end of its lifetime, paid or not. weir removes the address from
 the watch set and stops matching new payments to it. A tx already confirmed keeps firing
-its remaining milestones; one still unconfirmed stops being tracked once mined. The sweep
-runs when weir processes a tip block, so the event fires at the first block after the
+its remaining milestones. One still unconfirmed is re-matched when mined: if no output
+pays a remaining watch, tracking ends quietly; if another output does, it confirms with
+`matched` recomputed. The sweep runs on every successful tip settlement (each processed
+block, and boot reconciliation), so the event fires at the next settlement after the
 deadline. Handler action: stop expecting new payments on that address.
 
 ```json
@@ -298,7 +305,7 @@ keeps growing.
 | `nodeHeight` | number \| null | the node's best height (one `getblockcount` per tick); `null` when the RPC failed |
 | `chainLag` | number \| null | `nodeHeight − tipHeight`; `null` when either is unknown |
 | `watchCount` | number | size of the watch set |
-| `memoryUsedPct` | number \| null | redis memory used, 0–100; `null` when redis has no `maxmemory` |
+| `memoryUsedPct` | number \| null | `round(used ÷ maxmemory × 100)`, not clamped (can exceed 100); `null` when redis has no positive `maxmemory` |
 | `outboxDepth` | number | events queued for delivery (still retrying) |
 | `outboxOldestAgeSec` | number \| null | age of the oldest queued event; `null` when the outbox is empty |
 | `deadLetterCount` | number | events given up on (capped at `OUTBOX_DEAD_MAX`) |

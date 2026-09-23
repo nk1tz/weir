@@ -3,13 +3,16 @@
 The HTTP admin API exists only when `ADMIN_TOKEN` is set; unset, the daemon listens on
 nothing at all. It serves on `ADMIN_PORT` (default `8787`). The four probes (`GET /live`,
 `/ready`, `/health`, `/metrics`) are unauthenticated and expose counts only, never addresses
-or txids. Every other request needs `authorization: Bearer <ADMIN_TOKEN>` (scheme
-case-insensitive, compared in constant time) and answers `401 {"error":"unauthorized"}`
-without it; an unknown path answers `404 {"error":"not found"}` after the token check, so a
-wrong path without a token is a 401. A path segment with malformed percent-encoding answers
-`400 {"error":"malformed percent-encoding in path: …"}`. Until boot reconciliation finishes,
-the write routes (`POST /watches`, `DELETE /watches/:address`) answer
-`503 {"error":"not ready: reconciling"}` with `retry-after: 1`; reads and probes never do.
+or txids. Every other request needs `authorization: Bearer <ADMIN_TOKEN>`: the header is
+trimmed, the scheme is case-insensitive and followed by one or more whitespace characters
+(`/^Bearer\s+(.+)$/i`), and the token is compared in constant time. Without it the answer
+is `401 {"error":"unauthorized"}`; an unknown path answers `404 {"error":"not found"}` after
+the token check, so a wrong path without a token is a 401. A path segment with malformed
+percent-encoding answers `400 {"error":"malformed percent-encoding in path: …"}`. Until
+boot reconciliation finishes, any authenticated `POST` or `DELETE` whose first path segment
+is `watches` answers `503 {"error":"not ready: reconciling"}` with `retry-after: 1` before
+route validation (so `DELETE /watches` or `POST /watches/x/y` is 503 then, 404 later);
+reads and probes never wait.
 An unhandled error answers `500 {"error":"internal error"}` and never crashes the daemon.
 All bodies are `application/json` except `/metrics`. The webhook side of the surface is
 [webhooks.md](webhooks.md); the redis input path that needs no HTTP is
@@ -130,7 +133,7 @@ weir_webhook_deliveries_total{result="fail"} 0
 | `weir_last_zmq_tx_timestamp_seconds` | gauge | — | unix time of the last ZMQ `rawtx`; absent until the first after boot |
 | `weir_last_zmq_block_timestamp_seconds` | gauge | — | unix time of the last ZMQ `rawblock`; absent until the first after boot |
 | `weir_events_enqueued_total` | counter | `event="seen\|confirmed\|dropped\|demoted\|conflicted\|expired"` | events written to the outbox (`heartbeat` bypasses it) |
-| `weir_webhook_deliveries_total` | counter | `result="ok\|fail"` | delivery attempts by outcome |
+| `weir_webhook_deliveries_total` | counter | `result="ok\|fail"` | outbox delivery attempts by outcome; heartbeat sends are not counted |
 | `weir_events_dead_lettered_total` | counter | — | events given up on |
 | `weir_blocks_processed_total` | counter | — | blocks applied |
 | `weir_reorgs_total` | counter | — | reorgs handled |
@@ -222,8 +225,9 @@ curl -s localhost:8787/watches/bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq -H 'au
 ## DELETE /watches/:address
 
 Remove a watch and its expiry. Idempotent: `204` whether or not the address was watched.
-A tx already confirmed keeps firing its remaining milestones; one still unconfirmed stops
-being tracked once mined.
+A tx already confirmed keeps firing its remaining milestones. One still unconfirmed is
+re-matched when mined: if no output pays a remaining watch, tracking ends quietly; if
+another output does, it confirms with `matched` recomputed.
 
 ```sh
 curl -s -X DELETE localhost:8787/watches/bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq -H 'authorization: Bearer 3f9c…'
