@@ -64,6 +64,15 @@ the rules of this codebase:
   would otherwise replay its input scan over the mempool tx that actually won). The
   snapshot check in (a) is `getbestblockhash` BEFORE and AFTER `getrawmempool`, both equal
   to the stored tip, else the snapshot is discarded and nothing is written.
+- ACCEPTED RESIDUAL (ABA). The two reads compare hashes, so they cannot see a change that
+  undoes itself between them: best = H at the first read; the node connects a child H+1
+  (a limbo tx A leaves the mempool because H+1 mined it); the snapshot is taken (A absent);
+  the node disconnects H+1 again (best back to H, A back in the mempool); the second read
+  sees H. Tip work then runs on a snapshot that lacks A and calls it `conflicted`. A
+  natural reorg cannot produce this sequence: the node only leaves H+1 for a heavier
+  chain, whose best hash differs from H and is caught by the second read. Returning to
+  exactly H requires an operator running `invalidateblock H+1` on their own node inside
+  the milliseconds between the two reads. That is accepted; no code guards it.
 - Three components run OUTSIDE the queue and are not writers of engine state:
   - the heartbeat only READS (tip, watch count, memory, outbox stats) and sends directly;
   - the admin server READS engine state and probes, and writes ONLY the watch set
@@ -92,7 +101,10 @@ default 1000), `READY_MAX_LAG` (chain-lag bound for /ready, default 2). There is
 
 See `keysFor()`. Public: `addresses` SET (+ `expiries` ZSET member=address score=expiresAt-ms).
 Durable chain view: `tip` HASH {hash,height}; `blocks` ZSET (member=hash, score=height,
-pruned to `ringSize`); `maturing` ZSET (member=txid, score=inclusion height);
+pruned to `ringSize`; INVARIANT: exactly one hash per height — every put removes the entry
+at that height first, rewinds remove every height above the fork — so "already in the ring"
+means this hash at this height, a true duplicate, and a different hash at a known height is
+a replacement the connectivity path handles); `maturing` ZSET (member=txid, score=inclusion height);
 `maturing:{txid}` HASH {height, blockHash, matched(JSON), fired(JSON array), hex, inputs(JSON
 Outpoint[]; absent on records written before outpoint tracking — read as `[]`)} — the
 RECORD, which exists from seen-time (height 0) until tracking ends.
@@ -405,7 +417,7 @@ outbox drainer and the heartbeat take a sink; engine modules enqueue through the
 is the single shared `log` from src/lib/log.ts — no module takes a logger dep. Tests
 substitute tests/fakes.ts (`FakeStore`, `FakeSink`, `FakeChain`), which MUST match the real
 classes' semantics exactly (e.g. a MULTI's fragments apply in the same order; the ring is a
-ZSET member→score map, so two hashes can coexist at one height); a signature mismatch is
+ZSET member→score map whose put keeps one hash per height); a signature mismatch is
 fixed in the fake, never in the real class. `FakeStore` also models the outbox (id → record,
 queue as id → score, dead set) and exposes `outboxEvents(): WeirEvent[]` (queued events in
 score-then-insertion order) so engine tests assert on what was ENQUEUED; delivery itself is
@@ -516,7 +528,8 @@ mutation is ONE MULTI. Keys via `keysFor`. Types exported: `Claimant` (= `Pick<M
   only genesis).
 - MULTI fragments (private, the building blocks every transition is composed of — the fake
   mirrors them 1:1): `enqueue` (HSET outbox:{id} + ZADD outbox + ZADD outbox:created),
-  `tipOps` (HSET tip + ZADD blocks), `forgetOps(rec)` (SREM its own txid from each of its
+  `tipOps` (HSET tip + ZREMRANGEBYSCORE blocks at that height + ZADD blocks — one hash per
+  height), `forgetOps(rec)` (SREM its own txid from each of its
   prevout SETs + DEL record), `dropOps(drop)` (SREM pending, SREM evaluated, forget, enqueue
   `dropped`), `conflictOps(rec, event)` (SREM pending, ZREM maturing, SREM limbo, forget,
   enqueue `conflicted`), `promoteOps(rec)` (HSET record, ZADD maturing, SREM pending, SREM
@@ -653,12 +666,17 @@ true; on either mismatch nothing is written and the snapshot is discarded, false
 moved; a newer block or the next reconcile round settles); no tip yet → true.
 Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
 0. active chain: the same `getblockheader` answers `confirmations`; −1 → B is not on the
-   node's active chain now (a historical packet, or a walked block reorged away meanwhile)
-   → warn, return, nothing applied — not even a rewind. Re-checked right before step 2's
-   MULTI (a catch-up walk may have taken a while). Runs for every block, walked ones too.
+   node's active chain now (a historical packet) → warn, return, nothing applied — not even
+   a rewind. The SAME probe runs a second time in step 4, after every read and all write
+   preparation and immediately before `applyBlock`: a reorg that landed during the reads
+   (or the catch-up walk before them) means nothing is written. Both run for every block,
+   walked ones too.
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
-   If H is the tip or already in the ring → duplicate, skip (a replay after a crash that
-   happened AFTER the block's exec). If P === tip.hash → connected. Else: findForkPoint (a
+   If H is the tip, or the ring holds exactly H at h → duplicate, skip (a replay after a
+   crash that happened AFTER the block's exec, or an old notification). A DIFFERENT hash at
+   h in the ring is not a duplicate: B replaces it, and the connectivity path below
+   disconnects the ring's entry (fork point = B's parent) — this is how a node that flips
+   a100 → z100 → a100 converges. If P === tip.hash → connected. Else: findForkPoint (a
    pure gap yields empty disconnected); on a REORG first `enterLimboAndRewind(ancestor)`
    (one MULTI). Then, if blocks are missing (ancestor+1 < h), the PRUNE-WINDOW GUARD runs
    before walking: getBlockchainInfo; if the node is pruned and ancestor+1 < pruneheight,
@@ -688,8 +706,10 @@ Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
    timestamp = blockTime*1000 of B)}` — fired is recorded at ENQUEUE time; delivery retry is
    the outbox's job. When confs ≥ maxMilestone AND all milestones are fired → `finished`
    (tracking ends).
-4. `applyBlock({promoted, fired, finished, dropped, conflicted, ended, unindexed, tip: {H, h},
-   ringKeep: ringSize})` — the block's ONE MULTI, tip and ring included. Crash before exec =
+4. the final active-chain probe (`getblockheader` confirmations −1 → nothing written, see
+   step 0), then `applyBlock({promoted, fired, finished, dropped, conflicted, ended,
+   unindexed, tip: {H, h}, ringKeep: ringSize})` — the block's ONE MULTI, tip and ring
+   included. Crash before exec =
    nothing happened; boot reconciliation replays B. `weir_blocks_processed_total` after it.
 5. TIP-ONLY WORK — `settleTip`, only when `isTip` (false for the catch-up walk) and only
    when B is the node's CURRENT tip. The steps below consult node state (mempool, wall

@@ -95,6 +95,72 @@ describe('reconcile', () => {
     ])
   })
 
+  it('REGRESSION (livelock on a stable node): a100 → z100 → a100 with the node then stable converges — the ring keeps one hash per height, z100 is disconnected, a100 applied, limbo empty', async () => {
+    const { store, chain, processBlock, settleTip, run } = setup()
+    chain.mainChain.clear()
+    chain.addBlock({ hash: 'b99', prevHash: '', height: 99, time: 1_700_000_099, txs: [] })
+    const a = mkTx('A')
+    chain.addBlock({ hash: 'a100', prevHash: 'b99', height: 100, time: 1_700_000_100, txs: [a] })
+    // weir booted at a100: A maturing there, milestone 1 fired
+    store.tip = { hash: 'a100', height: 100 }
+    store.ring.set('b99', 99)
+    store.ring.set('a100', 100)
+    store.maturingIndex.set('A', 100)
+    store.records.set('A', { txid: 'A', height: 100, blockHash: 'a100', matched: MATCHED, fired: [1], hex: 'hex-A', inputs: [] })
+
+    // reorg to z100 (same parent, A back in the mempool): rewind → limbo → demoted
+    chain.addBlock({ hash: 'z100', prevHash: 'b99', height: 100, time: 1_700_000_110, txs: [] })
+    chain.mempool = ['A']
+    await processBlock(chain.raw('z100'))
+    expect(events(store)).toEqual(['demoted:A'])
+    expect(await store.ringAll()).toEqual([{ height: 99, hash: 'b99' }, { height: 100, hash: 'z100' }])
+
+    // back to a100 (A mined there again), node stable; weir restarts: reconcile must converge
+    chain.mainChain.set(100, 'a100')
+    chain.mempool = []
+    await run()
+
+    expect(settleTip.mock.results.length).toBeGreaterThan(0)
+    await expect(settleTip.mock.results[settleTip.mock.results.length - 1]!.value).resolves.toBe(true)
+    expect(store.tip).toEqual({ hash: 'a100', height: 100 })
+    expect(await store.ringAll()).toEqual([{ height: 99, hash: 'b99' }, { height: 100, hash: 'a100' }]) // exactly one hash at 100
+    expect(store.limbo.size).toBe(0)
+    expect(store.pending.size).toBe(0)
+    expect(store.maturingIndex.get('A')).toBe(100)
+    expect(events(store)).toEqual(['demoted:A', 'confirmed:A']) // re-included under a100 again
+    expect(store.outboxEvents()[1]).toMatchObject({ idempotencyKey: 'regtest:A:confirmed:1:a100' })
+
+    // and the same flip as a ZMQ packet (weir up the whole time): z100 again, then a100 again
+    chain.mainChain.set(100, 'z100')
+    chain.mempool = ['A']
+    await processBlock(chain.raw('z100'))
+    expect(events(store)).toEqual(['demoted:A', 'confirmed:A', 'demoted:A'])
+    chain.mainChain.set(100, 'a100')
+    chain.mempool = []
+    await processBlock(chain.raw('a100')) // a different hash at a known height is a replacement, not a duplicate
+    expect(store.tip).toEqual({ hash: 'a100', height: 100 })
+    expect(await store.ringAll()).toEqual([{ height: 99, hash: 'b99' }, { height: 100, hash: 'a100' }])
+    expect(events(store)).toEqual(['demoted:A', 'confirmed:A', 'demoted:A', 'confirmed:A'])
+    expect(store.limbo.size).toBe(0)
+  })
+
+  it('a ring written before the one-per-height invariant (two hashes at the tip height) still converges on boot', async () => {
+    const { store, chain, run } = setup()
+    chain.mainChain.clear()
+    chain.addBlock({ hash: 'b99', prevHash: '', height: 99, time: 1_700_000_099, txs: [] })
+    chain.addBlock({ hash: 'a100', prevHash: 'b99', height: 100, time: 1_700_000_100, txs: [] })
+    chain.addBlock({ hash: 'z100', prevHash: 'b99', height: 100, time: 1_700_000_110, txs: [] }, { main: false })
+    store.tip = { hash: 'z100', height: 100 }
+    store.ring.set('b99', 99)
+    store.ring.set('a100', 100) // stale entry from the pre-invariant ring
+    store.ring.set('z100', 100)
+
+    await run()
+
+    expect(store.tip).toEqual({ hash: 'a100', height: 100 })
+    expect(await store.ringAll()).toEqual([{ height: 99, hash: 'b99' }, { height: 100, hash: 'a100' }])
+  })
+
   it('REGRESSION (reconcile round cap): a node that keeps advancing is followed past 20 rounds — reconcile resolves only when the stored tip IS the best and settle succeeded', async () => {
     const { store, chain, rpc, processBlock, settleTip, run } = setup()
     store.tip = { hash: 'b100', height: 100 }

@@ -524,6 +524,29 @@ describe('blockPipeline', () => {
     expect(store.outboxEvents().map((e) => e.event)).toEqual(['seen'])
   })
 
+  it('REGRESSION (final active-chain probe placement): a reorg that lands DURING the block\'s reads — after the early check, before the MULTI — writes nothing', async () => {
+    const { store, chain, process } = setup()
+    store.watches.add(ADDR)
+    seedTip(store, chain, 100, 'b100')
+    const tx1 = mkTx('tx1')
+    seedPending(store, tx1)
+    chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [tx1] })
+    // the watch lookup is one of the reads between the two probes: the node reorgs while it runs
+    const watchedSubset = store.watchedSubset.bind(store)
+    store.watchedSubset = async (addrs) => {
+      chain.addBlock({ hash: 'b101x', prevHash: 'b100', height: 101, time: 1_700_000_111, txs: [] }) // replaces b101 on the active chain
+      return watchedSubset(addrs)
+    }
+
+    await process(chain.raw('b101'))
+
+    expect(store.tip).toEqual({ hash: 'b100', height: 100 })
+    expect(store.pending.has('tx1')).toBe(true)
+    expect(store.maturingIndex.size).toBe(0)
+    expect(store.outboxEvents()).toHaveLength(0)
+    expect(await store.ringHashAt(101)).toBeNull()
+  })
+
   it('REGRESSION (snapshot gate window): the tip is settled only when getbestblockhash is the stored tip BEFORE and AFTER the mempool snapshot — a snapshot taken around a move is discarded, a limbo tx is never conflicted from it', async () => {
     const { store, chain, cfg } = setup()
     store.watches.add(ADDR)

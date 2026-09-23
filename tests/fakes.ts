@@ -8,7 +8,9 @@ import { metrics } from '../src/lib/metrics'
  * In-memory fakes for engine tests — no redis/bitcoind needed.
  *
  * FakeStore mirrors the `src/store/redis.ts` Store surface and MUST match its semantics
- * exactly (the ring is a ZSET member→score map, so two hashes can coexist at one height;
+ * exactly (the ring is a ZSET member→score map holding ONE hash per height — a put replaces
+ * the entry at that height, so tests that seed two hashes at one height model a ring written
+ * before that invariant;
  * every transition that produces an event enqueues it in the same step; a MULTI is applied
  * in the same command order). All internal state is public so tests can seed and assert
  * directly. Values are cloned on the way in/out to mimic redis serialization.
@@ -46,7 +48,7 @@ export class FakeStore {
 
   // tip / ring
   tip: Tip | null = null
-  /** the `blocks` ZSET: member (blockHash) -> score (height); two hashes CAN share a height */
+  /** the `blocks` ZSET: member (blockHash) -> score (height); every put keeps ONE hash per height */
   ring = new Map<string, number>()
 
   // maturing: zset index (mined txs only) + per-txid record hashes
@@ -221,8 +223,10 @@ export class FakeStore {
     return id
   }
 
+  /** HSET tip + ring put with ONE hash per height (the entry at that height is removed first) */
   private tipOps(tip: Tip): void {
     this.tip = { ...tip }
+    for (const [hash, h] of [...this.ring.entries()]) if (h === tip.height) this.ring.delete(hash)
     this.ring.set(tip.hash, tip.height)
   }
 

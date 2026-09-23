@@ -16,6 +16,10 @@
  *   delivery is the drainer's job (src/delivery/outbox.ts).
  * - Event ids are monotonic (`makeEventId`): ms prefix + per-ms sequence + random suffix,
  *   so redis' tie order for equal ZSET scores (by member) IS enqueue order.
+ * - THE RING HOLDS EXACTLY ONE HASH PER HEIGHT: every put (`tipOps`) removes the entry at that
+ *   height before adding, and rewinds remove every height above the fork. So "already in the
+ *   ring" means exactly "this hash at this height" — a true duplicate — and a different hash
+ *   at a known height is a replacement the connectivity path handles.
  * - OUTPOINTS: `outpoint:{txid}:{vout}` is a SET of claimant txids — every pending or
  *   maturing spender of that prevout. CLAIM = SADD inside the transition that creates or
  *   promotes a record; RELEASE = SREM of ONLY the releaser's own txid inside every transition
@@ -394,8 +398,12 @@ export class Store {
     metrics.counters.inc('weir_events_enqueued_total', { event: event.event })
   }
 
+  /** HSET tip + the ring put — ONE hash per height: whatever sat at that height is removed first. */
   private tipOps(multi: Multi, tip: Tip): void {
-    multi.hSet(this.keys.tip, { hash: tip.hash, height: String(tip.height) }).zAdd(this.keys.blocks, { score: tip.height, value: tip.hash })
+    multi
+      .hSet(this.keys.tip, { hash: tip.hash, height: String(tip.height) })
+      .zRemRangeByScore(this.keys.blocks, tip.height, tip.height)
+      .zAdd(this.keys.blocks, { score: tip.height, value: tip.hash })
   }
 
   /** Release the record's own claims (SREM only its txid from each prevout SET) and DEL the record. */

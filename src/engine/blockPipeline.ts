@@ -22,17 +22,19 @@
  *   valid chain → error log, skipped. Running before promotion means a limbo tx can never be
  *   both re-included and conflicted.
  * - A block is applied only while it is on the node's ACTIVE chain (getblockheader
- *   confirmations ≠ -1), checked before any of its work (so a historical packet cannot
- *   even trigger a rewind) and again right before its MULTI (a catch-up walk may have
- *   taken a while) — for a ZMQ packet and for every walked block alike.
+ *   confirmations ≠ -1), checked twice: at the top of processOne, before any of its work
+ *   (so a historical packet cannot even trigger a rewind), and immediately before its
+ *   MULTI, after every read and all write preparation (a reorg during the reads or the
+ *   catch-up walk means nothing is written) — for a ZMQ packet and for every walked block.
  * - TIP-ONLY WORK compares against the node's LIVE state (mempool, wall clock), which is
  *   wrong for a block that is not the node's current tip: a catch-up block (a pending tx
  *   mined in a LATER missed block would be falsely evicted) or a queued burst during a
- *   reorg. So after the block's MULTI, `settleTip` snapshots the mempool, then asks
- *   getbestblockhash, and runs only when that is the stored tip — and every step, limbo
- *   resolution included, decides from THAT snapshot, never from a later probe. Boot calls
- *   the same `settleTip` after reconciling. A skipped run is picked up by the next tip
- *   block; each step is its own MULTI and safe to repeat.
+ *   reorg. So after the block's MULTI, `settleTip` reads getbestblockhash, snapshots the
+ *   mempool, reads getbestblockhash AGAIN, and runs only when both reads are the stored
+ *   tip (else the snapshot is discarded) — and every step, limbo resolution included,
+ *   decides from THAT snapshot, never from a later probe. Boot calls the same `settleTip`
+ *   after reconciling. A skipped run is picked up by the next tip block; each step is its
+ *   own MULTI and safe to repeat.
  * - A tx's `maturing:{txid}` record exists from SEEN-time (height 0); the `maturing` ZSET
  *   only indexes MINED txs.
  * - There are NO delivery-failure branches: every event is enqueued in the same MULTI as
@@ -81,10 +83,11 @@ export interface BlockPipeline {
   /** one raw block through the full sequence, pulling any missed ancestor blocks over RPC first (gap/reorg handling) */
   processBlock(raw: Buffer): Promise<void>
   /**
-   * The tip-only work for the STORED tip, if the node agrees it is the tip: snapshot the
-   * mempool, then getbestblockhash; equal → eviction, TTL, evaluated prune, limbo
-   * resolution from that snapshot, resolves true. Otherwise nothing is written and it
-   * resolves false (the node moved on: a newer block will settle). No tip yet → true.
+   * The tip-only work for the STORED tip, if the node agrees it is the tip: getbestblockhash,
+   * a mempool snapshot, getbestblockhash again — both reads must be the stored tip → eviction,
+   * TTL, evaluated prune, limbo resolution from that snapshot, resolves true. On either
+   * mismatch nothing is written, the snapshot is discarded and it resolves false (the node
+   * moved: a newer block or reconcile round will settle). No tip yet → true.
    */
   settleTip(): Promise<boolean>
 }
@@ -273,12 +276,6 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
   }
 
   async function processConnected(block: DecodedBlock, height: number, isTip: boolean): Promise<void> {
-    // Right before applying — a catch-up walk may have taken a while, and the node may have
-    // moved off this block meanwhile (see the same check at the top of processOne).
-    if ((await rpc.getBlockHeader(block.hash)).confirmations === -1) {
-      log.warn(CTX, `${block.hash}@${height} left the node's active chain before it was applied — nothing applied`)
-      return
-    }
     const net = cfg.network
     const blockTimeMs = block.time * 1000
     const writes: BlockWrites = {
@@ -368,6 +365,15 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
     }
 
     // ── the block's ONE MULTI ────────────────────────────────────────────────────────
+    // The final active-chain probe sits HERE, after every read and all write preparation and
+    // immediately before the exec: a reorg that landed during the reads (or the catch-up walk
+    // before them) means this block's transitions describe a chain the node left — nothing
+    // is written. (The same check at the top of processOne keeps a historical packet from
+    // triggering a rewind at all.)
+    if ((await rpc.getBlockHeader(block.hash)).confirmations === -1) {
+      log.warn(CTX, `${block.hash}@${height} left the node's active chain before it was applied — nothing applied`)
+      return
+    }
     await store.applyBlock(writes)
     metrics.counters.inc('weir_blocks_processed_total')
     log.info(CTX, `processed block ${block.hash}@${height} (${block.txs.length} txs)`)
