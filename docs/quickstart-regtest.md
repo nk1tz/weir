@@ -12,7 +12,7 @@ Prerequisites: docker with compose v2, node ≥ 20, git.
 ## 1. Clone and configure
 
 ```console
-$ git clone https://github.com/nate/weir && cd weir
+$ git clone https://github.com/nk1tz/weir && cd weir
 $ cp .env.example .env
 ```
 

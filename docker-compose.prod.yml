@@ -59,13 +59,14 @@ services:
       # long syntax + create_host_path:false: a mistyped conf path fails instead of
       # silently becoming an empty directory
       - type: bind
+        # must be readable by the image's bitcoin user (uid 101): chown 101:101 if you keep it mode 600
         source: ${BITCOIND_CONF:-./docker/bitcoin-mainnet.conf}
         target: /etc/bitcoin/bitcoin.conf
         read_only: true
         bind:
           create_host_path: false
       - bitcoind-data:/home/bitcoin/.bitcoin
-      # assumeutxo: `mkdir -p snapshots` BEFORE first `up` (else docker creates it root-owned),
+      # assumeutxo (full procedure: docs/DEPLOY.md): `mkdir -p snapshots` BEFORE first `up`,
       # put utxo-<height>.dat there, then (exec bypasses the entrypoint, so pass user + datadir;
       # the cookie file lives in the datadir; timeout 0 because the load runs a long time):
       #   docker compose -f docker-compose.prod.yml exec --user bitcoin bitcoind \

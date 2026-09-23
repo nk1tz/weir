@@ -44,7 +44,8 @@ WEBHOOK_SECRET=change-me-openssl-rand-hex-32 node examples/catch.js
 
 Watch terminal 2: a `seen` event when the payment hits the mempool, then `confirmed` at
 1 and 3 confirmations. The full transcript with expected output for every command is in
-[docs/quickstart-regtest.md](docs/quickstart-regtest.md).
+[docs/quickstart-regtest.md](docs/quickstart-regtest.md). Production (one VM, prebuilt image,
+mainnet node bootstrapped from a UTXO snapshot): [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Integration touchpoints
 
