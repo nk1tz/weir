@@ -52,14 +52,26 @@ services:
     # The image's entrypoint chowns the whole datadir; a read-only file mounted INSIDE it
     # makes that chown fail and the container exit. So the conf lives outside the datadir
     # and is passed with -conf. The datadir itself is a named volume the entrypoint owns.
-    command: ["bitcoind", "-conf=/etc/bitcoin/bitcoin.conf", "-datadir=/home/bitcoin/.bitcoin"]
+    # -nodebuglogfile: docker's json-file rotation covers stdout; without it Core also
+    # writes an unbounded debug.log inside the datadir volume.
+    command: ["bitcoind", "-conf=/etc/bitcoin/bitcoin.conf", "-datadir=/home/bitcoin/.bitcoin", "-nodebuglogfile"]
     volumes:
-      - ${BITCOIND_CONF:-./docker/bitcoin-mainnet.conf}:/etc/bitcoin/bitcoin.conf:ro
+      # long syntax + create_host_path:false: a mistyped conf path fails instead of
+      # silently becoming an empty directory
+      - type: bind
+        source: ${BITCOIND_CONF:-./docker/bitcoin-mainnet.conf}
+        target: /etc/bitcoin/bitcoin.conf
+        read_only: true
+        bind:
+          create_host_path: false
       - bitcoind-data:/home/bitcoin/.bitcoin
-      # assumeutxo: put utxo-<height>.dat here, then
-      #   docker compose -f docker-compose.prod.yml exec bitcoind \
-      #     bitcoin-cli -conf=/etc/bitcoin/bitcoin.conf loadtxoutset /snapshots/utxo-<height>.dat
-      # Delete the file afterwards.
+      # assumeutxo: `mkdir -p snapshots` BEFORE first `up` (else docker creates it root-owned),
+      # put utxo-<height>.dat there, then (exec bypasses the entrypoint, so pass user + datadir;
+      # the cookie file lives in the datadir; timeout 0 because the load runs a long time):
+      #   docker compose -f docker-compose.prod.yml exec --user bitcoin bitcoind \
+      #     bitcoin-cli -conf=/etc/bitcoin/bitcoin.conf -datadir=/home/bitcoin/.bitcoin \
+      #     -rpcclienttimeout=0 loadtxoutset /snapshots/utxo-<height>.dat
+      # Delete the file once `getchainstates` shows the snapshot chainstate is active.
       - ./snapshots:/snapshots:ro
     restart: unless-stopped
     logging: *logging
