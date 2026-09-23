@@ -25,12 +25,10 @@ Read this first. weir stays small by refusing to be these things:
 - **Not reorg-proof beyond its window.** Reorgs deeper than your max confirmation milestone
   are invisible by design. Pick milestones that match your risk tolerance.
 
-If you need any of the above, see [alternatives](#alternatives).
-
 ## 5-minute regtest quickstart
 
 ```sh
-git clone https://github.com/nate/weir && cd weir
+git clone https://github.com/nk1tz/weir && cd weir
 cp .env.example .env                          # defaults are regtest-ready
 
 docker compose --profile regtest up -d --build   # weir + redis + a regtest bitcoind
