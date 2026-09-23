@@ -18,6 +18,7 @@ exact procedure used for the reference deployment; every command was run as writ
 ```
 /root/weir-mainnet/   docker-compose.prod.yml  docker/  .env  bitcoin.conf  snapshots/
 /root/weir-regtest/   docker-compose.prod.yml  docker/  .env
+/root/weir-proxy/     docker-compose.yml  Caddyfile        (optional, step 6)
 ```
 
 One directory per stack. Compose names networks and volumes after the directory, so the
@@ -113,6 +114,24 @@ Regtest is the same in `~/weir-regtest`; its node needs no snapshot.
 
 `GET /ready` (on `ADMIN_PORT`, only reachable inside the compose network unless you put a
 reverse proxy in front) answers 200 once reconciled and within `READY_MAX_LAG` of the node.
+
+## 6. Public HTTPS for the admin API
+
+Only needed when the app that adds watches runs elsewhere (a PaaS, another host). One
+Caddy container joins both stack networks and publishes 80/443; everything else stays
+unpublished. Files: [examples/proxy](../examples/proxy).
+
+```bash
+mkdir -p ~/weir-proxy && cp examples/proxy/* ~/weir-proxy/   # then edit the two hostnames
+ufw allow 80/tcp && ufw allow 443/tcp
+cd ~/weir-proxy && docker compose up -d
+curl https://weir-regtest.example.com/ready                   # 200 once weir is up; /watches is 401 without the token
+```
+
+Two A records, both to the box: the hostname is how Caddy tells the two APIs apart. The
+routes are unchanged, so the base URL for the app is `https://<hostname>` and every call
+carries `Authorization: Bearer <ADMIN_TOKEN>` from the matching `.env`. Expect internet
+scanners to hit the unauthenticated probes within minutes; they get `/ready` and `401`s.
 
 ## Operating
 

@@ -1,0 +1,26 @@
+# TLS front door for both weir admin APIs. Joins each stack's network; publishes only 80/443.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    networks:
+      - mainnet
+      - regtest
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+networks:
+  mainnet:
+    external: true
+    name: weir-mainnet_default
+  regtest:
+    external: true
+    name: weir-regtest_default
+volumes:
+  caddy-data:

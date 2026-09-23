@@ -1,0 +1,8 @@
+# Replace the two hostnames (A records -> this box), then: docker compose up -d
+# Caddy obtains and renews Let's Encrypt certificates on its own.
+weir.example.com {
+  reverse_proxy weir-mainnet-weir-1:8787
+}
+weir-regtest.example.com {
+  reverse_proxy weir-regtest-weir-1:8787
+}
