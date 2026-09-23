@@ -89,8 +89,8 @@ export async function findForkPoint(
 /**
  * Step 1 of the limbo model, ONE MULTI: every maturing tx included above the ancestor moves
  * to the persisted limbo SET (record kept), the ring is truncated above the ancestor and the
- * tip rewinds to it. `ancestor` is the fork point findForkPoint VERIFIED (height AND hash) —
- * never re-selected from the ring by height. After this the replacement chain connects like
+ * tip rewinds to it. `ancestor` is the fork point returned by findForkPoint (height AND hash;
+ * below the ring it is the documented ring-floor fallback) — never re-selected by height. After this the replacement chain connects like
  * an ordinary gap walk.
  */
 export async function enterLimboAndRewind(

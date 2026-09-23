@@ -641,7 +641,8 @@ Displaced-tx resolution is the LIMBO MODEL — on a pruned/no-txindex node there
 ask "which block is txid X in now?" at reorg time (getrawtransaction without a blockhash only
 answers for mempool txs), so weir never adjudicates at detection time:
 `export async function enterLimboAndRewind(deps, ancestor: {height, hash}): Promise<void>` —
-takes the fork point findForkPoint VERIFIED (never re-selected from the ring by height),
+takes the fork point returned by findForkPoint (never re-selected from the ring by height;
+below the ring it is the documented ring-floor fallback),
 reads the maturing entries with inclusion height > ancestor, then `store.rewind(ancestor,
 displaced)`: ONE MULTI (SADD limbo + ZREM maturing, records kept;
 ring truncated above the ancestor; tip = ancestor). The replacement chain now processes as
@@ -676,7 +677,8 @@ Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
    preparation and immediately before `applyBlock`: a reorg that landed during the reads
    (or the catch-up walk before them) means B's applyBlock writes are discarded; the
    connectivity commits made before it (a rewind, a tracking reset, walked blocks) stand —
-   each was validated by its own probe. Both run for every block, walked ones too.
+   the rewind and reset were admitted by B's early probe, each walked block by its own.
+   Both run for every block, walked ones too.
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
    If H is the tip, or the ring holds exactly H at h → duplicate, skip (a replay after a
    crash that happened AFTER the block's exec, or an old notification). A DIFFERENT hash at

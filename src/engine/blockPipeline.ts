@@ -370,7 +370,8 @@ export function makeBlockPipeline(deps: BlockPipelineDeps): BlockPipeline {
     // immediately before the exec: a reorg that landed during the reads (or the catch-up walk
     // before them) means this block's transitions describe a chain the node left — B's
     // applyBlock writes are discarded. Preceding connectivity commits (a rewind, a tracking
-    // reset, walked blocks) stand: each was validated by its own probe. (The check at the
+    // reset, walked blocks) stand: the rewind and reset were admitted by B's early probe,
+    // each walked block by its own. (The check at the
     // top of processOne keeps a historical packet from triggering a rewind at all.)
     if ((await rpc.getBlockHeader(block.hash)).confirmations === -1) {
       log.warn(CTX, `${block.hash}@${height} left the node's active chain before it was applied — nothing applied`)
