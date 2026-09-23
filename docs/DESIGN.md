@@ -44,14 +44,16 @@ default 1000). There is no `WEBHOOK_MAX_RETRIES`: retry is the outbox's job, bou
 See `keysFor()`. Public: `addresses` SET (+ `expiries` ZSET member=address score=expiresAt-ms).
 Durable chain view: `tip` HASH {hash,height}; `blocks` ZSET (member=hash, score=height,
 pruned to `ringSize`); `maturing` ZSET (member=txid, score=inclusion height);
-`maturing:{txid}` HASH {height, blockHash, matched(JSON), fired(JSON array), hex}.
+`maturing:{txid}` HASH {height, blockHash, matched(JSON), fired(JSON array), hex, inputs(JSON
+Outpoint[]; absent on records written before outpoint tracking — read as `[]`)}.
 Working set (reconstructible): `pending`, `evaluated`, `mempool:current`, `mempool:postBlock`,
 `blockTxids` — all SETs of txids.
 Reorg state (durable): `limbo` SET — txids whose inclusion block was disconnected by a reorg,
 awaiting re-resolution (re-included by the new chain / demoted to mempool / conflicted). Kept
 in redis so a crash mid-reorg finishes resolving on the next block or boot.
-Outpoints: `outpoints` HASH `{txid}:{vout}` → owning tracked txid (inputs of pending +
-maturing txs; see Outpoint tracking).
+Outpoints: `outpoint:{txid}:{vout}` SET of claimant txids (inputs of pending + maturing
+txs; see Outpoint tracking).
+under force that could not claim the field (see Outpoint tracking rule 2).
 Outbox (durable): `outbox` ZSET member=eventId score=nextAttemptAt-ms (the delivery queue);
 `outbox:{eventId}` HASH {payload(JSON WeirEvent), event, idempotencyKey, attempts, createdAt,
 lastError}; `outbox:created` ZSET member=eventId score=createdAt-ms (mirrors `outbox`
@@ -97,11 +99,20 @@ delivery inside a transition let a block race the `seen` write and corrupt the r
 Rules:
 1. A state transition and its event are ONE atomic Redis step. Every Store transition method
    that produces an event takes the event and appends `HSET outbox:{id} …` + `ZADD outbox now id`
-   to the same MULTI as its state mutation. Either both persist or neither does. The one
-   exception in MECHANISM (not in atomicity) is `recordSeen`: it is a Lua script (EVAL) rather
-   than a MULTI, because it legitimately races the block pipeline (a tx can be mined while its
-   mempool evaluation is between its read and its write) and needs a guard a MULTI cannot
-   express — see src/store/redis.ts.
+   to the same MULTI as its state mutation. Either both persist or neither does. The
+   exceptions in MECHANISM (not in atomicity) are Lua scripts (EVAL) rather than MULTIs:
+   `recordSeen`, `replacePending` and `dropPending`, because they race other paths (a tx can
+   be mined, or replaced from the mempool, while a caller is between its read and its write)
+   and need guards a MULTI cannot express, and every transition that releases outpoints
+   (`conflict`, `finishMaturing`, `endTracking` too), whose owner-only HDEL is conditional.
+   GUARDS: a transition re-validates live state INSIDE its Lua wherever two writers can
+   race. The mempool evaluator races the block pipeline, so `recordSeen`, `replacePending`
+   and the tip-check `dropPending` are guarded (evaluated / mined / tombstoned / pendingUnmined
+   / fence) and return 0 to a stale caller — never a second verdict. The block + reorg path
+   is ONE serialized writer (makeBlockHandler's queue; reconcile runs before ZMQ starts) and
+   the evaluator never mutates maturing/limbo state, so `conflict`, `finishMaturing`,
+   `endTracking`, `demoteToPending`, `promoteToMaturing`, `markFired` read-then-write within
+   one block's processing and carry no guard by design.
 2. Nothing in the engine awaits delivery. Engine code never calls the sink.
 3. One drainer (src/delivery/outbox.ts) delivers: every `OUTBOX_POLL_MS` (1000, constant) it
    takes due events (`ZRANGEBYSCORE outbox -inf now LIMIT 0 50`), reads each hash, and sends
@@ -156,35 +167,52 @@ noticed as `dropped` at the NEXT block (up to ~10 min), and `conflicted` is infe
 mempool absence rather than proven. Inputs are literal bytes in every tx weir already
 decodes — no txindex, no prevout resolution: weir only checks them against its OWN memory.
 
+Model: an outpoint can legitimately have SEVERAL concurrent tracked spenders (an RBF chain,
+competing double-spends), so ownership is a SET of claimants, never a single owner. Claims
+never conflict; there is no force, no waitlist, no handover, no adjudication rounds.
+
 Rules:
 1. `DecodedTx` carries `inputs: Outpoint[]` (`{txid, vout}`, prev-txid display-order hex);
    the coinbase input (txid all zeros, vout 0xffffffff) is omitted. `MaturingRecord` carries
-   the same `inputs` so terminal cleanup can remove them.
-2. `weir:{net}:outpoints` HASH field=`{txid}:{vout}` → owning tracked txid. Written by
-   `recordSeen` (pending) and `promoteToMaturing` (never-seen mined txs); removed by every
-   transition that deletes the record (`dropPending`, `replacePending`, `conflict`,
-   `finishMaturing`, `endTracking`) — in the same Lua/MULTI. `demoteToPending` keeps them.
-   `clearTracking` wipes the hash.
-3. REPLACEMENT (mempool path, src/engine/txPipeline.ts): before matching outputs, the
-   evaluator looks up the tx's inputs (`outpointOwners(inputs)` — one HMGET, chunked at 1000).
-   Every distinct owner ≠ this txid that is currently PENDING is replaced NOW:
-   `replacePending(ownerTxid, event)` — one MULTI: SREM pending, SREM evaluated (the
-   original may legitimately return if the replacement is itself dropped), DEL record,
-   HDEL its outpoints, + enqueue `dropped` with `reason: 'replaced'`, `replacedBy: <this txid>`,
-   idempotency key `{net}:{owner}:dropped:replaced:{replacedBy}`. An owner that is MATURING
-   (mined) is never touched by a mempool tx — bitcoind would not have relayed a conflict with
-   a confirmed tx; log at warn and continue. Then the replacement is evaluated as usual (it
-   may pay a watched address → its own `seen`).
-4. BLOCK PATH (src/engine/blockPipeline.ts, step 2): collect every input of every block tx
-   (excluding coinbase), resolve owners with ONE chunked HMGET, then for each hit with
-   owner ≠ the spending txid:
-   - owner is PENDING → `replacePending(owner, ev)` with `replacedBy` = the confirmed
-     spender (a double-spend confirmed while ours sat in the mempool);
-   - owner is in LIMBO → PROVEN conflict: `conflict(owner, ev)` with
-     `conflictingTxid` = the spender, `reason: 'double-spend'`;
-   - owner is MATURING and not in limbo → impossible on a valid chain; log error, skip.
-   This runs before promotion so a limbo tx that is BOTH re-included and conflicted cannot
-   happen (a tx cannot be in a block whose other tx spends its inputs).
+   the same `inputs` so terminal cleanup can release them.
+2. `weir:{net}:outpoint:{txid}:{vout}` SET of claimant txids (pending or maturing).
+   - CLAIM = SADD, inside `recordSeen` (its Lua) and `promoteToMaturing` (its MULTI). Always
+     succeeds. A tx's claims are complete or absent (same atomic op as its record).
+   - RELEASE = SREM of ONLY the releaser's own txid, inside every transition that deletes the
+     record (`dropPending`, `replacePending`, `conflict`, `finishMaturing`, `endTracking` —
+     each reads `inputs` from the record it deletes). The key vanishes when empty. Nobody
+     else's claim is ever touched. `demoteToPending` keeps claims (the tx stays tracked).
+   - `clearTracking` DELs every `outpoint:*` key (SCAN + DEL after its main Lua). A claimant
+     without a record is skipped by every reader, so a stray claim is harmless.
+3. REPLACEMENT (mempool path, src/engine/txPipeline.ts) — ONE pass, no rounds:
+   `isEvaluated` → evaluation fence (a stale view is refused before anything is mutated) →
+   `outpointOwners(inputs)` (pipelined SMEMBERS, self excluded) → for EVERY distinct owner:
+   read its record only to build the payload (gone → nothing to do); record unmined →
+   `replacePending(owner, ev, startedAtMs)` — ONE Lua that atomically applies the fence
+   (-1), requires `pendingUnmined` (in `pending` AND record exists with height 0, else 0:
+   nothing written, nothing enqueued — a second caller, or one the block pipeline overtook,
+   finds it already handled), then SREM pending, SREM evaluated (the original may return if
+   the replacement is itself dropped), release its claims, DEL record, + enqueue `dropped`
+   with `reason: 'replaced'`, `replacedBy: <this txid>`, key
+   `{net}:{owner}:dropped:replaced:{replacedBy}` → 1; record MINED (maturing/limbo) → a
+   mempool tx cannot displace a confirmed tx (bitcoind would not have relayed it; during reorg
+   lag the block path adjudicates it — rule 4): warn, skip. Then match outputs; a watched tx
+   is recorded with `recordSeen` (outcome `'recorded' | 'skipped' | 'stale'`), which claims its
+   inputs. Documented imprecision: two spenders of one outpoint arriving CONCURRENTLY can both
+   see no prior owner and both be recorded; bitcoind keeps only one, and the loser is
+   reported `dropped` with `reason: 'evicted'` at the next tip check rather than `replaced`
+   immediately — a labelling difference, never a lost verdict.
+4. BLOCK PATH (src/engine/blockPipeline.ts, step 2, before promotion): collect every input of
+   every block tx (excluding coinbase), `outpointOwners` once, then for each owner ≠ its
+   spender (the owner's record read only for the payload; gone → skip):
+   - owner in LIMBO → PROVEN conflict: `conflict(owner, ev)` with `conflictingTxid` = the
+     spender, `reason: 'double-spend'`, timestamp = blockTime*1000;
+   - owner's record MINED (height > 0) and not in limbo → impossible on a valid chain; log
+     error, skip;
+   - otherwise → `replacePending(owner, ev, scanStartMs)` with `replacedBy` = the confirmed
+     spender (a double-spend confirmed while ours sat in the mempool); the Lua decides.
+   Every claimant of a spent outpoint is adjudicated (a field may have several). Running
+   before promotion means a limbo tx cannot be both re-included and conflicted by one block.
 5. `resolveLimbo` keeps its by-elimination fallback (`getmempoolentry` → demoted, else
    conflicted) for txs the new chain neither re-included nor provably conflicted (e.g. an
    input spent by a tx weir never decoded because it was below the ring floor).
@@ -192,12 +220,22 @@ Rules:
    `dropped` gains `reason: 'replaced' | 'evicted'` (`evicted` is the residual verdict of the
    tip-block dropped check) and `replacedBy?: string`; `conflicted` gains
    `reason?: 'double-spend'` and `conflictingTxid?: string` when proven.
+7. RETRY SAFETY NET: an evaluation the fence refused, or a tx missed by ZMQ without a
+   sequence gap, is un-evaluated and is picked up by the next mempool reparse — which runs
+   PERIODICALLY (`MEMPOOL_REPARSE_INTERVAL_MS` = 300 000, constant; the reparser's mutex skips
+   overlap), not only at boot and on ZMQ gaps. Cost: one getrawmempool plus fetches of
+   un-evaluated txids only.
 
-Store surface: `outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string>>`
-(outpoint key → owner txid, hits only), `replacePending(txid, event)`; `recordSeen`,
-`promoteToMaturing`, `dropPending`, `conflict`, `finishMaturing`, `endTracking` maintain the
-hash as in rule 2. Idempotency: `idem.replaced(net, txid, replacedBy)`; `conflicted` keeps
-its single key (one terminal verdict per txid).
+Store surface: `outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string[]>>`
+(field → claimant txids, empty fields omitted, chunked pipelining), `replacePending(txid,
+event, startedAtMs): Promise<boolean>` (rule 3; false = nothing done), `recordSeen(rec,
+event, startedAtMs): Promise<'recorded' | 'skipped' | 'stale'>`, `promoteToMaturing` (claims
+via SADD), and the releasing Luas `dropPending(txid, event): Promise<boolean>` (guarded like
+replacePending, unfenced), `conflict(txid, event)`, `finishMaturing(txid, nowMs)`,
+`endTracking(txid)` — they read the record's own `inputs`, callers pass nothing.
+`clearTracking` (one Lua for records + tracking keys, then SCAN-DEL of `outpoint:*`) and
+`sweepOrphanRecords` (per-record conditional Lua). Idempotency: `idem.replaced(net, txid,
+replacedBy)`; `conflicted` keeps its single key (one terminal verdict per txid).
 
 ## Module map and contracts
 
@@ -321,9 +359,12 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   `ringRemoveAbove(height)` (ZREMRANGEBYSCORE — reorg rewind, keeps the one-hash-per-height
   invariant).
 - transitions that ENQUEUE (each one MULTI = state mutation + outbox HSET/ZADD; see Outbox):
-  `recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<boolean>`
-  — HSET record (height 0), SADD pending, SADD evaluated, + enqueue when event is non-null
-  (null when seen is disabled). ONE Lua script, FENCED (refused when now − startedAtMs >
+  `recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<'recorded' | 'skipped' | 'stale'>`
+  — HSET record (height 0), SADD pending, SADD evaluated, claim `outpoints` field → txid
+  with HSETNX for each of `rec.inputs` (KEYS[8]; ARGV[14] = inputs JSON, ARGV[15] = the
+  `{txid}:{vout}` fields joined by ',', ARGV[16] = force), + enqueue when event is non-null
+  (null when seen is disabled); returns `{conflicts}` (nothing written) when a field is owned
+  by another txid and force is off (Outpoint tracking rule 2). ONE Lua script, FENCED (refused when now − startedAtMs >
   MAX_EVALUATION_AGE_MS, see Outbox rule 8) and GUARDED: a no-op (resolves false) when `evaluated` already
   holds the txid (a duplicate concurrent evaluation), or the record already has height > 0
   (the block pipeline mined + promoted it between this evaluation's read and its write —
@@ -334,22 +375,30 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   block would emit a false `dropped` for a confirmed payment);
   `markFired(txid, fired: number[], event: TxEvent)` — HSET fired + enqueue `confirmed`
   (fired is recorded at ENQUEUE time; delivery retry is the outbox's job);
-  `dropPending(txid, event: TxEvent)` — SREM pending, SREM evaluated, DEL record, + enqueue;
+  `dropPending(txid, event: TxEvent): Promise<boolean>` — ONE GUARDED Lua: not
+  pending-unmined → 0 (nothing written, false); else SREM pending, SREM evaluated, release its
+  outpoints (owner-only HDEL from the record's `inputs`, with waitlist handover), DEL record,
+  + enqueue (`reason: 'evicted'`) → true;
+  `replacePending(txid, event: TxEvent, startedAtMs): Promise<boolean>` — ONE Lua: fence →
+  -1; not pending-unmined (not pending, record missing, or mined) → 0 (nothing written); else
+  the dropPending mutation + enqueue `dropped` with `reason: 'replaced'` → 1 (see Outpoint
+  tracking rule 3; no tombstone — not a terminal verdict);
   `demoteToPending(rec, event: TxEvent)` — HSET record back to height 0/blockHash ''/fired [],
   SADD pending, SADD evaluated, SREM limbo, + enqueue `demoted` (`evaluated` is part of it
   because the tip prune forgot the txid when it was mined; without it the next reparse would
   emit a second `seen`);
-  `conflict(txid, event: TxEvent)` — SREM pending, ZREM maturing, DEL record, SREM limbo,
-  ZADD tombstones, + enqueue;
+  `conflict(txid, event: TxEvent)` — ONE Lua: SREM pending, ZREM maturing, release its
+  outpoints, DEL record, SREM limbo, ZADD tombstones, + enqueue;
   `expireWatch(addr, event: ExpiredEvent)` — SREM addresses, ZREM expiries, + enqueue;
-  `endTracking(txid)` — SREM pending, SREM limbo, DEL record (no event: watch removed mid-flight);
-  `finishMaturing(txid, nowMs)` — DEL record, ZREM maturing, ZADD tombstones score=nowMs (no
-  event: the final-milestone cleanup — tracking ENDED). `dropPending` deliberately does NOT
+  `endTracking(txid)` — ONE Lua: SREM pending, SREM limbo, release its outpoints, DEL record
+  (no event: watch removed mid-flight);
+  `finishMaturing(txid, nowMs)` — ONE Lua: release its outpoints, DEL record, ZREM maturing,
+  ZADD tombstones score=nowMs (no event: the final-milestone cleanup — tracking ENDED). `dropPending` deliberately does NOT
   tombstone: a rebroadcast may legitimately re-fire `seen`.
 - tombstones: `isTombstoned(txid)` (ZSCORE non-nil), `pruneTombstones(beforeMs)`
   (ZREMRANGEBYSCORE -inf beforeMs; the tip block calls it with now − TOMBSTONE_TTL_MS).
 - maturing: `promoteToMaturing(rec: MaturingRecord)` — THE mined-tx promotion, one MULTI:
-  HSET record, ZADD maturing, SREM pending, SREM limbo, SADD evaluated (every promotion
+  HSET record, ZADD maturing, SREM pending, SREM limbo, SADD evaluated, HSETNX per outpoint (every promotion
   branch uses it, so a crash cannot leave a half-promoted tx; no event — confirmations come
   from the milestone sweep), `maturingEntries(): Promise<Array<{txid: string; height: number}>>`,
   `removeMaturing(txid)` (DEL record + ZREM — dangling-index cleanup only; the final-milestone
@@ -361,8 +410,15 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   only by transitions (`dropPending`, `conflict`, `endTracking`, `removeMaturing`).
 - limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`
   (demotion is `demoteToPending` above).
-- `clearTracking(): Promise<string[]>` — prune-window guard: wipe maturing index + records +
-  pending + limbo + evaluated + mempool scratch, PRESERVING watches/expiries/tip/ring AND the
+- outpoints: `outpointOwners(outpoints)` (HMGET chunked at 1000; hits only; contract under
+  Outpoint tracking).
+- `sweepOrphanRecords(): Promise<number>` — SCAN `maturing:*`; each record is deleted by its
+  own Lua ONLY while its txid has no live membership (not pending, not in limbo, not in the
+  maturing index) — a record a concurrent `recordSeen`/promotion just created is left alone.
+- `clearTracking(): Promise<string[]>` — prune-window guard: collect the txids of limbo +
+  pending + maturing, then ONE Lua DELs their records AND the tracking keys (maturing index,
+  pending, limbo, evaluated, mempool scratch, block txids, outpoints, outpoints:waiting)
+  atomically, then `sweepOrphanRecords()`. PRESERVING watches/expiries/tip/ring AND the
   outbox (queued events are still owed); returns the txids whose tracking was lost.
 - outbox: `outboxDue`, `outboxRead`, `outboxAck`, `outboxRetry`, `outboxDead`, `outboxStats`
   (contracts under Outbox).
@@ -406,11 +462,14 @@ yields 2 entries).
 `export function makeTxEvaluator(deps): (tx: DecodedTx, startedAtMs: number) => Promise<void>` and
 `export function makeRawTxHandler(deps): (raw: Buffer) => Promise<void>` (startedAtMs =
 receipt time, then decode → evaluate).
-Evaluate: if `isEvaluated` → return. Match. If no match → markEvaluated, done. If match:
+Evaluate: if `isEvaluated` → return. Fence (refuse a stale evaluation, warn, leave
+un-evaluated). Replacement check (Outpoint tracking rule 3). Match. If no match →
+markEvaluated, done. If match:
 build the `seen` TxEvent (confs 0, block fields null, timestamp now) when seenEnabled, then
-`recordSeen(rec, event | null, startedAtMs)` — one atomic fenced + guarded step, nothing
-awaited from the network; `false` (a concurrent path already tracks or mined the tx, or the
-evaluation is older than MAX_EVALUATION_AGE_MS) is logged and is the end of the evaluation.
+the claim loop: `recordSeen(rec, event | null, startedAtMs, force)` — one atomic fenced +
+guarded step, nothing awaited from the network; `skipped` (a concurrent path already tracks
+or mined the tx) / `stale` is logged and is the end of the evaluation; `{conflicts}` →
+`replacePending` each, retry (rule 3: force after a round that replaced nothing, or the third).
 The old "delivery failed → leave un-evaluated" path no longer exists: the outbox owns retry.
 
 ### src/engine/mempool.ts
@@ -440,7 +499,9 @@ Re-inclusion is discovered NATURALLY by the block pipeline's promotion step: a l
 found in a new block re-enters maturing (fresh height/blockHash, fired []) and leaves limbo —
 no event at re-inclusion; milestones re-fire on the sweep with new-blockhash idempotency keys.
 `export async function resolveLimbo(deps): Promise<void>` — runs after the TIP block finishes
-(and at boot when already reconciled): for each txid still in limbo,
+(and at boot when already reconciled): for each txid still in limbo (a PROVEN conflict —
+Outpoint tracking rule 4 — already left limbo inside `conflict` in the block pipeline, so it
+is never adjudicated twice),
   - getMempoolEntry non-null → build `demoted` (confs 0, block fields = the OLD block,
     timestamp now) and `demoteToPending(rec, ev)` (one MULTI, enqueues it);
   - else → build `conflicted` (confs = last confirmed depth or 0, old block fields) and
@@ -464,6 +525,9 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    ancestor+1 .. h-1 via getBlockHash → getBlockRaw → process (in order, as NON-tip blocks),
    then B itself. After the OUTERMOST (tip) block completes: `resolveLimbo`.
 2. per connected block: decodeBlock → setBlockTxids → `pendingInBlock()` + `limboTxids()` →
+   the INPUT SCAN (Outpoint tracking rule 4: every block input → `outpointOwners`, one chunked
+   HMGET; limbo owner → proven `conflict` with `timestamp = blockTime*1000`, and the local
+   limbo snapshot forgets it; any other unmined owner → the guarded `replacePending`) →
    resolve the block's DISTINCT output addresses with `watchedSubset` ONCE (chunked at 1000
    addresses) → `matchAgainst` per tx: for each block tx that matches (check EVERY block tx,
    not just pending ∩ block — a payment never seen in the mempool still confirms): build
@@ -488,8 +552,11 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    every tx entering `pending` also gets its record written under `maturing:{txid}` with
    height 0 / blockHash '' — a dropped tx cannot be re-fetched from a pruned node. The
    `maturing` ZSET still only indexes MINED txs; the record exists from seen onward):
-   `dropPending(txid, ev)` — one MULTI (pending, evaluated so a rebroadcast can re-fire
-   `seen`, record, + enqueue).
+   `dropPending(txid, ev)` — one GUARDED Lua (pending, evaluated so a rebroadcast can re-fire
+   `seen`, record, the outpoints it still owns, + enqueue) with `reason: 'evicted'`, a no-op
+   (false, logged) when the txid is no longer pending-unmined — a mempool replacement that
+   landed since `droppedPending()` was read already gave the verdict; replacements are the
+   input scans' job.
 5. TTL sweep — TIP BLOCKS ONLY: dueExpiries(now) → `expireWatch(addr, ev)` (one MULTI).
 6. pruneEvaluated + pruneTombstones(now − TOMBSTONE_TTL_MS) (tip only), setTip({hash: H,
    height: h}), ringPut, ringPrune(ringSize).
