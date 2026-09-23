@@ -1,6 +1,7 @@
-import type { DecodedBlock, DecodedTx, ExpiredEvent, MaturingRecord, Tip, TxEvent, WeirEvent } from '../src/lib/types'
+import type { DecodedBlock, DecodedTx, ExpiredEvent, MaturingRecord, Outpoint, Tip, TxEvent, WeirEvent } from '../src/lib/types'
 import type { SendResult } from '../src/delivery/webhook'
-import { MAX_EVALUATION_AGE_MS, makeEventId, type OutboxRecord } from '../src/store/redis'
+import { outpointField } from '../src/store/keys'
+import { MAX_EVALUATION_AGE_MS, makeEventId, type OutboxRecord, type RecordSeenOutcome, type ReplaceOutcome } from '../src/store/redis'
 
 /**
  * In-memory fakes for engine tests — no redis/bitcoind needed.
@@ -17,6 +18,12 @@ import { MAX_EVALUATION_AGE_MS, makeEventId, type OutboxRecord } from '../src/st
  * (id → deadAt score), plus `tombstones` (txid → doneAt score). Ids come from the REAL
  * `makeEventId`, and every ZSET read sorts by score then member exactly like redis — so
  * the monotonic-id tie order is what `outboxEvents()` (what engine tests assert on) shows.
+ *
+ * `outpoints` models the `outpoint:{txid}:{vout}` claimant SETs (keyed by `{txid}:{vout}`),
+ * maintained by exactly the transitions that maintain them in redis: CLAIM = SADD by
+ * recordSeen and promoteToMaturing (never conflicts), RELEASE = SREM of only the releaser's
+ * own txid by dropPending/replacePending/conflict/finishMaturing/endTracking — from the
+ * record's own `inputs`, like the Lua; an empty set vanishes — and all DELeted by clearTracking.
  */
 
 /** ZSET iteration order: score ascending, ties by member lexicographically (redis semantics). */
@@ -36,6 +43,9 @@ export class FakeStore {
 
   // reorg-displaced txids awaiting re-resolution
   limbo = new Set<string>()
+
+  /** the `outpoint:{txid}:{vout}` SETs: field → claimant txids (pending + maturing spenders); a key with no members does not exist */
+  outpoints = new Map<string, Set<string>>()
 
   // mempool / block scratch sets
   mempoolCurrent = new Set<string>()
@@ -65,6 +75,8 @@ export class FakeStore {
 
   /** the `tombstones` ZSET: txid → doneAt unix ms (tracking ended) */
   tombstones = new Map<string, number>()
+  /** the `retired` ZSET: txid → exitAt unix ms (dropped/replaced; an evaluation started at or before it is refused) */
+  retired = new Map<string, number>()
 
   // meta (settable by tests)
   memory: { usedBytes: number; maxBytes: number | null } = { usedBytes: 0, maxBytes: null }
@@ -245,14 +257,53 @@ export class FakeStore {
 
   // --- record ops (hash-only; do NOT touch the maturing zset index) ---
 
-  /** like Store.readRecord: null when absent, THROWS on a partial (corrupt) hash */
+  /** like Store.readRecord: null when absent, THROWS on a partial (corrupt) hash; a missing `inputs` (pre-outpoint record) reads as [] */
   async readRecord(txid: string): Promise<MaturingRecord | null> {
     const rec = this.records.get(txid)
     if (rec === undefined) return null
     if (rec.height === undefined || rec.blockHash === undefined || rec.matched === undefined || rec.fired === undefined || rec.hex === undefined) {
       throw new Error(`[fakes] corrupt maturing record for ${txid}: missing fields`)
     }
-    return structuredClone(rec as MaturingRecord)
+    return structuredClone({ ...(rec as MaturingRecord), inputs: rec.inputs ?? [] })
+  }
+
+  // --- outpoints (SADD / own-SREM helpers shared by the transitions below) ---
+
+  /** the Lua `pendingUnmined`: in `pending` AND the record exists with height 0 */
+  private pendingUnmined(txid: string): boolean {
+    return this.pending.has(txid) && this.records.get(txid)?.height === 0
+  }
+
+  /** SADD txid into each prevout's claimant set */
+  private claimOutpoints(txid: string, inputs: Outpoint[]): void {
+    for (const o of inputs) {
+      const field = outpointField(o)
+      const set = this.outpoints.get(field) ?? new Set<string>()
+      set.add(txid)
+      this.outpoints.set(field, set)
+    }
+  }
+
+  /** the Lua `release`: from the RECORD's inputs, SREM only this txid (the key vanishes when empty) */
+  private releaseOutpoints(txid: string): void {
+    for (const o of this.records.get(txid)?.inputs ?? []) {
+      const field = outpointField(o)
+      const set = this.outpoints.get(field)
+      if (set === undefined) continue
+      set.delete(txid)
+      if (set.size === 0) this.outpoints.delete(field)
+    }
+  }
+
+  /** SMEMBERS per prevout (pipelined, chunked in the real Store) — prevouts with claimants only, keyed by `{txid}:{vout}` */
+  async outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string[]>> {
+    const owners = new Map<string, string[]>()
+    for (const o of outpoints) {
+      const field = outpointField(o)
+      const set = this.outpoints.get(field)
+      if (set !== undefined && set.size > 0) owners.set(field, [...set])
+    }
+    return owners
   }
 
   // --- transitions that ENQUEUE (state mutation + outbox, one step) ---
@@ -267,23 +318,26 @@ export class FakeStore {
   }
 
   /**
-   * One guarded atomic step (Lua in the real Store): refused (false) when the evaluation is
-   * older than MAX_EVALUATION_AGE_MS; skipped (false) when the txid is already evaluated,
-   * its record already has height > 0 (mined meanwhile), or it is tombstoned (tracking
-   * ended); otherwise record at height 0 + SADD pending + SADD evaluated + enqueue `seen`
-   * when given.
+   * One guarded atomic step (Lua in the real Store): `stale` when the evaluation is older
+   * than MAX_EVALUATION_AGE_MS; `skipped` when the txid is already evaluated, its record
+   * already has height > 0 (mined meanwhile), or it is tombstoned (tracking ended);
+   * otherwise record at height 0 + SADD pending + SADD evaluated + SADD its claims + enqueue
+   * `seen` when given → `recorded`.
    */
-  async recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<boolean> {
-    if (Date.now() - startedAtMs > MAX_EVALUATION_AGE_MS) return false
-    if (this.evaluated.has(rec.txid)) return false
+  async recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<RecordSeenOutcome> {
+    if (Date.now() - startedAtMs > MAX_EVALUATION_AGE_MS) return 'stale'
+    if (this.evaluated.has(rec.txid)) return 'skipped'
     const existing = this.records.get(rec.txid)
-    if (existing !== undefined && (existing.height ?? 0) > 0) return false
-    if (this.tombstones.has(rec.txid)) return false
+    if (existing !== undefined && (existing.height ?? 0) > 0) return 'skipped'
+    if (this.tombstones.has(rec.txid)) return 'skipped'
+    const exitAt = this.retired.get(rec.txid)
+    if (exitAt !== undefined && startedAtMs <= exitAt) return 'stale'
     this.records.set(rec.txid, structuredClone(rec))
     this.pending.add(rec.txid)
     this.evaluated.add(rec.txid)
+    this.claimOutpoints(rec.txid, rec.inputs)
     if (event !== null) this.enqueue(event, Date.now())
-    return true
+    return 'recorded'
   }
 
   /** HSET fired (on a missing txid this CREATES a partial hash, exactly like redis) + enqueue `confirmed` */
@@ -294,12 +348,38 @@ export class FakeStore {
     this.enqueue(event, Date.now())
   }
 
-  /** SREM pending, SREM evaluated, DEL record + enqueue `dropped` */
-  async dropPending(txid: string, event: TxEvent): Promise<void> {
+  /** GUARDED (Lua in the real Store): false, nothing touched, unless pending-unmined; else SREM pending, SREM evaluated, release its outpoints, DEL record + enqueue `dropped` */
+  async dropPending(txid: string, event: TxEvent): Promise<boolean> {
+    if (!this.pendingUnmined(txid)) return false
+    const nowMs = Date.now()
     this.pending.delete(txid)
     this.evaluated.delete(txid)
+    this.releaseOutpoints(txid)
     this.records.delete(txid)
-    this.enqueue(event, Date.now())
+    this.retired.set(txid, nowMs)
+    this.enqueue(event, nowMs)
+    return true
+  }
+
+  /**
+   * Fenced + guarded (Lua in the real Store): false, nothing touched, when the evaluation is
+   * stale or the txid is not pending-unmined (not pending, record missing or mined); else
+   * the dropPending mutation + enqueue `dropped` (reason replaced) — no tombstone.
+   */
+  async replacePending(txid: string, event: TxEvent, startedAtMs: number, spenderTxid: string): Promise<ReplaceOutcome> {
+    const nowMs = Date.now()
+    const spenderExit = this.retired.get(spenderTxid)
+    if (spenderExit !== undefined && startedAtMs <= spenderExit) return 'stale'
+    if (this.tombstones.has(spenderTxid)) return 'stale'
+    if (nowMs - startedAtMs > MAX_EVALUATION_AGE_MS) return 'stale'
+    if (!this.pendingUnmined(txid)) return 'skipped'
+    this.pending.delete(txid)
+    this.evaluated.delete(txid)
+    this.releaseOutpoints(txid)
+    this.records.delete(txid)
+    this.retired.set(txid, nowMs)
+    this.enqueue(event, nowMs)
+    return 'replaced'
   }
 
   /** SREM addresses, ZREM expiries + enqueue `expired` */
@@ -309,22 +389,24 @@ export class FakeStore {
     this.enqueue(event, Date.now())
   }
 
-  /** SREM pending, SREM limbo, DEL record — no event */
+  /** SREM pending, SREM limbo, release its outpoints, DEL record — no event */
   async endTracking(txid: string): Promise<void> {
     this.pending.delete(txid)
     this.limbo.delete(txid)
+    this.releaseOutpoints(txid)
     this.records.delete(txid)
   }
 
   // --- maturing ---
 
-  /** one MULTI: record + index + SREM pending + SREM limbo + SADD evaluated */
+  /** one MULTI: record + index + SREM pending + SREM limbo + SADD evaluated + SADD its claims */
   async promoteToMaturing(rec: MaturingRecord): Promise<void> {
     this.records.set(rec.txid, structuredClone(rec))
     this.maturingIndex.set(rec.txid, rec.height)
     this.pending.delete(rec.txid)
     this.limbo.delete(rec.txid)
     this.evaluated.add(rec.txid)
+    this.claimOutpoints(rec.txid, rec.inputs)
   }
 
   /** one MULTI: record → height 0 / blockHash '' / fired [] + SADD pending + SADD evaluated + SREM limbo + enqueue `demoted` */
@@ -336,19 +418,21 @@ export class FakeStore {
     this.enqueue(event, Date.now())
   }
 
-  /** one MULTI: SREM pending, ZREM maturing, DEL record, SREM limbo, ZADD tombstones + enqueue `conflicted` */
+  /** one Lua: SREM pending, ZREM maturing, release its outpoints, DEL record, SREM limbo, ZADD tombstones + enqueue `conflicted` */
   async conflict(txid: string, event: TxEvent): Promise<void> {
     const nowMs = Date.now()
     this.pending.delete(txid)
     this.maturingIndex.delete(txid)
+    this.releaseOutpoints(txid)
     this.records.delete(txid)
     this.limbo.delete(txid)
     this.tombstones.set(txid, nowMs)
     this.enqueue(event, nowMs)
   }
 
-  /** one MULTI: DEL record, ZREM maturing, ZADD tombstones — tracking ENDED */
+  /** one Lua: release its outpoints, DEL record, ZREM maturing, ZADD tombstones — tracking ENDED */
   async finishMaturing(txid: string, nowMs: number): Promise<void> {
+    this.releaseOutpoints(txid)
     this.records.delete(txid)
     this.maturingIndex.delete(txid)
     this.tombstones.set(txid, nowMs)
@@ -362,6 +446,11 @@ export class FakeStore {
   /** ZREMRANGEBYSCORE tombstones -inf beforeMs */
   async pruneTombstones(beforeMs: number): Promise<void> {
     for (const [txid, at] of [...this.tombstones.entries()]) if (at <= beforeMs) this.tombstones.delete(txid)
+  }
+
+  /** ZREMRANGEBYSCORE retired -inf beforeMs */
+  async pruneRetired(beforeMs: number): Promise<void> {
+    for (const [txid, at] of [...this.retired.entries()]) if (at <= beforeMs) this.retired.delete(txid)
   }
 
   /** ZSET order: by height ascending, ties by txid lexicographically (redis semantics) */
@@ -382,18 +471,35 @@ export class FakeStore {
     this.records.delete(txid)
   }
 
-  /** wipe all tx tracking, keep watches/tip/ring AND the outbox; returns lost txids */
+  /** DEL of every `outpoint:*` set FIRST, then ONE Lua in the real Store (records of the lost txids + every tracking key), then the conditional orphan sweep; keeps watches/tip/ring AND the outbox; returns lost txids */
   async clearTracking(): Promise<string[]> {
+    this.outpoints.clear()
     const lost = new Set<string>([...this.limbo, ...this.pending, ...this.maturingIndex.keys()])
+    for (const txid of lost) {
+      this.releaseOutpoints(txid)
+      this.records.delete(txid)
+    }
     this.maturingIndex.clear()
-    this.records.clear()
     this.pending.clear()
     this.limbo.clear()
     this.evaluated.clear()
     this.mempoolCurrent.clear()
     this.mempoolPostBlock.clear()
     this.blockTxids.clear()
+    await this.sweepOrphanRecords()
     return [...lost]
+  }
+
+  /** the conditional sweep: a record is deleted (its own claims released first) ONLY while its txid is in no live membership (pending, limbo, maturing index) */
+  async sweepOrphanRecords(): Promise<number> {
+    let deleted = 0
+    for (const txid of [...this.records.keys()]) {
+      if (this.pending.has(txid) || this.limbo.has(txid) || this.maturingIndex.has(txid)) continue
+      this.releaseOutpoints(txid)
+      this.records.delete(txid)
+      deleted++
+    }
+    return deleted
   }
 
   // --- outbox (the drainer's surface) ---
@@ -495,11 +601,16 @@ export class FakeSink {
 /** Address every test watches; `mkTx` pays it at vout 0. */
 export const ADDR = 'bcrt1qwatchedwatchedwatched'
 
-/** A decoded tx paying `address` (null = unrecognized script) at vout 0 plus an unwatched change output. */
-export function mkTx(txid: string, address: string | null = ADDR, valueSats = 5000): DecodedTx {
+/**
+ * A decoded tx paying `address` (null = unrecognized script) at vout 0 plus an unwatched
+ * change output. `inputs` default to [] (spends nothing weir could track); RBF/double-spend
+ * tests pass explicit prevouts so two txs can share one.
+ */
+export function mkTx(txid: string, address: string | null = ADDR, valueSats = 5000, inputs: Outpoint[] = []): DecodedTx {
   return {
     txid,
     hex: `hex-${txid}`,
+    inputs: inputs.map((o) => ({ ...o })),
     outputs: [
       { vout: 0, valueSats, address, scriptType: address ? 'p2wpkh' : null },
       { vout: 1, valueSats: 111, address: 'bcrt1qchange', scriptType: 'p2wpkh' },

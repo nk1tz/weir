@@ -32,6 +32,7 @@ describe('txPipeline', () => {
     const tx: DecodedTx = {
       txid: 'tx1',
       hex: 'hex-tx1',
+      inputs: [],
       outputs: [
         { vout: 0, valueSats: 5000, address: ADDR, scriptType: 'p2wpkh' },
         { vout: 2, valueSats: 7000, address: ADDR, scriptType: 'p2wpkh' },
@@ -69,7 +70,7 @@ describe('txPipeline', () => {
     store.isEvaluated = async (txid) => {
       const was = await isEvaluated(txid)
       // the block lands between the evaluator's read and its write
-      await store.promoteToMaturing({ txid: 'tx1', height: 101, blockHash: 'b101', matched: [{ address: ADDR, vout: 0, valueSats: 5000 }], fired: [1], hex: tx.hex })
+      await store.promoteToMaturing({ txid: 'tx1', height: 101, blockHash: 'b101', matched: [{ address: ADDR, vout: 0, valueSats: 5000 }], fired: [1], hex: tx.hex, inputs: [] })
       await store.pruneEvaluated()
       return was
     }
@@ -88,23 +89,31 @@ describe('txPipeline', () => {
     })
 
     it('an evaluation just under the fence records; one just over is refused and leaves the txid un-evaluated', async () => {
-      const { store, evaluate } = setup()
-      store.watches.add(ADDR)
-      const now = Date.now()
+      // The clock is pinned: the boundary is exact, and a millisecond tick between capturing
+      // `now` and the fence check must not turn the "under" case into a refusal.
+      vi.useFakeTimers()
+      vi.setSystemTime(1_700_000_000_000)
+      try {
+        const { store, evaluate } = setup()
+        store.watches.add(ADDR)
+        const now = Date.now()
 
-      await evaluate(mkTx('over'), now - MAX_EVALUATION_AGE_MS - 1)
-      expect(store.evaluated.has('over')).toBe(false) // the next reparse redoes it
-      expect(store.pending.has('over')).toBe(false)
-      expect(store.records.has('over')).toBe(false)
-      expect(store.outboxEvents()).toHaveLength(0)
+        await evaluate(mkTx('over'), now - MAX_EVALUATION_AGE_MS - 1)
+        expect(store.evaluated.has('over')).toBe(false) // the next reparse redoes it
+        expect(store.pending.has('over')).toBe(false)
+        expect(store.records.has('over')).toBe(false)
+        expect(store.outboxEvents()).toHaveLength(0)
 
-      await evaluate(mkTx('under'), now - MAX_EVALUATION_AGE_MS)
-      expect(store.evaluated.has('under')).toBe(true)
-      expect(store.pending.has('under')).toBe(true)
-      expect(seenEvents(store).map((e) => e.txid)).toEqual(['under'])
+        await evaluate(mkTx('under'), now - MAX_EVALUATION_AGE_MS)
+        expect(store.evaluated.has('under')).toBe(true)
+        expect(store.pending.has('under')).toBe(true)
+        expect(seenEvents(store).map((e) => e.txid)).toEqual(['under'])
 
-      await evaluate(mkTx('over'), Date.now()) // a fresh evaluation of the refused txid succeeds
-      expect(seenEvents(store).map((e) => e.txid)).toEqual(['under', 'over'])
+        await evaluate(mkTx('over'), Date.now()) // a fresh evaluation of the refused txid succeeds
+        expect(seenEvents(store).map((e) => e.txid)).toEqual(['under', 'over'])
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('makeRawTxHandler stamps startedAtMs at receipt, before decoding', async () => {

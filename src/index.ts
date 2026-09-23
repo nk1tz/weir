@@ -2,14 +2,15 @@
  * weir daemon entrypoint. Boot sequence per DESIGN.md "src/index.ts":
  *   loadConfig → Store.connect → preflight → startOutboxDrainer → ONE awaited drainOnce →
  *   reconcile (+ resolveLimbo) → startZmq (rawtx → txHandler, rawblock → blockHandler,
- *   gap → reparser) → initial mempool reparse (async) → startHeartbeat → admin server when
- *   ADMIN_TOKEN is set.
+ *   gap → reparser) → initial mempool reparse (async) → periodic reparse timer → startHeartbeat
+ *   → admin server when ADMIN_TOKEN is set.
  * The drainer starts right after preflight and one pass is awaited BEFORE reconcile: events
  * queued before a crash go out first, and their acks free redis memory before reconcile
  * writes (a full redis would otherwise crash-loop at boot); if the endpoint is still down
  * the pass just reschedules. Engine deps get NO sink (they enqueue through the Store); the
  * sink goes only to the drainer and the heartbeat.
- * SIGINT/SIGTERM → close zmq, stop heartbeat, close admin, await drainer.stop(), store.quit, exit 0.
+ * SIGINT/SIGTERM → close zmq, stop the reparse timer, stop heartbeat, close admin, await
+ * drainer.stop(), store.quit, exit 0.
  *
  * The startup banner never prints secrets: webhook target HOST only, and the RPC URL
  * never appears anywhere (it carries credentials).
@@ -25,7 +26,7 @@ import { decodeBlock, decodeRawTx, isValidAddress } from './bitcoin/decoder'
 import { WebhookSink } from './delivery/webhook'
 import { startOutboxDrainer } from './delivery/outbox'
 import { makeRawTxHandler, makeTxEvaluator } from './engine/txPipeline'
-import { makeMempoolReparser } from './engine/mempool'
+import { MEMPOOL_REPARSE_INTERVAL_MS, makeMempoolReparser } from './engine/mempool'
 import { makeBlockHandler, makeBlockProcessor } from './engine/blockPipeline'
 import { resolveLimbo } from './engine/reorg'
 import { startHeartbeat } from './engine/heartbeat'
@@ -111,6 +112,15 @@ async function main(): Promise<void> {
     fatal(CTX, err)
   })
 
+  // Periodic reparse — the retry safety net (DESIGN "Outpoint tracking" rule 7): picks up
+  // evaluations the fence refused and txs ZMQ missed without a sequence gap. Overlap is
+  // skipped by the reparser's mutex; a rejection is an unexpected internal error → fatal.
+  const reparseTimer = setInterval(() => {
+    reparse().catch((err: unknown) => fatal(CTX, err))
+  }, MEMPOOL_REPARSE_INTERVAL_MS)
+  reparseTimer.unref()
+  log.info(CTX, `periodic mempool reparse every ${MEMPOOL_REPARSE_INTERVAL_MS / 1000}s`)
+
   const heartbeat = startHeartbeat({ cfg, store, sink })
 
   let admin: { close(): Promise<void> } | null = null
@@ -133,6 +143,7 @@ async function main(): Promise<void> {
     log.info(CTX, `${signal} received — shutting down`)
     ;(async () => {
       await zmq.close()
+      clearInterval(reparseTimer)
       heartbeat.stop()
       if (admin !== null) await admin.close()
       await drainer.stop() // waits for an in-flight delivery pass

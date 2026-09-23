@@ -13,7 +13,7 @@
 import * as bitcoinjs from 'bitcoinjs-lib'
 import bs58check from 'bs58check'
 import { bech32, bech32m } from 'bech32'
-import type { DecodedBlock, DecodedOutput, DecodedTx, Network, ScriptType } from '../lib/types'
+import type { DecodedBlock, DecodedOutput, DecodedTx, Network, Outpoint, ScriptType } from '../lib/types'
 
 interface AddressPrefixes {
   /** base58check version byte for p2pkh */
@@ -113,10 +113,24 @@ function decodeOutputs(tx: bitcoinjs.Transaction, network: Network): DecodedOutp
   })
 }
 
+/**
+ * Every input's prevout as `{txid, vout}` — the literal bytes of the tx (prev hash reversed
+ * to display order), never resolved. The coinbase input (hash all zeros, index 0xffffffff)
+ * spends nothing and is omitted. Spec: DESIGN "Outpoint tracking" rule 1.
+ */
+function decodeInputs(tx: bitcoinjs.Transaction): Outpoint[] {
+  if (tx.isCoinbase()) return []
+  return tx.ins.map((input): Outpoint => ({
+    txid: Buffer.from(input.hash).reverse().toString('hex'),
+    vout: input.index,
+  }))
+}
+
 function toDecodedTx(tx: bitcoinjs.Transaction, hex: string, network: Network): DecodedTx {
   return {
     txid: tx.getId(),
     hex,
+    inputs: decodeInputs(tx),
     outputs: decodeOutputs(tx, network),
   }
 }

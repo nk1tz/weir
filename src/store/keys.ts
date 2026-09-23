@@ -1,4 +1,4 @@
-import type { Network } from '../lib/types'
+import type { Network, Outpoint } from '../lib/types'
 
 /**
  * The complete redis footprint. `addresses` (and `expiries` alongside it) is the
@@ -31,6 +31,10 @@ export interface Keys {
   mempoolPostBlock: string
   /** SET latest block's txids, intersection scratch space */
   blockTxids: string
+  /** SET per prevout — `outpoint:{txid}:{vout}` → claimant txids (pending + maturing spenders; replacement / proven-conflict detection) */
+  outpointKey: (o: Outpoint) => string
+  /** `outpoint:` — the prefix every outpoint SET key starts with (SCAN pattern; the Lua scripts build keys from it) */
+  outpointPrefix: string
 
   /** ZSET eventId scored by nextAttemptAt unix ms — the durable delivery queue */
   outbox: string
@@ -42,6 +46,8 @@ export interface Keys {
   outboxCreated: string
   /** ZSET txid scored by doneAt unix ms — txids whose tracking ENDED; a stale evaluation must not resurrect them */
   tombstones: string
+  /** ZSET txid scored by exitAt unix ms — the RETIREMENT WATERMARK: txids dropped/replaced (not terminal); an evaluation that STARTED before exitAt must not resurrect them, a later one (a rebroadcast) may */
+  retired: string
 }
 
 export function keysFor(network: Network): Keys {
@@ -59,12 +65,20 @@ export function keysFor(network: Network): Keys {
     mempoolCurrent: `${p}:mempool:current`,
     mempoolPostBlock: `${p}:mempool:postBlock`,
     blockTxids: `${p}:block:txids`,
+    outpointKey: (o: Outpoint) => `${p}:outpoint:${outpointField(o)}`,
+    outpointPrefix: `${p}:outpoint:`,
     outbox: `${p}:outbox`,
     outboxRecord: (eventId: string) => `${p}:outbox:${eventId}`,
     outboxDead: `${p}:outbox:dead`,
     outboxCreated: `${p}:outbox:created`,
     tombstones: `${p}:tombstones`,
+    retired: `${p}:retired`,
   }
+}
+
+/** One prevout as `{txid}:{vout}` — the tail of its SET key and the key of every claimants Map. */
+export function outpointField(o: Outpoint): string {
+  return `${o.txid}:${o.vout}`
 }
 
 /** Idempotency keys — consumers dedupe on these; shape is part of the public contract. */
@@ -73,6 +87,7 @@ export const idem = {
   confirmed: (net: Network, txid: string, milestone: number, blockHash: string) =>
     `${net}:${txid}:confirmed:${milestone}:${blockHash}`,
   dropped: (net: Network, txid: string, tipHeight: number) => `${net}:${txid}:dropped:${tipHeight}`,
+  replaced: (net: Network, txid: string, replacedBy: string) => `${net}:${txid}:dropped:replaced:${replacedBy}`,
   demoted: (net: Network, txid: string, fromBlockHash: string) => `${net}:${txid}:demoted:${fromBlockHash}`,
   conflicted: (net: Network, txid: string) => `${net}:${txid}:conflicted`,
   expired: (net: Network, address: string, expiresAtMs: number) => `${net}:${address}:expired:${expiresAtMs}`,

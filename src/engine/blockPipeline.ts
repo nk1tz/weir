@@ -1,11 +1,22 @@
 /**
- * Block pipeline: the ordered per-block sequence — connectivity (gap/reorg) → mined-watch
- * promotion → milestone sweep → dropped check → TTL sweep → prune/tip/ring, then limbo
- * resolution once the TIP block is done. Spec: docs/DESIGN.md "src/engine/blockPipeline.ts".
+ * Block pipeline: the ordered per-block sequence — connectivity (gap/reorg) → input scan
+ * (replacements + proven conflicts) → mined-watch promotion → milestone sweep → dropped
+ * check → TTL sweep → prune/tip/ring, then limbo resolution once the TIP block is done.
+ * Spec: docs/DESIGN.md "src/engine/blockPipeline.ts" and "Outpoint tracking" rule 4.
  *
  * INVARIANTS
  * - Reorgs use the limbo model (src/engine/reorg.ts): rewind first, then the replacement
  *   chain is a plain connected walk; re-inclusion is discovered by the promotion step.
+ * - INPUT SCAN, before promotion: every block input is resolved against its claimant SET
+ *   (`outpointOwners`, pipelined SMEMBERS). EVERY claimant that is not the spender itself is
+ *   a confirmed double-spend:
+ *   a LIMBO owner → PROVEN `conflict` (reason `double-spend`, conflictingTxid = spender) —
+ *   it leaves limbo here, so `resolveLimbo` never sees it (no second verdict); any other
+ *   owner → `replacePending` (dropped, reason `replaced`, replacedBy = spender), a guarded
+ *   Lua that decides for itself whether the owner is still pending and unmined — no decision
+ *   is taken from the read here (the record is read only to build the payload); a MATURING
+ *   owner outside limbo is impossible on a valid chain → error log, skipped. Running before
+ *   promotion means a limbo tx can never be both re-included and conflicted.
  * - The dropped check, TTL sweep and evaluated-prune run ONLY on the tip block: they compare
  *   against the node's LIVE mempool / wall clock, which is meaningless for historical blocks
  *   during a catch-up walk (a pending tx mined in a LATER missed block would be falsely
@@ -15,6 +26,10 @@
  * - There are NO delivery-failure branches: every event is enqueued in the same store
  *   transition as its state change (markFired, dropPending, expireWatch, demoteToPending,
  *   conflict) and the outbox drainer retries it. The pipeline never holds a sink.
+ * - RETIREMENT WATERMARK: a drop/replacement records its exit time in `retired`; a duplicate
+ *   evaluation that STARTED before that exit cannot resurrect the txid (recordSeen refuses
+ *   it), while a later evaluation — a real rebroadcast — records normally. Pruned with the
+ *   tombstones. Drops never tombstone: a dropped-then-mined tx still confirms here.
  * - TOMBSTONES: when tracking ENDS (final milestone → `finishMaturing`; `conflict`) the txid
  *   is tombstoned for TOMBSTONE_TTL_MS so a stale mempool evaluation (an RPC that read the
  *   tx before the block and returned after the cleanup) cannot resurrect it — the next block
@@ -22,10 +37,10 @@
  *   promotion branch skips tombstoned txids for the same reason. `dropPending` never
  *   tombstones: a rebroadcast may legitimately re-fire `seen`. Pruned on every tip block.
  */
-import type { DecodedBlock, ExpiredEvent, MaturingRecord, Network, TxEvent } from '../lib/types'
+import type { DecodedBlock, ExpiredEvent, MaturingRecord, Network, Outpoint, TxEvent } from '../lib/types'
 import type { Rpc } from '../bitcoin/rpc'
 import type { Store } from '../store/redis'
-import { idem } from '../store/keys'
+import { idem, outpointField } from '../store/keys'
 import { fatal, log } from '../lib/log'
 import { matchAgainst } from './matcher'
 import { enterLimboAndRewind, findForkPoint, type ReorgRpc, type ReorgStore, resolveLimbo } from './reorg'
@@ -51,12 +66,15 @@ export type BlockStore = ReorgStore &
     | 'setBlockTxids'
     | 'pendingInBlock'
     | 'watchedSubset'
+    | 'outpointOwners'
+    | 'replacePending'
     | 'promoteToMaturing'
     | 'markFired'
     | 'removeMaturing'
     | 'finishMaturing'
     | 'isTombstoned'
     | 'pruneTombstones'
+    | 'pruneRetired'
     | 'replacePostBlockMempool'
     | 'droppedPending'
     | 'dropPending'
@@ -99,10 +117,104 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     return watched
   }
 
+  /**
+   * Rule 4, the block-wide input scan: every input of every block tx (coinbase has none)
+   * resolved against its claimant SET (`outpointOwners`, chunked pipelining); EVERY claimant
+   * ≠ its spender adjudicated once (the first spending tx wins when several inputs of one
+   * claimant are spent). Returns the limbo txids that were proven conflicted so the caller's
+   * snapshot forgets them.
+   */
+  async function scanInputs(block: DecodedBlock, height: number, limbo: ReadonlySet<string>): Promise<string[]> {
+    const net = cfg.network
+    const startedAtMs = Date.now() // the block path is serialized: the replacePending fence is formal here
+    const blockTimeMs = block.time * 1000
+    const inputs: Outpoint[] = []
+    const spenderOf = new Map<string, string>()
+    for (const tx of block.txs) {
+      for (const o of tx.inputs) {
+        const field = outpointField(o)
+        if (spenderOf.has(field)) continue // a valid block never spends one prevout twice
+        spenderOf.set(field, tx.txid)
+        inputs.push(o)
+      }
+    }
+    if (inputs.length === 0) return []
+    const owners = await store.outpointOwners(inputs)
+    // claimant → the block txid that spent (one of) its inputs
+    const spentOwner = new Map<string, string>()
+    for (const [field, claimants] of owners) {
+      const spender = spenderOf.get(field)!
+      for (const owner of claimants) if (spender !== owner && !spentOwner.has(owner)) spentOwner.set(owner, spender)
+    }
+
+    const conflicted: string[] = []
+    for (const [owner, spender] of spentOwner) {
+      // The record only feeds the payload; whether there is anything to replace is decided
+      // atomically inside replacePending.
+      const rec = await store.readRecord(owner)
+      if (!rec) {
+        log.info(CTX, `${spender} in ${block.hash} spends an input of ${owner}, whose record is gone (already replaced or dropped) — nothing to do`)
+        continue
+      }
+      if (limbo.has(owner)) {
+        // PROVEN conflict: the new chain spent one of a displaced tx's inputs. Terminal.
+        const lastDepth = rec.fired.length > 0 ? Math.max(...rec.fired) : 0
+        const ev: TxEvent = {
+          version: 1,
+          event: 'conflicted',
+          network: net,
+          txid: owner,
+          confs: lastDepth,
+          matched: rec.matched,
+          blockHeight: rec.height,
+          blockHash: rec.blockHash,
+          hex: rec.hex,
+          reason: 'double-spend',
+          conflictingTxid: spender,
+          idempotencyKey: idem.conflicted(net, owner),
+          timestamp: blockTimeMs,
+        }
+        await store.conflict(owner, ev) // full cleanup + SREM limbo + enqueue, one Lua
+        conflicted.push(owner)
+        log.info(CTX, `conflicted ${owner} (was ${rec.blockHash}@${rec.height}) — input double-spent by ${spender} in ${block.hash}@${height}`)
+        continue
+      }
+      if (rec.height > 0) {
+        log.error(
+          CTX,
+          `${spender} in ${block.hash} spends an input of ${owner}, which is maturing at ${rec.blockHash}@${rec.height} and not in limbo — ` +
+            'impossible on a valid chain; skipping',
+        )
+        continue
+      }
+      // A double-spend confirmed while ours sat in the mempool.
+      const ev: TxEvent = {
+        version: 1,
+        event: 'dropped',
+        network: net,
+        txid: owner,
+        confs: 0,
+        matched: rec.matched,
+        blockHeight: null,
+        blockHash: null,
+        hex: rec.hex,
+        reason: 'replaced',
+        replacedBy: spender,
+        idempotencyKey: idem.replaced(net, owner, spender),
+        timestamp: Date.now(),
+      }
+      const outcome = await store.replacePending(owner, ev, startedAtMs, spender)
+      if (outcome === 'replaced') log.info(CTX, `dropped ${owner} — replaced by ${spender} confirmed in ${block.hash}@${height}`)
+      else if (outcome === 'skipped') log.info(CTX, `${owner} was no longer pending when ${spender} in ${block.hash} was scanned (already replaced) — nothing to do`)
+      else log.warn(CTX, `replacement of ${owner} by mined ${spender} refused (the spender is tombstoned within the TTL) — ${owner} is left to the tip-block dropped check`)
+    }
+    return conflicted
+  }
+
   async function processConnected(block: DecodedBlock, height: number, isTip: boolean): Promise<void> {
     const net = cfg.network
 
-    // ── 2. mined-watch promotion ─────────────────────────────────────────────────────
+    // ── 2. input scan, then mined-watch promotion ────────────────────────────────────
     // Check EVERY block tx against the watch set — not just pending ∩ block — so a payment
     // never seen in the mempool (missed ZMQ, direct-to-block) still confirms. Limbo txids
     // found in the block are reorg re-inclusions: fresh height/blockHash, fired resets,
@@ -110,6 +222,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     await store.setBlockTxids(block.txs.map((t) => t.txid))
     const pendingMined = new Set(await store.pendingInBlock())
     const limbo = new Set(await store.limboTxids())
+    for (const gone of await scanInputs(block, height, limbo)) limbo.delete(gone)
     const watched = await watchedInBlock(block)
     for (const tx of block.txs) {
       const matched = matchAgainst(tx, watched)
@@ -129,6 +242,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
         matched,
         fired: [],
         hex: tx.hex,
+        inputs: tx.inputs,
       }
       // One code path for all three origins: promoteToMaturing is a single MULTI, so a
       // crash can never leave a tx half-promoted. The `evaluated` flag is deliberately NOT
@@ -197,6 +311,8 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     // Both compare against live node state (mempool, wall clock), which is meaningless
     // for historical blocks during a catch-up walk: a pending tx mined in a LATER missed
     // block is absent from the live mempool and would be falsely reported dropped.
+    // Replacements were caught by the input scan (mempool path or above), so what is left
+    // here vanished for another reason: the residual verdict is `evicted`.
     if (isTip) {
       await store.replacePostBlockMempool(await rpc.getRawMempool())
       for (const txid of await store.droppedPending()) {
@@ -212,13 +328,15 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
           blockHeight: null,
           blockHash: null,
           hex: rec?.hex ?? '',
+          reason: 'evicted',
           idempotencyKey: idem.dropped(net, txid, height),
           timestamp: Date.now(),
         }
-        // One MULTI: pending, evaluated (a rebroadcast can legitimately fire `seen` again),
-        // record, + `dropped` enqueued.
-        await store.dropPending(txid, ev)
-        log.info(CTX, `dropped ${txid} — left the mempool without confirming`)
+        // One GUARDED Lua: pending, evaluated (a rebroadcast can legitimately fire `seen`
+        // again), record, outpoints it still owns, + `dropped` enqueued — or nothing, when a
+        // mempool replacement already handled the txid since droppedPending() was read.
+        if (await store.dropPending(txid, ev)) log.info(CTX, `dropped ${txid} — left the mempool without confirming`)
+        else log.info(CTX, `${txid} left pending while the dropped check ran (already replaced) — nothing to do`)
       }
 
       const now = Date.now()
@@ -240,6 +358,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     if (isTip) {
       await store.pruneEvaluated()
       await store.pruneTombstones(Date.now() - TOMBSTONE_TTL_MS)
+      await store.pruneRetired(Date.now() - TOMBSTONE_TTL_MS)
     }
     await store.setTip({ hash: block.hash, height })
     await store.ringPut(height, block.hash)

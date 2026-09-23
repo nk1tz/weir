@@ -53,7 +53,6 @@ awaiting re-resolution (re-included by the new chain / demoted to mempool / conf
 in redis so a crash mid-reorg finishes resolving on the next block or boot.
 Outpoints: `outpoint:{txid}:{vout}` SET of claimant txids (inputs of pending + maturing
 txs; see Outpoint tracking).
-under force that could not claim the field (see Outpoint tracking rule 2).
 Outbox (durable): `outbox` ZSET member=eventId score=nextAttemptAt-ms (the delivery queue);
 `outbox:{eventId}` HASH {payload(JSON WeirEvent), event, idempotencyKey, attempts, createdAt,
 lastError}; `outbox:created` ZSET member=eventId score=createdAt-ms (mirrors `outbox`
@@ -64,12 +63,23 @@ hashes). eventId = `<nowMs padded 15>-<seq within that ms padded 8>-<8 hex rando
 redis' tie order for equal scores (by member) is enqueue order.
 Tombstones (durable, self-pruning): `tombstones` ZSET member=txid score=doneAt-ms — txids
 whose tracking ENDED (final milestone, conflicted); a stale mempool evaluation must not
-resurrect them (see `recordSeen`). Pruned on every tip block below now − TOMBSTONE_TTL_MS
-(3,600,000; constant). The tombstone bounds the STORE side; the EVALUATION FENCE
-(`MAX_EVALUATION_AGE_MS` = 600,000, far below the TTL) bounds the evaluator side, so no
-evaluation can outlive the tombstone that guards it. `conflicted` needs no permanent set: an
-invalid tx cannot re-enter the mempool, and the only other path back, a stale evaluation, is
-fenced.
+resurrect them (see `recordSeen`), and the block path's never-seen promotion skips them.
+ABSOLUTE: any evaluation of a tombstoned txid is refused. Pruned on every tip block below
+now − TOMBSTONE_TTL_MS (3,600,000; constant). The tombstone bounds the STORE side; the
+EVALUATION FENCE (`MAX_EVALUATION_AGE_MS` = 600,000, far below the TTL) bounds the evaluator
+side, so no evaluation can outlive the tombstone that guards it. `conflicted` needs no
+permanent set: an invalid tx cannot re-enter the mempool, and the only other path back, a
+stale evaluation, is fenced.
+Retirement watermark (durable, self-pruning): `retired` ZSET member=txid score=exitAt-ms —
+txids that LEFT pending without ending (`dropPending`, `replacePending`; same Lua). NOT a
+tombstone: a drop is not terminal (a rebroadcast may re-fire `seen`, and a dropped-then-mined
+tx must still confirm through the block path), so the watermark is RELATIVE: `recordSeen`
+refuses (stale) an evaluation whose `startedAtMs <= exitAt` — a duplicate evaluation (ZMQ
+rawtx + reparse fetch) that was in flight when the tx left would otherwise resurrect it as a
+fresh pending record and earn a second `dropped` under a different key — while an evaluation
+started after the exit (a real rebroadcast) records normally and leaves the watermark in
+place (the next exit overwrites it). Pruned with the tombstones (same TTL; only the window
+inside MAX_EVALUATION_AGE_MS matters).
 
 ## Events (src/lib/types.ts — WRITTEN)
 
@@ -104,7 +114,8 @@ Rules:
    `recordSeen`, `replacePending` and `dropPending`, because they race other paths (a tx can
    be mined, or replaced from the mempool, while a caller is between its read and its write)
    and need guards a MULTI cannot express, and every transition that releases outpoints
-   (`conflict`, `finishMaturing`, `endTracking` too), whose owner-only HDEL is conditional.
+   (`conflict`, `finishMaturing`, `endTracking` too), whose release reads the record's
+   `inputs` and SREMs only the releaser's own txid from each claimant SET.
    GUARDS: a transition re-validates live state INSIDE its Lua wherever two writers can
    race. The mempool evaluator races the block pipeline, so `recordSeen`, `replacePending`
    and the tip-check `dropPending` are guarded (evaluated / mined / tombstoned / pendingUnmined
@@ -144,7 +155,7 @@ Rules:
    passes never overlap and never double-send.
 8. EVALUATION FENCE: every evaluation carries `startedAtMs` — captured at ZMQ rawtx receipt
    (makeRawTxHandler) and, in the reparser, immediately BEFORE getrawtransaction is issued.
-   `recordSeen(rec, event, startedAtMs)` refuses (returns false, warns with the age) when
+   `recordSeen(rec, event, startedAtMs)` refuses (`stale`, warns with the age) when
    `now − startedAtMs > MAX_EVALUATION_AGE_MS` (600,000, exported from src/store/redis.ts;
    MUST stay far below TOMBSTONE_TTL_MS). The check runs inside the Lua, atomically with the
    other guards. A refused evaluation leaves the txid un-evaluated: the next reparse redoes
@@ -182,23 +193,36 @@ Rules:
      record (`dropPending`, `replacePending`, `conflict`, `finishMaturing`, `endTracking` —
      each reads `inputs` from the record it deletes). The key vanishes when empty. Nobody
      else's claim is ever touched. `demoteToPending` keeps claims (the tx stays tracked).
-   - `clearTracking` DELs every `outpoint:*` key (SCAN + DEL after its main Lua). A claimant
-     without a record is skipped by every reader, so a stray claim is harmless.
+   - `clearTracking` DELs every `outpoint:*` key (SCAN + DEL BEFORE its main Lua — the bulk
+     pass); its main Lua and the orphan sweep also release each record's OWN claims before
+     deleting the record, so a `recordSeen` landing between the bulk pass and the Lua leaves
+     no orphan claim. A claimant without a record is skipped by every reader anyway, so a
+     stray claim would be harmless, just unbounded.
 3. REPLACEMENT (mempool path, src/engine/txPipeline.ts) — ONE pass, no rounds:
    `isEvaluated` → evaluation fence (a stale view is refused before anything is mutated) →
    `outpointOwners(inputs)` (pipelined SMEMBERS, self excluded) → for EVERY distinct owner:
    read its record only to build the payload (gone → nothing to do); record unmined →
-   `replacePending(owner, ev, startedAtMs)` — ONE Lua that atomically applies the fence
-   (-1), requires `pendingUnmined` (in `pending` AND record exists with height 0, else 0:
+   `replacePending(owner, ev, startedAtMs, spender)` — ONE Lua that atomically checks the
+   SPENDER's own state first (the spender retired at an exit ≥ `startedAt`, or tombstoned →
+   `stale`, nothing written: an evaluation that predates its own tx's exit may not act on
+   anyone — an old evaluation of A would otherwise replace the B that replaced A), then
+   applies the fence (-1), requires `pendingUnmined` (in `pending` AND record exists with height 0, else 0:
    nothing written, nothing enqueued — a second caller, or one the block pipeline overtook,
    finds it already handled), then SREM pending, SREM evaluated (the original may return if
    the replacement is itself dropped), release its claims, DEL record, + enqueue `dropped`
    with `reason: 'replaced'`, `replacedBy: <this txid>`, key
-   `{net}:{owner}:dropped:replaced:{replacedBy}` → 1; record MINED (maturing/limbo) → a
-   mempool tx cannot displace a confirmed tx (bitcoind would not have relayed it; during reorg
-   lag the block path adjudicates it — rule 4): warn, skip. Then match outputs; a watched tx
-   is recorded with `recordSeen` (outcome `'recorded' | 'skipped' | 'stale'`), which claims its
-   inputs. Documented imprecision: two spenders of one outpoint arriving CONCURRENTLY can both
+   `{net}:{owner}:dropped:replaced:{replacedBy}` → 1, and ZADD the retirement watermark
+   (`retired`, score = now); record MINED (maturing/limbo) → a mempool tx cannot displace a
+   confirmed tx (bitcoind would not have relayed it; during reorg lag the block path
+   adjudicates it — rule 4): warn, skip. `replacePending` resolves `'replaced' | 'skipped' |
+   'stale'`; if ANY adjudication of the pass came back `stale`, the evaluator stops WITHOUT
+   `markEvaluated` (an unwatched spender marked evaluated would never be re-fetched while the
+   tx it replaced stayed pending): the next reparse redoes the whole evaluation with a fresh
+   `startedAt`. Then match outputs; no match → `markEvaluated`, but only after the same
+   TS-side age check (`now − startedAtMs > MAX_EVALUATION_AGE_MS` → return without marking);
+   a watched tx is recorded with `recordSeen` (outcome `'recorded' | 'skipped' | 'stale'` —
+   `stale` also when the evaluation predates the txid's retirement watermark), which claims
+   its inputs. Documented imprecision: two spenders of one outpoint arriving CONCURRENTLY can both
    see no prior owner and both be recorded; bitcoind keeps only one, and the loser is
    reported `dropped` with `reason: 'evicted'` at the next tip check rather than `replaced`
    immediately — a labelling difference, never a lost verdict.
@@ -209,8 +233,10 @@ Rules:
      spender, `reason: 'double-spend'`, timestamp = blockTime*1000;
    - owner's record MINED (height > 0) and not in limbo → impossible on a valid chain; log
      error, skip;
-   - otherwise → `replacePending(owner, ev, scanStartMs)` with `replacedBy` = the confirmed
-     spender (a double-spend confirmed while ours sat in the mempool); the Lua decides.
+   - otherwise → `replacePending(owner, ev, scanStartMs, spender)` with `replacedBy` = the
+     confirmed spender (a double-spend confirmed while ours sat in the mempool); the Lua
+     decides (a `stale` here means the mined spender is tombstoned within the TTL — warned,
+     the owner is left to the tip-block dropped check).
    Every claimant of a spent outpoint is adjudicated (a field may have several). Running
    before promotion means a limbo tx cannot be both re-included and conflicted by one block.
 5. `resolveLimbo` keeps its by-elimination fallback (`getmempoolentry` → demoted, else
@@ -228,13 +254,17 @@ Rules:
 
 Store surface: `outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string[]>>`
 (field → claimant txids, empty fields omitted, chunked pipelining), `replacePending(txid,
-event, startedAtMs): Promise<boolean>` (rule 3; false = nothing done), `recordSeen(rec,
-event, startedAtMs): Promise<'recorded' | 'skipped' | 'stale'>`, `promoteToMaturing` (claims
-via SADD), and the releasing Luas `dropPending(txid, event): Promise<boolean>` (guarded like
-replacePending, unfenced), `conflict(txid, event)`, `finishMaturing(txid, nowMs)`,
-`endTracking(txid)` — they read the record's own `inputs`, callers pass nothing.
-`clearTracking` (one Lua for records + tracking keys, then SCAN-DEL of `outpoint:*`) and
-`sweepOrphanRecords` (per-record conditional Lua). Idempotency: `idem.replaced(net, txid,
+event, startedAtMs, spenderTxid): Promise<'replaced' | 'skipped' | 'stale'>` (rule 3; only
+`replaced` wrote anything), `recordSeen(rec, event, startedAtMs): Promise<'recorded' | 'skipped' |
+'stale'>`, `promoteToMaturing` (claims via SADD), and the releasing Luas `dropPending(txid,
+event): Promise<boolean>` (guarded like replacePending, unfenced; both ZADD `retired`),
+`conflict(txid, event)`, `finishMaturing(txid, nowMs)`, `endTracking(txid)` — they read the
+record's own `inputs`, callers pass nothing. `pruneRetired(beforeMs)` (tip blocks, same TTL
+as `pruneTombstones`). `clearTracking` (SCAN-DEL of `outpoint:*` FIRST, then one Lua that
+releases each collected record's own claims and DELs records + tracking keys, then
+`sweepOrphanRecords` — a `recordSeen` landing after the Lua keeps its record, memberships
+and claims; one landing before it leaves no orphan claim) and `sweepOrphanRecords`
+(per-record conditional Lua that also releases the record's own claims). Idempotency: `idem.replaced(net, txid,
 replacedBy)`; `conflicted` keeps its single key (one terminal verdict per txid).
 
 ## Module map and contracts
@@ -360,11 +390,11 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   invariant).
 - transitions that ENQUEUE (each one MULTI = state mutation + outbox HSET/ZADD; see Outbox):
   `recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<'recorded' | 'skipped' | 'stale'>`
-  — HSET record (height 0), SADD pending, SADD evaluated, claim `outpoints` field → txid
-  with HSETNX for each of `rec.inputs` (KEYS[8]; ARGV[14] = inputs JSON, ARGV[15] = the
-  `{txid}:{vout}` fields joined by ',', ARGV[16] = force), + enqueue when event is non-null
-  (null when seen is disabled); returns `{conflicts}` (nothing written) when a field is owned
-  by another txid and force is off (Outpoint tracking rule 2). ONE Lua script, FENCED (refused when now − startedAtMs >
+  — HSET record (height 0), SADD pending, SADD evaluated, claim each of `rec.inputs` (SADD
+  txid into `outpoint:{txid}:{vout}`; ARGV[14] = inputs JSON, ARGV[15] = the `{txid}:{vout}`
+  fields joined by ',', ARGV[16] = the key prefix the Lua builds the SET names from —
+  single-instance redis, see Topology), + enqueue when event is non-null (null when seen is
+  disabled). ONE Lua script, FENCED (refused when now − startedAtMs >
   MAX_EVALUATION_AGE_MS, see Outbox rule 8) and GUARDED: a no-op (resolves false) when `evaluated` already
   holds the txid (a duplicate concurrent evaluation), or the record already has height > 0
   (the block pipeline mined + promoted it between this evaluation's read and its write —
@@ -372,33 +402,38 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   txid is TOMBSTONED (tracking already ended and the record is GONE, so the first two guards
   cannot see it: a mempool RPC that read the tx before the block and returned after the
   final-milestone cleanup would otherwise recreate a height-0 pending record and the next
-  block would emit a false `dropped` for a confirmed payment);
+  block would emit a false `dropped` for a confirmed payment); and `stale` (code -3, warned)
+  when the txid is RETIRED at an exit time ≥ `startedAtMs` (a duplicate evaluation that
+  predates a drop/replacement — see Redis schema, retirement watermark);
   `markFired(txid, fired: number[], event: TxEvent)` — HSET fired + enqueue `confirmed`
   (fired is recorded at ENQUEUE time; delivery retry is the outbox's job);
   `dropPending(txid, event: TxEvent): Promise<boolean>` — ONE GUARDED Lua: not
   pending-unmined → 0 (nothing written, false); else SREM pending, SREM evaluated, release its
-  outpoints (owner-only HDEL from the record's `inputs`, with waitlist handover), DEL record,
-  + enqueue (`reason: 'evicted'`) → true;
-  `replacePending(txid, event: TxEvent, startedAtMs): Promise<boolean>` — ONE Lua: fence →
-  -1; not pending-unmined (not pending, record missing, or mined) → 0 (nothing written); else
-  the dropPending mutation + enqueue `dropped` with `reason: 'replaced'` → 1 (see Outpoint
+  claims (SREM its own txid from each prevout SET in the record's `inputs`), DEL record, ZADD
+  `retired` score=now (the retirement watermark), + enqueue (`reason: 'evicted'`) → true;
+  `replacePending(txid, event: TxEvent, startedAtMs, spenderTxid): Promise<'replaced' | 'skipped' | 'stale'>`
+  — ONE Lua: the spender retired at an exit ≥ startedAtMs, or tombstoned → -3 (`stale`,
+  warned); fence → -1 (`stale`, warned); not pending-unmined (not pending, record missing,
+  or mined) → 0 (`skipped`, nothing written); else the dropPending mutation (watermark
+  included) + enqueue `dropped` with `reason: 'replaced'` → 1 (`replaced`) (see Outpoint
   tracking rule 3; no tombstone — not a terminal verdict);
   `demoteToPending(rec, event: TxEvent)` — HSET record back to height 0/blockHash ''/fired [],
   SADD pending, SADD evaluated, SREM limbo, + enqueue `demoted` (`evaluated` is part of it
   because the tip prune forgot the txid when it was mined; without it the next reparse would
   emit a second `seen`);
   `conflict(txid, event: TxEvent)` — ONE Lua: SREM pending, ZREM maturing, release its
-  outpoints, DEL record, SREM limbo, ZADD tombstones, + enqueue;
+  claims, DEL record, SREM limbo, ZADD tombstones, + enqueue;
   `expireWatch(addr, event: ExpiredEvent)` — SREM addresses, ZREM expiries, + enqueue;
-  `endTracking(txid)` — ONE Lua: SREM pending, SREM limbo, release its outpoints, DEL record
+  `endTracking(txid)` — ONE Lua: SREM pending, SREM limbo, release its claims, DEL record
   (no event: watch removed mid-flight);
-  `finishMaturing(txid, nowMs)` — ONE Lua: release its outpoints, DEL record, ZREM maturing,
+  `finishMaturing(txid, nowMs)` — ONE Lua: release its claims, DEL record, ZREM maturing,
   ZADD tombstones score=nowMs (no event: the final-milestone cleanup — tracking ENDED). `dropPending` deliberately does NOT
   tombstone: a rebroadcast may legitimately re-fire `seen`.
 - tombstones: `isTombstoned(txid)` (ZSCORE non-nil), `pruneTombstones(beforeMs)`
-  (ZREMRANGEBYSCORE -inf beforeMs; the tip block calls it with now − TOMBSTONE_TTL_MS).
+  (ZREMRANGEBYSCORE -inf beforeMs; the tip block calls it with now − TOMBSTONE_TTL_MS);
+  `pruneRetired(beforeMs)` — the same prune for the retirement watermark.
 - maturing: `promoteToMaturing(rec: MaturingRecord)` — THE mined-tx promotion, one MULTI:
-  HSET record, ZADD maturing, SREM pending, SREM limbo, SADD evaluated, HSETNX per outpoint (every promotion
+  HSET record, ZADD maturing, SREM pending, SREM limbo, SADD evaluated, SADD into each prevout SET (every promotion
   branch uses it, so a crash cannot leave a half-promoted tx; no event — confirmations come
   from the milestone sweep), `maturingEntries(): Promise<Array<{txid: string; height: number}>>`,
   `removeMaturing(txid)` (DEL record + ZREM — dangling-index cleanup only; the final-milestone
@@ -410,15 +445,19 @@ unhandled, never swallowed. A subscriber-loop failure (other than close()) is fa
   only by transitions (`dropPending`, `conflict`, `endTracking`, `removeMaturing`).
 - limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`
   (demotion is `demoteToPending` above).
-- outpoints: `outpointOwners(outpoints)` (HMGET chunked at 1000; hits only; contract under
-  Outpoint tracking).
-- `sweepOrphanRecords(): Promise<number>` — SCAN `maturing:*`; each record is deleted by its
-  own Lua ONLY while its txid has no live membership (not pending, not in limbo, not in the
-  maturing index) — a record a concurrent `recordSeen`/promotion just created is left alone.
-- `clearTracking(): Promise<string[]>` — prune-window guard: collect the txids of limbo +
-  pending + maturing, then ONE Lua DELs their records AND the tracking keys (maturing index,
-  pending, limbo, evaluated, mempool scratch, block txids, outpoints, outpoints:waiting)
-  atomically, then `sweepOrphanRecords()`. PRESERVING watches/expiries/tip/ring AND the
+- outpoints: `outpointOwners(outpoints): Promise<Map<string, string[]>>` (one SMEMBERS per
+  prevout, pipelined in chunks of 1000; prevouts with claimants only; contract under Outpoint
+  tracking).
+- `sweepOrphanRecords(): Promise<number>` — SCAN `maturing:*`; each record's own claims are
+  released and the record deleted by its own Lua ONLY while its txid has no live membership
+  (not pending, not in limbo, not in the maturing index) — a record a concurrent
+  `recordSeen`/promotion just created is left alone.
+- `clearTracking(): Promise<string[]>` — prune-window guard: SCAN + DEL every `outpoint:*`
+  SET (the bulk pass), collect the txids of limbo + pending + maturing, then ONE Lua releases
+  each of their records' own claims, DELs the records AND the tracking keys (maturing index,
+  pending, limbo, evaluated, mempool scratch, block txids) atomically, then
+  `sweepOrphanRecords()` — so a `recordSeen` landing after the Lua keeps its record,
+  memberships and claims, and one landing before it leaves no orphan claim. PRESERVING watches/expiries/tip/ring AND the
   outbox (queued events are still owed); returns the txids whose tracking was lost.
 - outbox: `outboxDue`, `outboxRead`, `outboxAck`, `outboxRetry`, `outboxDead`, `outboxStats`
   (contracts under Outbox).
@@ -462,14 +501,15 @@ yields 2 entries).
 `export function makeTxEvaluator(deps): (tx: DecodedTx, startedAtMs: number) => Promise<void>` and
 `export function makeRawTxHandler(deps): (raw: Buffer) => Promise<void>` (startedAtMs =
 receipt time, then decode → evaluate).
-Evaluate: if `isEvaluated` → return. Fence (refuse a stale evaluation, warn, leave
-un-evaluated). Replacement check (Outpoint tracking rule 3). Match. If no match →
-markEvaluated, done. If match:
+Evaluate — ONE pass (Outpoint tracking rule 3): if `isEvaluated` → return. Fence (refuse a
+stale evaluation, warn, leave un-evaluated). Replacement check: `outpointOwners(inputs)`,
+every distinct claimant ≠ this txid → its record (gone → skip; mined → warn, skip; unmined →
+the guarded `replacePending`); any `stale` outcome → warn, return WITHOUT markEvaluated.
+Match. If no match → the TS-side age check, then markEvaluated, done. If match:
 build the `seen` TxEvent (confs 0, block fields null, timestamp now) when seenEnabled, then
-the claim loop: `recordSeen(rec, event | null, startedAtMs, force)` — one atomic fenced +
-guarded step, nothing awaited from the network; `skipped` (a concurrent path already tracks
-or mined the tx) / `stale` is logged and is the end of the evaluation; `{conflicts}` →
-`replacePending` each, retry (rule 3: force after a round that replaced nothing, or the third).
+`recordSeen(rec, event | null, startedAtMs)` — one atomic fenced + guarded step that also
+claims the inputs, nothing awaited from the network; `skipped` (a concurrent path already
+tracks or mined the tx) / `stale` is logged and is the end of the evaluation.
 The old "delivery failed → leave un-evaluated" path no longer exists: the outbox owns retry.
 
 ### src/engine/mempool.ts
@@ -479,7 +519,8 @@ concurrency 32): startedAtMs = now → getRawTransactionVerbose → decode → e
 startedAtMs) (reuse txPipeline evaluator; the fence clock starts BEFORE the RPC);
 tx that vanished (null) is skipped; tx that was mined meanwhile (`blockhash` set) is skipped
 too — the block pipeline owns mined txs and a `seen` for it would be false. Then
-clearCurrentMempool.
+clearCurrentMempool. Exports `MEMPOOL_REPARSE_INTERVAL_MS` (300 000, constant): index.ts runs
+the reparser on that interval as the retry safety net (Outpoint tracking rule 7).
 
 ### src/engine/reorg.ts
 `export async function findForkPoint(deps, incomingPrevHash: string, incomingHeight: number):
@@ -525,9 +566,10 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    ancestor+1 .. h-1 via getBlockHash → getBlockRaw → process (in order, as NON-tip blocks),
    then B itself. After the OUTERMOST (tip) block completes: `resolveLimbo`.
 2. per connected block: decodeBlock → setBlockTxids → `pendingInBlock()` + `limboTxids()` →
-   the INPUT SCAN (Outpoint tracking rule 4: every block input → `outpointOwners`, one chunked
-   HMGET; limbo owner → proven `conflict` with `timestamp = blockTime*1000`, and the local
-   limbo snapshot forgets it; any other unmined owner → the guarded `replacePending`) →
+   the INPUT SCAN (Outpoint tracking rule 4: every block input → `outpointOwners`, chunked
+   pipelined SMEMBERS; for EVERY claimant ≠ its spender: limbo → proven `conflict` with
+   `timestamp = blockTime*1000`, and the local limbo snapshot forgets it; mined and not in
+   limbo → error, skip; otherwise the guarded `replacePending`) →
    resolve the block's DISTINCT output addresses with `watchedSubset` ONCE (chunked at 1000
    addresses) → `matchAgainst` per tx: for each block tx that matches (check EVERY block tx,
    not just pending ∩ block — a payment never seen in the mempool still confirms): build
@@ -553,13 +595,13 @@ a block B (hash H, prev P, height h from getBlockHeader(H)):
    height 0 / blockHash '' — a dropped tx cannot be re-fetched from a pruned node. The
    `maturing` ZSET still only indexes MINED txs; the record exists from seen onward):
    `dropPending(txid, ev)` — one GUARDED Lua (pending, evaluated so a rebroadcast can re-fire
-   `seen`, record, the outpoints it still owns, + enqueue) with `reason: 'evicted'`, a no-op
+   `seen`, record, its own claims, + enqueue) with `reason: 'evicted'`, a no-op
    (false, logged) when the txid is no longer pending-unmined — a mempool replacement that
    landed since `droppedPending()` was read already gave the verdict; replacements are the
    input scans' job.
 5. TTL sweep — TIP BLOCKS ONLY: dueExpiries(now) → `expireWatch(addr, ev)` (one MULTI).
-6. pruneEvaluated + pruneTombstones(now − TOMBSTONE_TTL_MS) (tip only), setTip({hash: H,
-   height: h}), ringPut, ringPrune(ringSize).
+6. pruneEvaluated + pruneTombstones + pruneRetired (both now − TOMBSTONE_TTL_MS; tip only),
+   setTip({hash: H, height: h}), ringPut, ringPrune(ringSize).
 A tracked tx that no longer matches any watch → `endTracking(txid)` (no event).
 There are no delivery-failure branches in the engine: every event is enqueued atomically
 with its state change and the outbox retries it.
@@ -594,9 +636,12 @@ unconditionally right after `reconcile` returns (a crash between limbo-rewind an
 must not leave displaced txs unadjudicated until the next block; no-op when limbo is empty).
 
 ### src/admin/server.ts
-`export function startAdminServer(deps): {close(): Promise<void>; port: Promise<number>}` —
+`export function startAdminServer(deps, onFatal = fatal): {close(): Promise<void>; port: Promise<number>}` —
 node:http only, no framework. Only constructed when adminToken set. `port` resolves with
-the bound port once listening (`ADMIN_PORT=0` = ephemeral; tests use it). Every route
+the bound port once listening (`ADMIN_PORT=0` = ephemeral; tests use it) and REJECTS with
+the listen error (EADDRINUSE, EACCES) when the server errors before listening — a caller
+awaiting it fails fast with the real cause; the error still takes the fatal path
+(`onFatal` is injectable for tests only). Every route
 (except /health) requires `authorization: Bearer <ADMIN_TOKEN>` (timingSafeEqual) → 401 otherwise.
 - `POST /watches` body `{address: string, ttl?: number}` → validate with isValidAddress →
   422 `{error}` on invalid; addWatch(+expiry from ttl ?? watchDefaultTtl when > 0) → 201
@@ -618,9 +663,12 @@ never fatal); a server `'error'` event (listen failure) → `fatal` (background 
 loadConfig → Store.connect → preflight → startOutboxDrainer → ONE awaited `drainOnce()`
 (logged; acks free memory before reconcile writes under a full redis) → reconcile →
 resolveLimbo → startZmq (rawtx → txHandler, rawblock → blockHandler, gap → reparser) →
-initial mempool reparse (async) → startHeartbeat → admin server if token. Engine deps get
-NO sink (they enqueue); the sink goes only to the drainer and the heartbeat. SIGINT/SIGTERM
-→ close zmq, stop heartbeat, close admin, await drainer.stop(), store.quit, exit 0.
+initial mempool reparse (async) → periodic reparse timer (`setInterval(reparse,
+MEMPOOL_REPARSE_INTERVAL_MS)`, unref'd; the reparser's mutex skips overlap; a rejection is
+fatal — background path) → startHeartbeat → admin server if token. Engine deps get NO sink
+(they enqueue); the sink goes only to the drainer and the heartbeat. SIGINT/SIGTERM → close
+zmq, clear the reparse timer, stop heartbeat, close admin, await drainer.stop(), store.quit,
+exit 0.
 Log a startup banner: version, network, milestones, webhook target host, admin on/off.
 
 ## Coding conventions

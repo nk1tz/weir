@@ -445,7 +445,9 @@ describe('lifecycle', () => {
       expect(MAX_EVALUATION_AGE_MS).toBeLessThan(TOMBSTONE_TTL_MS)
     })
 
-    it('dropped does NOT tombstone: a rebroadcast re-fires seen', async () => {
+    it('dropped does NOT tombstone: a rebroadcast (an evaluation started AFTER the drop) re-fires seen; one started before it is refused', async () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(1_700_000_000_000)
       const { store, chain, register, evaluate, process } = wire()
       store.watches.add(ADDR)
       const tx1 = register(mkTx('tx1'))
@@ -455,11 +457,21 @@ describe('lifecycle', () => {
       await evaluate(tx1, Date.now())
       chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [] })
       chain.mempool = [] // gone without being mined
+      const beforeDrop = Date.now()
+      vi.setSystemTime(beforeDrop + 1000)
       await process(chain.raw('b101'))
       expect(enqueued(store)).toEqual(['seen', 'dropped'])
+      expect((store.outboxEvents()[1] as TxEvent).reason).toBe('evicted')
       expect(store.tombstones.size).toBe(0)
+      expect(store.retired.get('tx1')).toBe(beforeDrop + 1000) // the retirement watermark, not a tombstone
 
-      await evaluate(tx1, Date.now()) // rebroadcast
+      await evaluate(tx1, beforeDrop) // a duplicate evaluation that was in flight when it dropped: refused
+      expect(enqueued(store)).toEqual(['seen', 'dropped'])
+      expect(store.pending.has('tx1')).toBe(false)
+      expect(store.evaluated.has('tx1')).toBe(false)
+
+      vi.setSystemTime(beforeDrop + 2000)
+      await evaluate(tx1, Date.now()) // a real rebroadcast
 
       expect(enqueued(store)).toEqual(['seen', 'dropped', 'seen'])
       expect(store.pending.has('tx1')).toBe(true)

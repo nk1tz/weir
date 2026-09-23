@@ -93,7 +93,10 @@ function requireAdminToken(token: string | null): string {
   return token
 }
 
-export function startAdminServer(deps: AdminDeps): { close(): Promise<void>; port: Promise<number> } {
+export function startAdminServer(
+  deps: AdminDeps,
+  onFatal: (ctx: string, err: unknown) => void = fatal,
+): { close(): Promise<void>; port: Promise<number> } {
   const token = requireAdminToken(deps.config.adminToken)
 
   async function handleHealth(res: ServerResponse): Promise<void> {
@@ -266,20 +269,30 @@ export function startAdminServer(deps: AdminDeps): { close(): Promise<void>; por
     })
   })
 
-  // A server-level error (listen failure such as EADDRINUSE) has no request to answer with
-  // a 500 — it is a background failure, so it takes the one fatal exit path. Per-request
-  // failures are answered 500 above and never crash the daemon.
-  server.on('error', (err) => fatal('admin', err))
-
-  // Resolves with the BOUND port once listening (adminPort 0 = ephemeral, used by tests).
-  // Never rejects: a listen failure surfaces through the server 'error' handler above.
-  const port = new Promise<number>((resolve) => {
+  // Resolves with the BOUND port once listening (adminPort 0 = ephemeral, used by tests);
+  // REJECTS with the listen error (EADDRINUSE, EACCES, ...) when the server errors before it
+  // is listening, so a caller awaiting the port fails fast with the real cause instead of
+  // hanging. `onFatal` is injectable for tests only; production callers use the default.
+  let listening = false
+  let rejectPort!: (err: Error) => void
+  const port = new Promise<number>((resolve, reject) => {
+    rejectPort = reject
     server.listen(deps.config.adminPort, () => {
+      listening = true
       const addr = server.address()
       const bound = typeof addr === 'object' && addr !== null ? addr.port : deps.config.adminPort
       log.info('admin', `listening on :${bound}`)
       resolve(bound)
     })
+  })
+
+  // A server-level error (listen failure such as EADDRINUSE) has no request to answer with
+  // a 500 — it is a background failure, so it takes the one fatal exit path (after the port
+  // promise has been rejected, so tests and boot code see the error). Per-request failures
+  // are answered 500 above and never crash the daemon.
+  server.on('error', (err) => {
+    if (!listening) rejectPort(err)
+    onFatal('admin', err)
   })
 
   return {

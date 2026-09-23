@@ -17,6 +17,13 @@ export interface MempoolReparserDeps {
 
 const FETCH_CONCURRENCY = 32
 
+/**
+ * How often index.ts runs the reparser unprompted (DESIGN "Outpoint tracking" rule 7): the
+ * safety net for a fence-refused evaluation or a tx ZMQ missed without a sequence gap. One
+ * getrawmempool plus fetches of un-evaluated txids only; the mutex skips overlap.
+ */
+export const MEMPOOL_REPARSE_INTERVAL_MS = 300_000
+
 /** Run fn over items with at most `limit` in flight. Rejections propagate. */
 async function mapBounded<T>(
   items: T[],

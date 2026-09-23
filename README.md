@@ -137,9 +137,9 @@ idempotencyKey, timestamp, blockHeight, blockHash, hex}`):
 |---|---|---|
 | `seen` | a tx paying a watched address enters the mempool (needs milestone `0`) | show "payment detected", start waiting for confirmations |
 | `confirmed` | the tx reaches a configured milestone depth (fires once per milestone, e.g. at 1 and at 3) | credit at whichever depth matches your risk tolerance |
-| `dropped` | a seen tx vanishes from the mempool without being mined (evicted, replaced) | roll back "payment detected"; a rebroadcast will fire a fresh `seen` |
+| `dropped` | a seen tx vanishes from the mempool without being mined; `reason` is `replaced` (another tx spent one of its inputs — RBF fee-bump or redirect — detected the moment weir sees it, with `replacedBy: <txid>`) or `evicted` (residual: gone from the mempool at the next block) | roll back "payment detected"; a rebroadcast will fire a fresh `seen` |
 | `demoted` | a reorg orphans the tx's block and the tx returns to the mempool | revert to unconfirmed; new `confirmed` events follow if it's re-mined |
-| `conflicted` | a reorg orphans the tx's block and the tx is gone (double-spend won) | reverse any credit, alert a human — terminal |
+| `conflicted` | a reorg orphans the tx's block and the tx is gone (double-spend won); when the new chain provably spent one of its inputs the event carries `reason: 'double-spend'` and `conflictingTxid` | reverse any credit, alert a human — terminal |
 | `expired` | a TTL'd watch passed its deadline unpaid (address-scoped payload) | close the invoice for that address |
 | `heartbeat` | every `HEARTBEAT_INTERVAL` seconds (`{tipHeight, watchCount, memoryUsedPct, outboxDepth, outboxOldestAgeSec, deadLetterCount}`) | reset a dead-man's switch; page if heartbeats stop or `outboxDepth` keeps growing |
 
@@ -216,6 +216,25 @@ Use BlockCypher if you don't run a node and don't mind a third party learning yo
 addresses. Use electrs if you need history or arbitrary-address queries and can afford a
 full index. Use Cyphernode if you want a whole self-hosted bitcoin backend. Use weir if
 you run a (pruned) node and just want to know when watched addresses get paid.
+
+## Development
+
+```sh
+pnpm test          # unit suite: engine + store contracts against in-memory fakes, no services needed
+pnpm test:redis    # executes every Store Lua script against a real redis (see below)
+pnpm typecheck && pnpm build
+```
+
+The Store's state transitions are Redis Lua scripts (atomic guards + enqueue). The unit
+suite pins their text and mirrors their semantics in a fake, but only a real redis executes
+them — run the integration file before touching `src/store/redis.ts`:
+
+```sh
+docker run -d --name weir-test-redis -p 6390:6379 redis:7-alpine
+pnpm test:redis
+```
+
+End to end against a real node: `examples/regtest-demo.sh` (see the quickstart).
 
 ## License
 

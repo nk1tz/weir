@@ -7,9 +7,11 @@
  *   (record kept), the ring/tip rewind to the fork point, and the replacement chain then
  *   processes as a plain connected walk (one hash per height, no second fork search).
  * - Re-inclusion is discovered by the block pipeline's promotion step (no event; milestones
- *   re-fire under the new blockHash). `resolveLimbo` runs only after the TIP block finishes
- *   (and at boot), when the node's mempool reflects the new chain: present → demoted,
- *   absent → conflicted (terminal). Each outcome is ONE store transition that also enqueues
+ *   re-fire under the new blockHash), and a PROVEN conflict (a new-chain tx spending one of
+ *   a limbo tx's inputs) by its input scan — both leave limbo inside the block pipeline.
+ *   `resolveLimbo` runs only after the TIP block finishes (and at boot), when the node's
+ *   mempool reflects the new chain, for whatever is still in limbo: present → demoted,
+ *   absent → conflicted by elimination (terminal). Each outcome is ONE store transition that also enqueues
  *   its event — nothing here awaits delivery.
  * - Limbo is durable, so a crash between rewind and resolution re-resolves on the next
  *   block or boot.
@@ -160,7 +162,9 @@ export async function resolveLimbo(deps: ReorgDeps): Promise<void> {
       continue
     }
 
-    // Not re-included by the new chain, not in the mempool → conflicted. Terminal.
+    // Not re-included by the new chain, not in the mempool → conflicted BY ELIMINATION
+    // (a PROVEN double-spend — the new chain spending one of its inputs — was already
+    // adjudicated by the block pipeline's input scan and left limbo there). Terminal.
     const lastDepth = rec.fired.length > 0 ? Math.max(...rec.fired) : 0
     const ev: TxEvent = {
       version: 1,

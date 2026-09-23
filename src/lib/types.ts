@@ -10,9 +10,18 @@ export interface DecodedOutput {
   scriptType: ScriptType | null
 }
 
+/** A previous output spent by a transaction input — the literal bytes in the tx, never resolved. */
+export interface Outpoint {
+  /** prev txid, display-order hex */
+  txid: string
+  vout: number
+}
+
 export interface DecodedTx {
   txid: string
   hex: string
+  /** every input's prevout; the coinbase input (txid all zeros, vout 0xffffffff) is omitted */
+  inputs: Outpoint[]
   outputs: DecodedOutput[]
 }
 
@@ -59,6 +68,16 @@ export interface TxEvent extends EventBase {
   blockHeight: number | null
   blockHash: string | null
   hex: string
+  /**
+   * `dropped`: `replaced` (an input was spent by another tx weir saw — mempool or block) or
+   * `evicted` (the residual verdict of the tip-block dropped check). `conflicted`:
+   * `double-spend` when the new chain provably spent one of the tx's inputs.
+   */
+  reason?: 'replaced' | 'evicted' | 'double-spend'
+  /** `dropped` with reason `replaced`: the txid that spent one of this tx's inputs */
+  replacedBy?: string
+  /** `conflicted` with reason `double-spend`: the confirmed txid that spent one of this tx's inputs */
+  conflictingTxid?: string
 }
 
 /** a TTL'd watch passed its deadline without being paid */
@@ -94,6 +113,8 @@ export interface MaturingRecord {
   /** milestones whose `confirmed` event has been ENQUEUED (e.g. [1] after the 1-conf event) */
   fired: number[]
   hex: string
+  /** the tx's inputs (see Outpoint) — kept so terminal cleanup can remove them from `outpoints` */
+  inputs: Outpoint[]
 }
 
 export interface Tip {

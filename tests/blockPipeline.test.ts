@@ -182,7 +182,7 @@ describe('blockPipeline', () => {
       pending: false,
       limbo: false,
       indexedAt: 101,
-      record: { txid: 'tx1', height: 101, blockHash: 'b101', matched: MATCHED, fired: [], hex: 'hex-tx1' },
+      record: { txid: 'tx1', height: 101, blockHash: 'b101', matched: MATCHED, fired: [], hex: 'hex-tx1', inputs: [] },
     })
     expect(store.evaluated.has('tx1')).toBe(false) // tip prune: not in the post-block mempool
     expect(store.maturingIndex.get('tx1')).toBe(101)
@@ -408,7 +408,7 @@ describe('blockPipeline', () => {
     expect(store.limbo.size).toBe(0)
   })
 
-  it('dropped emits, removes pending, un-evaluates (seen can re-fire) and deletes the record', async () => {
+  it('dropped (reason evicted) emits, removes pending, un-evaluates (seen can re-fire) and deletes the record', async () => {
     const { store, chain, process } = setup()
     store.watches.add(ADDR)
     seedTip(store, chain, 100, 'b100')
@@ -429,6 +429,8 @@ describe('blockPipeline', () => {
     expect(dropped[0]!.matched).toEqual(MATCHED) // from the seen-time record
     expect(dropped[0]!.hex).toBe('hex-tx1')
     expect(dropped[0]!.idempotencyKey).toBe('regtest:tx1:dropped:101')
+    expect(dropped[0]!.reason).toBe('evicted') // no replacement was seen: the residual verdict
+    expect(dropped[0]!.replacedBy).toBeUndefined()
 
     expect(store.pending.has('tx1')).toBe(false)
     expect(store.evaluated.has('tx1')).toBe(false) // rebroadcast → seen can fire again

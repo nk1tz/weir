@@ -116,6 +116,52 @@ describe('decodeRawTx known-good mainnet addresses per script type', () => {
   })
 })
 
+// -- decodeRawTx: inputs (outpoints) ------------------------------------------
+
+describe('decodeRawTx inputs', () => {
+  it('carries every input as {txid (display-order hex), vout} — known mainnet tx', () => {
+    // 2f4d8b12…: 3 inputs; prev txids are the reversed wire-order hashes
+    const f = fixture('2f4d8b12392b92a50a544f209f06f7e779e83e30eaf1e48df53c41c87b2e8b0b')
+    const decoded = decodeRawTx(f.rawTxHex, 'mainnet')
+    expect(decoded.inputs).toEqual([
+      { txid: '5edc268fcae2e2b0a37927a58e7fa5c8ec91001fa932dc8b9f6caa81a9e4d1bf', vout: 4 },
+      { txid: '830068488f93fb1c1007b70558c6a8713e7c6c88563a1654495678f509921732', vout: 0 },
+      { txid: '9faf99552b381f907b8556e1e4ce5062647d113e7028658969689e026708f500', vout: 5 },
+    ])
+  })
+
+  it('keeps duplicate prev txids with distinct vouts (two inputs from one parent)', () => {
+    const f = fixture('c85f1c0c429c1027c809ef71a0e05aebc34cff7d13f792e1ac0ae216a016b1b5')
+    const decoded = decodeRawTx(f.rawTxHex, 'mainnet')
+    expect(decoded.inputs).toHaveLength(4)
+    expect(decoded.inputs[0]).toEqual({ txid: '79cc25b1edd3f20ab882fb95ed4da8221b873bf154a4a83254156107b02be0d6', vout: 4 })
+    expect(decoded.inputs[3]).toEqual({ txid: '79cc25b1edd3f20ab882fb95ed4da8221b873bf154a4a83254156107b02be0d6', vout: 6 })
+  })
+
+  it('a coinbase tx has inputs: [] (the null prevout spends nothing)', () => {
+    for (const txid of [
+      'a10cf4e6884d25b1a68fe6a930f48fe1caf6d3c3a9c04bd5af84265c9e9648d7',
+      '33b68057b18e1226064c37dcaf4e53142115ac8025ed35b7fea6ebb70f5a5b29',
+    ]) {
+      const f = fixture(txid)
+      expect(decodeRawTx(f.rawTxHex, f.network).inputs).toEqual([])
+    }
+    const genesis = decodeBlock(Buffer.from(genesisBlockHex, 'hex'), 'mainnet')
+    expect(genesis.txs[0]!.inputs).toEqual([])
+  })
+
+  it('decodeBlock carries inputs for every block tx', () => {
+    const f1 = fixture('2f4d8b12392b92a50a544f209f06f7e779e83e30eaf1e48df53c41c87b2e8b0b')
+    const f2 = fixture('704668d96430b0e8c9d03d218228ab11ef3ddf119248362dce29924630c238d3')
+    const raw = buildRawBlock('00000000d1145790a8694403d4063f323d499e655c83426834d4ce2f8dd4a2ee', 1735689600, [f1.rawTxHex, f2.rawTxHex])
+    const block = decodeBlock(raw, 'mainnet')
+    expect(block.txs[0]!.inputs).toHaveLength(3)
+    expect(block.txs[1]!.inputs).toEqual([
+      { txid: '2973ba505b8129dd9487a96175688cdd507a3a11eab32cc2bb191eb9b056db7d', vout: 0 },
+    ])
+  })
+})
+
 // -- decodeRawTx: unknown script types are kept, never dropped --------------
 
 describe('unknown script types', () => {

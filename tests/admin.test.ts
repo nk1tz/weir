@@ -70,8 +70,35 @@ describe('admin server', () => {
       lastBlockAtMs: () => lastBlockAt,
       config: { network: 'regtest', adminToken: TOKEN, adminPort: 0, watchDefaultTtl: 0 },
     })
+    // rejects with the real listen error (EADDRINUSE, ...) instead of hanging the whole file
     port = await handle.port
     expect(port).toBeGreaterThan(0)
+  })
+
+  it('a listen failure rejects `port` with the EADDRINUSE error and takes the (injected) fatal path', async () => {
+    const { createServer: createNetServer } = await import('node:net')
+    const holder = createNetServer()
+    await new Promise<void>((resolve) => holder.listen(0, resolve)) // all interfaces, like the admin server
+    const held = (holder.address() as { port: number }).port
+    const onFatal = vi.fn()
+    try {
+      const clashing = startAdminServer(
+        {
+          store,
+          isValidAddress: () => true,
+          rpcPing: async () => {},
+          lastBlockAtMs: () => null,
+          config: { network: 'regtest', adminToken: TOKEN, adminPort: held, watchDefaultTtl: 0 },
+        },
+        onFatal,
+      )
+      await expect(clashing.port).rejects.toThrow(/EADDRINUSE/)
+      expect(onFatal).toHaveBeenCalledTimes(1)
+      expect(onFatal.mock.calls[0]![0]).toBe('admin')
+      expect(String((onFatal.mock.calls[0]![1] as Error).message)).toMatch(/EADDRINUSE/)
+    } finally {
+      await new Promise<void>((resolve) => holder.close(() => resolve()))
+    }
   })
 
   afterAll(async () => {

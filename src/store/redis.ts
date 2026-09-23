@@ -19,10 +19,33 @@
  *   Nothing here awaits the network; delivery is the drainer's job (src/delivery/outbox.ts).
  * - Event ids are monotonic (`makeEventId`): ms prefix + per-ms sequence + random suffix,
  *   so redis' tie order for equal ZSET scores (by member) IS enqueue order.
- * - EVALUATION FENCE: `recordSeen` refuses an evaluation older than MAX_EVALUATION_AGE_MS
+ * - RETIREMENT WATERMARK: `dropPending` and `replacePending` ZADD the txid into `retired`
+ *   (score = exit time). `recordSeen` refuses (stale) an evaluation that STARTED at or before
+ *   that exit: a duplicate evaluation (ZMQ + reparse) that was in flight when the tx was
+ *   replaced must not resurrect it as a fresh pending record (a second verdict later). An
+ *   evaluation started after the exit is a real rebroadcast and records normally; the
+ *   watermark stays (a later exit overwrites it) and is pruned with the tombstones. Drops do
+ *   NOT tombstone: a dropped-then-mined tx must still confirm through the block path.
+ * - EVALUATION FENCE: `recordSeen` and `replacePending` refuse an evaluation older than MAX_EVALUATION_AGE_MS
  *   (measured from ZMQ receipt / the reparser's RPC issue). Tombstones bound the STORE side
  *   for TOMBSTONE_TTL_MS; the fence bounds the EVALUATOR side, so a response parked longer
  *   than the tombstone can never land after the tombstone is pruned.
+ * - OUTPOINTS: `outpoint:{txid}:{vout}` is a SET of claimant txids — every pending or
+ *   maturing spender of that prevout — so a replacement (mempool) or a confirmed double-spend
+ *   (block) is detected from the tx bytes alone. CLAIM = SADD (`recordSeen`'s Lua,
+ *   `promoteToMaturing`'s MULTI; never conflicts), RELEASE = SREM of ONLY the releaser's own
+ *   txid inside every transition that deletes the record (`dropPending`, `replacePending`,
+ *   `conflict`, `finishMaturing`, `endTracking` — the prelude's `release` reads `inputs`
+ *   from the record). `demoteToPending` keeps claims; `clearTracking` DELs every
+ *   `outpoint:*` key. The Lua scripts build these key names from a prefix ARGV — fine on the
+ *   single redis instance weir targets (see Topology), not on Redis Cluster.
+ * - NO DECISION FROM A STALE READ: every mutating transition re-validates the record's LIVE
+ *   state inside its Lua and returns 0 — nothing written, nothing enqueued — when a caller's
+ *   read is stale: `replacePending` (fenced) and `dropPending` both require the txid to be
+ *   pending AND its record to exist with height 0; a second caller never gets a second
+ *   verdict. `sweepOrphanRecords` deletes a record only while it has no live membership.
+ *   The block + reorg path is one serialized writer, so `conflict`, `finishMaturing`,
+ *   `endTracking`, `demoteToPending`, `promoteToMaturing` and `markFired` carry no guard.
  * - Single redis instance: multi-key MULTI/EVAL without hash tags — not Redis Cluster.
  * - Bounded reconnects: boot fails fast on a bad REDIS_URL (connect() rejects). At runtime,
  *   exhausting the retries is FATAL from inside the reconnect strategy: node-redis emits no
@@ -33,14 +56,17 @@
 
 import { randomBytes } from 'node:crypto'
 import { createClient } from 'redis'
-import type { ExpiredEvent, MaturingRecord, Network, Tip, TxEvent, WeirEvent } from '../lib/types'
+import type { ExpiredEvent, MaturingRecord, Network, Outpoint, Tip, TxEvent, WeirEvent } from '../lib/types'
 import { describeError, fatal, log } from '../lib/log'
-import { type Keys, keysFor } from './keys'
+import { type Keys, keysFor, outpointField } from './keys'
 
 const CTX = 'store'
 
 /** Connection attempts before giving up (boot: connect() rejects; runtime: fatal). */
 const MAX_RECONNECTS = 5
+
+/** SMEMBERS per pipelined round trip when resolving outpoint claimants. */
+const OUTPOINT_CHUNK = 1000
 
 /**
  * Managed redis (Upstash, ElastiCache, ...) blocks CONFIG with an explicit command-access
@@ -82,6 +108,11 @@ export function makeEventId(nowMs: number): string {
  */
 export const MAX_EVALUATION_AGE_MS = 600_000
 
+/** What `recordSeen` did: `recorded`; `skipped` (a concurrent path already tracks, mined or ended the tx); `stale` (the fence or the retirement watermark refused it, warned). */
+export type RecordSeenOutcome = 'recorded' | 'skipped' | 'stale'
+/** What `replacePending` did: `replaced` (event enqueued); `skipped` (no longer pending-unmined — nothing written); `stale` (the fence refused it, warned — nothing written). */
+export type ReplaceOutcome = 'replaced' | 'skipped' | 'stale'
+
 /** What the drainer reads back for one queued event (`outboxRead`). */
 export interface OutboxRecord {
   event: WeirEvent
@@ -92,6 +123,33 @@ export interface OutboxRecord {
 }
 
 /**
+ * Shared Lua prelude, prepended to every releasing/enqueuing script:
+ * - `pendingUnmined(pending, recordPrefix, txid)`: the LIVE-state check the guarded
+ *   transitions re-validate — a member of `pending` whose record exists with height 0.
+ * - `release(record, outpointPrefix, txid)`: for each of the record's `inputs`, SREM ONLY
+ *   `txid` from that prevout's claimant SET (`outpointPrefix .. '{txid}:{vout}'`; the key
+ *   vanishes when empty). Nobody else's claim is ever touched.
+ * - `enqueue(...)`: the outbox write.
+ */
+const LUA_PRELUDE = `
+local function pendingUnmined(pending, recordPrefix, txid)
+  if redis.call('SISMEMBER', pending, txid) == 0 then return false end
+  local h = redis.call('HGET', recordPrefix .. txid, 'height')
+  return h and tonumber(h) == 0
+end
+local function release(record, outpointPrefix, txid)
+  local inputs = redis.call('HGET', record, 'inputs')
+  if not inputs then return end
+  for _, o in ipairs(cjson.decode(inputs)) do redis.call('SREM', outpointPrefix .. o.txid .. ':' .. o.vout, txid) end
+end
+local function enqueue(outbox, created, rec, id, payload, event, key, now)
+  redis.call('HSET', rec, 'payload', payload, 'event', event, 'idempotencyKey', key, 'attempts', '0', 'createdAt', now)
+  redis.call('ZADD', outbox, now, id)
+  redis.call('ZADD', created, now, id)
+end
+`.trim()
+
+/**
  * recordSeen as ONE atomic script (see module doc). Returns 1 when the tx was recorded;
  * -1 when the evaluation is STALE (now − startedAt > maxAge: the fence); 0 when it was
  * skipped because a concurrent path already handled it: `evaluated` holds the txid (a
@@ -99,24 +157,146 @@ export interface OutboxRecord {
  * promoted it between this evaluation's read and its write), or the txid is TOMBSTONED
  * (tracking already ENDED — final milestone or conflict — and the record is gone, so the
  * first two guards would let a stale evaluation resurrect it as a height-0 pending record
- * and the next block would emit a false `dropped`).
- * KEYS: record, pending, evaluated, outbox, outbox record (unused when ARGV[7] is ''), tombstones, outbox:created.
- * ARGV: txid, height, blockHash, matched, fired, hex, eventId, payload, event, idempotencyKey, nowMs, startedAtMs, maxAgeMs.
+ * and the next block would emit a false `dropped`); -3 when the txid is RETIRED (dropped or
+ * replaced) at a time this evaluation predates (`startedAt <= exitAt`: a duplicate evaluation
+ * that was in flight when the tx left — reported as `stale`; a later evaluation is a real
+ * rebroadcast and passes). The tx's inputs are CLAIMED in the same step: SADD txid into
+ * each prevout's SET (ARGV[15] = the `{txid}:{vout}` fields joined by ',' — empty = none; a
+ * comma never appears in hex or a number, so the split is exact — ARGV[16] = the key prefix).
+ * KEYS: record, pending, evaluated, outbox, outbox record (unused when ARGV[7] is ''), tombstones, outbox:created, retired.
+ * ARGV: txid, height, blockHash, matched, fired, hex, eventId, payload, event, idempotencyKey, nowMs, startedAtMs, maxAgeMs, inputs, outpointFields, outpointPrefix.
  */
-const RECORD_SEEN_LUA = `
+const RECORD_SEEN_LUA = `${LUA_PRELUDE}
 if tonumber(ARGV[11]) - tonumber(ARGV[12]) > tonumber(ARGV[13]) then return -1 end
 if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then return 0 end
 local h = redis.call('HGET', KEYS[1], 'height')
 if h and tonumber(h) > 0 then return 0 end
 if redis.call('ZSCORE', KEYS[6], ARGV[1]) then return 0 end
-redis.call('HSET', KEYS[1], 'height', ARGV[2], 'blockHash', ARGV[3], 'matched', ARGV[4], 'fired', ARGV[5], 'hex', ARGV[6])
+local exitAt = redis.call('ZSCORE', KEYS[8], ARGV[1])
+if exitAt and tonumber(ARGV[12]) <= tonumber(exitAt) then return -3 end
+redis.call('HSET', KEYS[1], 'height', ARGV[2], 'blockHash', ARGV[3], 'matched', ARGV[4], 'fired', ARGV[5], 'hex', ARGV[6], 'inputs', ARGV[14])
 redis.call('SADD', KEYS[2], ARGV[1])
 redis.call('SADD', KEYS[3], ARGV[1])
-if ARGV[7] ~= '' then
-  redis.call('HSET', KEYS[5], 'payload', ARGV[8], 'event', ARGV[9], 'idempotencyKey', ARGV[10], 'attempts', '0', 'createdAt', ARGV[11])
-  redis.call('ZADD', KEYS[4], ARGV[11], ARGV[7])
-  redis.call('ZADD', KEYS[7], ARGV[11], ARGV[7])
+for field in string.gmatch(ARGV[15], '[^,]+') do redis.call('SADD', ARGV[16] .. field, ARGV[1]) end
+if ARGV[7] ~= '' then enqueue(KEYS[4], KEYS[7], KEYS[5], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11]) end
+return 1
+`.trim()
+
+/**
+ * replacePending: the SPENDER's own state comes first — an evaluation that predates its own
+ * tx's exit (`ZSCORE retired spender` ≥ startedAt) or whose tx is tombstoned may not act on
+ * anyone (-3: stale, nothing written); then fenced (-1: stale, nothing written) and GUARDED
+ * (0: the owner is not pending-unmined — not in `pending`, or its record is missing or
+ * already has height > 0: the block pipeline mined it, or another caller replaced it first —
+ * nothing written, nothing enqueued). Otherwise SREM pending, SREM evaluated, release its
+ * claims, DEL record, ZADD retired (the watermark, score = now), enqueue `dropped`; returns 1.
+ * KEYS: record, pending, evaluated, outbox, outbox record, outbox:created, retired, tombstones.
+ * ARGV: txid, eventId, payload, event, idempotencyKey, nowMs, startedAtMs, maxAgeMs, recordPrefix, outpointPrefix, spenderTxid.
+ */
+const REPLACE_PENDING_LUA = `${LUA_PRELUDE}
+local spenderExit = redis.call('ZSCORE', KEYS[7], ARGV[11])
+if spenderExit and tonumber(ARGV[7]) <= tonumber(spenderExit) then return -3 end
+if redis.call('ZSCORE', KEYS[8], ARGV[11]) then return -3 end
+if tonumber(ARGV[6]) - tonumber(ARGV[7]) > tonumber(ARGV[8]) then return -1 end
+if not pendingUnmined(KEYS[2], ARGV[9], ARGV[1]) then return 0 end
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('SREM', KEYS[3], ARGV[1])
+release(KEYS[1], ARGV[10], ARGV[1])
+redis.call('DEL', KEYS[1])
+redis.call('ZADD', KEYS[7], ARGV[6], ARGV[1])
+enqueue(KEYS[4], KEYS[6], KEYS[5], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+return 1
+`.trim()
+
+/**
+ * dropPending (the tip-block dropped check, serialized — no fence): GUARDED like
+ * replacePending (0 when the txid is no longer pending-unmined: a mempool replacement or
+ * the block pipeline got there first — nothing written, nothing enqueued). Otherwise SREM
+ * pending, SREM evaluated, release its claims, DEL record, ZADD retired (the watermark),
+ * enqueue `dropped`; returns 1.
+ * KEYS: record, pending, evaluated, outbox, outbox record, outbox:created, retired.
+ * ARGV: txid, eventId, payload, event, idempotencyKey, nowMs, recordPrefix, outpointPrefix.
+ */
+const DROP_PENDING_LUA = `${LUA_PRELUDE}
+if not pendingUnmined(KEYS[2], ARGV[7], ARGV[1]) then return 0 end
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('SREM', KEYS[3], ARGV[1])
+release(KEYS[1], ARGV[8], ARGV[1])
+redis.call('DEL', KEYS[1])
+redis.call('ZADD', KEYS[7], ARGV[6], ARGV[1])
+enqueue(KEYS[4], KEYS[6], KEYS[5], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+return 1
+`.trim()
+
+/**
+ * conflict: SREM pending, ZREM maturing, release its claims, DEL record, SREM limbo, ZADD
+ * tombstones, enqueue `conflicted`.
+ * KEYS: record, pending, maturing, limbo, tombstones, outbox, outbox record, outbox:created.
+ * ARGV: txid, eventId, payload, event, idempotencyKey, nowMs, outpointPrefix.
+ */
+const CONFLICT_LUA = `${LUA_PRELUDE}
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
+release(KEYS[1], ARGV[7], ARGV[1])
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[4], ARGV[1])
+redis.call('ZADD', KEYS[5], ARGV[6], ARGV[1])
+enqueue(KEYS[6], KEYS[8], KEYS[7], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+return 1
+`.trim()
+
+/**
+ * finishMaturing: release its claims, DEL record, ZREM maturing, ZADD tombstones (no event).
+ * KEYS: record, maturing, tombstones. ARGV: txid, nowMs, outpointPrefix.
+ */
+const FINISH_MATURING_LUA = `${LUA_PRELUDE}
+release(KEYS[1], ARGV[3], ARGV[1])
+redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
+return 1
+`.trim()
+
+/**
+ * endTracking: SREM pending, SREM limbo, release its claims, DEL record (no event).
+ * KEYS: record, pending, limbo. ARGV: txid, outpointPrefix.
+ */
+const END_TRACKING_LUA = `${LUA_PRELUDE}
+redis.call('SREM', KEYS[2], ARGV[1])
+redis.call('SREM', KEYS[3], ARGV[1])
+release(KEYS[1], ARGV[2], ARGV[1])
+redis.call('DEL', KEYS[1])
+return 1
+`.trim()
+
+/**
+ * clearTracking, atomically: for every txid in ARGV[3..] release its OWN claims (from its
+ * record's `inputs`) and DEL its record (ARGV[1] = the record key prefix, ARGV[2] = the
+ * outpoint key prefix), then DEL every tracking key. The bulk `outpoint:*` SCAN + DEL runs
+ * BEFORE this script and the orphan sweep (SWEEP_ORPHAN_LUA) after it, outside it.
+ * KEYS: maturing, pending, limbo, evaluated, mempool:current, mempool:postBlock, block:txids.
+ */
+const CLEAR_TRACKING_LUA = `${LUA_PRELUDE}
+for i = 3, #ARGV do
+  release(ARGV[1] .. ARGV[i], ARGV[2], ARGV[i])
+  redis.call('DEL', ARGV[1] .. ARGV[i])
 end
+redis.call('DEL', unpack(KEYS))
+return #ARGV - 2
+`.trim()
+
+/**
+ * The orphan sweep's per-record step: release the record's OWN claims and DEL it ONLY while
+ * the txid has no live membership (not pending, not in limbo, not in the maturing index) — a
+ * record a concurrent recordSeen/promotion just created is left alone. Returns 1 when deleted.
+ * KEYS: record, pending, limbo, maturing. ARGV: txid, outpointPrefix.
+ */
+const SWEEP_ORPHAN_LUA = `${LUA_PRELUDE}
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return 0 end
+if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then return 0 end
+if redis.call('ZSCORE', KEYS[4], ARGV[1]) then return 0 end
+release(KEYS[1], ARGV[2], ARGV[1])
+redis.call('DEL', KEYS[1])
 return 1
 `.trim()
 
@@ -155,7 +335,7 @@ end
 return 1
 `.trim()
 
-/** MaturingRecord hash fields: height (string int), blockHash, matched (JSON), fired (JSON), hex. */
+/** MaturingRecord hash fields: height (string int), blockHash, matched (JSON), fired (JSON), hex, inputs (JSON). */
 function recordToHash(rec: MaturingRecord): Record<string, string> {
   return {
     height: String(rec.height),
@@ -163,7 +343,13 @@ function recordToHash(rec: MaturingRecord): Record<string, string> {
     matched: JSON.stringify(rec.matched),
     fired: JSON.stringify(rec.fired),
     hex: rec.hex,
+    inputs: JSON.stringify(rec.inputs),
   }
+}
+
+/** `outpoints` HASH fields for a tx's inputs, or [] when it spends nothing (coinbase). */
+function outpointFields(inputs: Outpoint[]): string[] {
+  return inputs.map(outpointField)
 }
 
 /** Outbox hash fields at enqueue time (lastError is only written by retry/dead). */
@@ -183,6 +369,7 @@ function hashToRecord(txid: string, h: Record<string, string>): MaturingRecord {
   const matched = h['matched']
   const fired = h['fired']
   const hex = h['hex']
+  const inputs = h['inputs']
   if (
     height === undefined ||
     blockHash === undefined ||
@@ -199,6 +386,9 @@ function hashToRecord(txid: string, h: Record<string, string>): MaturingRecord {
     matched: JSON.parse(matched) as MaturingRecord['matched'],
     fired: JSON.parse(fired) as number[],
     hex,
+    // A record written before outpoint tracking has no `inputs`: its outpoints were never
+    // indexed, so there is nothing to look up or remove — not corruption.
+    inputs: inputs === undefined ? [] : (JSON.parse(inputs) as Outpoint[]),
   }
 }
 
@@ -445,13 +635,16 @@ export class Store {
 
   /**
    * A tx paying a watched address entered the mempool: HSET record (height 0), SADD
-   * pending, SADD evaluated, + enqueue `seen` when `event` is non-null (null when seen
-   * events are disabled). One Lua script, guarded (see RECORD_SEEN_LUA). Resolves false
-   * when a guard skipped it — a concurrent path already tracks (or mined) the tx — or when
-   * the evaluation is older than MAX_EVALUATION_AGE_MS (`startedAtMs` = ZMQ receipt / RPC
-   * issue time; warned): the txid stays un-evaluated and the next reparse redoes it.
+   * pending, SADD evaluated, claim its inputs (SADD txid into each prevout's SET), + enqueue
+   * `seen` when `event` is non-null (null when seen events are disabled). One Lua script,
+   * guarded (see RECORD_SEEN_LUA). `skipped` when a guard fired — a concurrent path already
+   * tracks (or mined) the tx; `stale` (warned) when the evaluation is older than
+   * MAX_EVALUATION_AGE_MS (`startedAtMs` = ZMQ receipt / RPC issue time) or when it started
+   * at or before the txid's last exit (`retired` watermark: a duplicate evaluation that was
+   * in flight when the tx was dropped/replaced): the txid stays un-evaluated and the next
+   * reparse redoes it with a fresh view.
    */
-  async recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<boolean> {
+  async recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<RecordSeenOutcome> {
     const h = recordToHash(rec)
     const nowMs = Date.now()
     const id = event === null ? '' : makeEventId(nowMs)
@@ -464,6 +657,7 @@ export class Store {
         id === '' ? this.keys.outbox : this.keys.outboxRecord(id),
         this.keys.tombstones,
         this.keys.outboxCreated,
+        this.keys.retired,
       ],
       arguments: [
         rec.txid,
@@ -479,6 +673,9 @@ export class Store {
         String(nowMs),
         String(startedAtMs),
         String(MAX_EVALUATION_AGE_MS),
+        h['inputs'] as string,
+        outpointFields(rec.inputs).join(','),
+        this.keys.outpointPrefix,
       ],
     })
     const code = Number(reply)
@@ -487,8 +684,22 @@ export class Store {
         CTX,
         `refused stale evaluation of ${rec.txid}: started ${nowMs - startedAtMs}ms ago (fence ${MAX_EVALUATION_AGE_MS}ms) — left un-evaluated for the next reparse`,
       )
+      return 'stale'
     }
-    return code === 1
+    if (code === -3) {
+      log.warn(
+        CTX,
+        `refused evaluation of ${rec.txid} that predates its last drop/replacement (started ${nowMs - startedAtMs}ms ago) — left un-evaluated; a rebroadcast is picked up by the next reparse`,
+      )
+      return 'stale'
+    }
+    return code === 1 ? 'recorded' : 'skipped'
+  }
+
+  /** The outbox part of an EVAL: id + the ARGV tail every enqueuing script takes (eventId, payload, event, idempotencyKey). */
+  private eventArgs(event: WeirEvent, nowMs: number): { id: string; args: [string, string, string, string] } {
+    const id = makeEventId(nowMs)
+    return { id, args: [id, JSON.stringify(event), event.event, event.idempotencyKey] }
   }
 
   /** A milestone was reached: HSET fired + enqueue `confirmed`, one MULTI. */
@@ -499,17 +710,68 @@ export class Store {
   }
 
   /**
-   * A pending tx left the mempool unmined: SREM pending, SREM evaluated (a rebroadcast may
-   * legitimately re-fire `seen`), DEL record, + enqueue `dropped`, one MULTI.
+   * A pending tx left the mempool unmined (the tip-block dropped check): SREM pending, SREM
+   * evaluated (a rebroadcast may legitimately re-fire `seen`), release its outpoints, DEL
+   * record, + enqueue `dropped` (reason `evicted`) — one GUARDED Lua (DROP_PENDING_LUA):
+   * resolves false, nothing written or enqueued, when the txid is no longer pending-unmined
+   * (a mempool replacement or the block pipeline handled it since the caller's read).
    */
-  async dropPending(txid: string, event: TxEvent): Promise<void> {
-    const multi = this.client
-      .multi()
-      .sRem(this.keys.pending, txid)
-      .sRem(this.keys.evaluated, txid)
-      .del(this.keys.maturingRecord(txid))
-    this.enqueue(multi, event, Date.now())
-    await multi.exec()
+  async dropPending(txid: string, event: TxEvent): Promise<boolean> {
+    const nowMs = Date.now()
+    const { id, args } = this.eventArgs(event, nowMs)
+    const reply = await this.client.eval(DROP_PENDING_LUA, {
+      keys: [this.keys.maturingRecord(txid), this.keys.pending, this.keys.evaluated, this.keys.outbox, this.keys.outboxRecord(id), this.keys.outboxCreated, this.keys.retired],
+      arguments: [txid, ...args, String(nowMs), this.keys.maturingRecord(''), this.keys.outpointPrefix],
+    })
+    return Number(reply) === 1
+  }
+
+  /**
+   * A pending tx was REPLACED — another tx (mempool or block) spent one of its inputs. ONE
+   * fenced, guarded Lua (REPLACE_PENDING_LUA): a no-op resolving false when the evaluation
+   * is stale (warned) or when the txid is no longer pending-unmined (not pending, record
+   * missing, or already mined) — the caller decided from a read that the block pipeline or
+   * another caller has since overtaken, and nothing is written or enqueued. Otherwise the
+   * dropPending mutation (+ the retirement watermark) + enqueue `dropped` with reason
+   * `replaced` / `replacedBy`. No tombstone: the original may legitimately return if the
+   * replacement is itself dropped. Outcome: `replaced` | `skipped` | `stale` — a caller that
+   * saw `stale` must leave its own evaluation un-evaluated (the next reparse redoes it).
+   * `spenderTxid` is the tx whose evaluation asks: the Lua refuses (`stale`) when THAT tx is
+   * retired at an exit ≥ `startedAtMs` or tombstoned — an evaluation that predates its own
+   * tx's exit may not act on anyone (it would replace the very tx that replaced it).
+   */
+  async replacePending(txid: string, event: TxEvent, startedAtMs: number, spenderTxid: string): Promise<ReplaceOutcome> {
+    const nowMs = Date.now()
+    const { id, args } = this.eventArgs(event, nowMs)
+    const reply = await this.client.eval(REPLACE_PENDING_LUA, {
+      keys: [
+        this.keys.maturingRecord(txid),
+        this.keys.pending,
+        this.keys.evaluated,
+        this.keys.outbox,
+        this.keys.outboxRecord(id),
+        this.keys.outboxCreated,
+        this.keys.retired,
+        this.keys.tombstones,
+      ],
+      arguments: [txid, ...args, String(nowMs), String(startedAtMs), String(MAX_EVALUATION_AGE_MS), this.keys.maturingRecord(''), this.keys.outpointPrefix, spenderTxid],
+    })
+    const code = Number(reply)
+    if (code === -3) {
+      log.warn(
+        CTX,
+        `refused replacement of ${txid} by ${spenderTxid}: the evaluation of ${spenderTxid} (started ${nowMs - startedAtMs}ms ago) predates its own drop/replacement, or it is tombstoned — nothing changed`,
+      )
+      return 'stale'
+    }
+    if (code === -1) {
+      log.warn(
+        CTX,
+        `refused stale replacement of ${txid} by ${event.replacedBy ?? '?'}: evaluation started ${nowMs - startedAtMs}ms ago (fence ${MAX_EVALUATION_AGE_MS}ms) — nothing changed`,
+      )
+      return 'stale'
+    }
+    return code === 1 ? 'replaced' : 'skipped'
   }
 
   /**
@@ -524,33 +786,36 @@ export class Store {
 
   /**
    * Tracking ends without an event (the watch was removed mid-flight): SREM pending,
-   * SREM limbo, DEL record, one MULTI. The maturing index never holds such a tx.
+   * SREM limbo, release its outpoints, DEL record — one Lua (END_TRACKING_LUA). The
+   * maturing index never holds such a tx.
    */
   async endTracking(txid: string): Promise<void> {
-    await this.client
-      .multi()
-      .sRem(this.keys.pending, txid)
-      .sRem(this.keys.limbo, txid)
-      .del(this.keys.maturingRecord(txid))
-      .exec()
+    await this.client.eval(END_TRACKING_LUA, {
+      keys: [this.keys.maturingRecord(txid), this.keys.pending, this.keys.limbo],
+      arguments: [txid, this.keys.outpointPrefix],
+    })
   }
 
   // ── maturing (mined, below max milestone) ──────────────────────────────────
 
   /**
    * The ONE mined-tx promotion, atomically (MULTI): HSET record, ZADD maturing index,
-   * SREM pending, SREM limbo, SADD evaluated. Used for every promotion branch (pending,
-   * limbo re-inclusion, never-seen) so a crash can never leave a half-promoted tx.
+   * SREM pending, SREM limbo, SADD evaluated, then CLAIM its inputs — one SADD into each
+   * prevout's claimant SET (idempotent for a tx that claimed at seen-time; the input scan,
+   * which runs before promotion, is what adjudicates the other claimants). Used for every
+   * promotion branch (pending, limbo re-inclusion, never-seen) so a crash can never leave a
+   * half-promoted tx.
    */
   async promoteToMaturing(rec: MaturingRecord): Promise<void> {
-    await this.client
+    const multi = this.client
       .multi()
       .hSet(this.keys.maturingRecord(rec.txid), recordToHash(rec))
       .zAdd(this.keys.maturing, { score: rec.height, value: rec.txid })
       .sRem(this.keys.pending, rec.txid)
       .sRem(this.keys.limbo, rec.txid)
       .sAdd(this.keys.evaluated, rec.txid)
-      .exec()
+    for (const o of rec.inputs) multi.sAdd(this.keys.outpointKey(o), rec.txid)
+    await multi.exec()
   }
 
   /**
@@ -573,37 +838,42 @@ export class Store {
   }
 
   /**
-   * The terminal reorg outcome (limbo → gone): SREM pending, ZREM maturing, DEL record,
-   * SREM limbo, ZADD tombstones (tracking ENDED), + enqueue `conflicted`, one MULTI.
+   * The terminal reorg outcome (limbo → gone): SREM pending, ZREM maturing, release its
+   * outpoints, DEL record, SREM limbo, ZADD tombstones (tracking ENDED), + enqueue
+   * `conflicted` — one Lua (CONFLICT_LUA).
    */
   async conflict(txid: string, event: TxEvent): Promise<void> {
     const nowMs = Date.now()
-    const multi = this.client
-      .multi()
-      .sRem(this.keys.pending, txid)
-      .zRem(this.keys.maturing, txid)
-      .del(this.keys.maturingRecord(txid))
-      .sRem(this.keys.limbo, txid)
-      .zAdd(this.keys.tombstones, { score: nowMs, value: txid })
-    this.enqueue(multi, event, nowMs)
-    await multi.exec()
+    const { id, args } = this.eventArgs(event, nowMs)
+    await this.client.eval(CONFLICT_LUA, {
+      keys: [
+        this.keys.maturingRecord(txid),
+        this.keys.pending,
+        this.keys.maturing,
+        this.keys.limbo,
+        this.keys.tombstones,
+        this.keys.outbox,
+        this.keys.outboxRecord(id),
+        this.keys.outboxCreated,
+      ],
+      arguments: [txid, ...args, String(nowMs), this.keys.outpointPrefix],
+    })
   }
 
   /**
    * The final-milestone cleanup (tracking ENDED): DEL record, ZREM maturing, ZADD
-   * tombstones score=nowMs, one MULTI. The tombstone stops a stale evaluation (a mempool
+   * tombstones score=nowMs, one Lua. The tombstone stops a stale evaluation (a mempool
    * RPC that read the tx before the block and returned after this cleanup) from
    * resurrecting the txid as a height-0 pending record — the next block would report
    * a false `dropped` for a payment that confirmed. `dropPending` deliberately does NOT
-   * tombstone: a rebroadcast may legitimately re-fire `seen`.
+   * tombstone: a rebroadcast may legitimately re-fire `seen`. Releases its outpoints too —
+   * one Lua (FINISH_MATURING_LUA).
    */
   async finishMaturing(txid: string, nowMs: number): Promise<void> {
-    await this.client
-      .multi()
-      .del(this.keys.maturingRecord(txid))
-      .zRem(this.keys.maturing, txid)
-      .zAdd(this.keys.tombstones, { score: nowMs, value: txid })
-      .exec()
+    await this.client.eval(FINISH_MATURING_LUA, {
+      keys: [this.keys.maturingRecord(txid), this.keys.maturing, this.keys.tombstones],
+      arguments: [txid, String(nowMs), this.keys.outpointPrefix],
+    })
   }
 
   /** ZSCORE tombstones — true when the txid's tracking ended within the tombstone TTL. */
@@ -614,6 +884,11 @@ export class Store {
   /** ZREMRANGEBYSCORE tombstones -inf beforeMs — the tip-block prune. */
   async pruneTombstones(beforeMs: number): Promise<void> {
     await this.client.zRemRangeByScore(this.keys.tombstones, '-inf', beforeMs)
+  }
+
+  /** ZREMRANGEBYSCORE retired -inf beforeMs — the tip-block prune of the retirement watermark (same TTL as tombstones). */
+  async pruneRetired(beforeMs: number): Promise<void> {
+    await this.client.zRemRangeByScore(this.keys.retired, '-inf', beforeMs)
   }
 
   /** Every maturing txid with its inclusion height (ZSET score), ascending. */
@@ -637,6 +912,27 @@ export class Store {
       .exec()
   }
 
+  // ── outpoints (prevout → claimant txids) ────────────────────────────────────
+
+  /**
+   * Which tracked txs claim these prevouts: one SMEMBERS per prevout, pipelined (MULTI) in
+   * chunks of 1000. Returns only the prevouts with claimants, keyed by `{txid}:{vout}`.
+   */
+  async outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string[]>> {
+    const owners = new Map<string, string[]>()
+    for (let i = 0; i < outpoints.length; i += OUTPOINT_CHUNK) {
+      const chunk = outpoints.slice(i, i + OUTPOINT_CHUNK)
+      const multi = this.client.multi()
+      for (const o of chunk) multi.sMembers(this.keys.outpointKey(o))
+      const replies = (await multi.exec()) as unknown[]
+      chunk.forEach((o, j) => {
+        const members = replies[j]
+        if (Array.isArray(members) && members.length > 0) owners.set(outpointField(o), members.map(String))
+      })
+    }
+    return owners
+  }
+
   // ── limbo (reorg-displaced txids awaiting re-resolution) ───────────────────
 
   async addLimbo(txids: string[]): Promise<void> {
@@ -654,34 +950,65 @@ export class Store {
 
   /**
    * Nuclear option for the prune-window guard: downtime exceeded what the pruned node
-   * can replay, so all in-flight tx tracking is unrecoverable. Clears every tracking
-   * structure (maturing index + records, pending, limbo, evaluated, mempool scratch)
-   * while PRESERVING the watch set, expiries, tip, ring AND the outbox (queued events are
-   * still owed — `maturing:*` never matches `outbox*`). Returns the txids whose tracking
+   * can replay, so all in-flight tx tracking is unrecoverable. The txids are collected from
+   * limbo/pending/maturing, then ONE Lua (CLEAR_TRACKING_LUA) DELs their records AND every
+   * tracking key (maturing index, pending, limbo, evaluated, mempool scratch, block txids)
+   * atomically. Every `outpoint:*` claimant SET is SCANned and DELeted BEFORE that Lua (the
+   * bulk pass) and the orphan `maturing:*` records are swept by `sweepOrphanRecords` AFTER
+   * it, so a `recordSeen` landing after the Lua keeps its record, its memberships and its
+   * claims; both Luas also release each record's OWN claims before deleting it, so a
+   * `recordSeen` landing between the bulk pass and the Lua leaves no orphan claim behind.
+   * PRESERVES the watch set, expiries, tip, ring AND the outbox (queued events
+   * are still owed — `maturing:*` never matches `outbox*`). Returns the txids whose tracking
    * was lost so the caller can log them loudly.
    */
   async clearTracking(): Promise<string[]> {
-    const lost = new Set<string>([
-      ...(await this.limboTxids()),
-      ...(await this.pendingTxids()),
-      ...(await this.maturingEntries()).map((e) => e.txid),
-    ])
-    // Per-txid record hashes: scan the maturing:{txid} pattern (the maturing ZSET key
-    // itself has no trailing colon, so the pattern cannot match it).
-    const pattern = this.keys.maturingRecord('*')
-    for await (const key of this.client.scanIterator({ MATCH: pattern, COUNT: 500 })) {
+    for await (const key of this.client.scanIterator({ MATCH: `${this.keys.outpointPrefix}*`, COUNT: 500 })) {
       await this.client.del(key)
     }
-    await this.client.del([
-      this.keys.maturing,
-      this.keys.pending,
-      this.keys.limbo,
-      this.keys.evaluated,
-      this.keys.mempoolCurrent,
-      this.keys.mempoolPostBlock,
-      this.keys.blockTxids,
-    ])
-    return [...lost]
+    const lost = [
+      ...new Set<string>([
+        ...(await this.limboTxids()),
+        ...(await this.pendingTxids()),
+        ...(await this.maturingEntries()).map((e) => e.txid),
+      ]),
+    ]
+    await this.client.eval(CLEAR_TRACKING_LUA, {
+      keys: [
+        this.keys.maturing,
+        this.keys.pending,
+        this.keys.limbo,
+        this.keys.evaluated,
+        this.keys.mempoolCurrent,
+        this.keys.mempoolPostBlock,
+        this.keys.blockTxids,
+      ],
+      arguments: [this.keys.maturingRecord(''), this.keys.outpointPrefix, ...lost],
+    })
+    await this.sweepOrphanRecords()
+    return lost
+  }
+
+  /**
+   * Delete every `maturing:{txid}` record that belongs to NO live membership (a crash between
+   * a record write and its index, or a record the clearTracking Lua did not know about).
+   * SCAN the record pattern (the maturing ZSET key itself has no trailing colon, so the
+   * pattern cannot match it); each candidate is deleted by SWEEP_ORPHAN_LUA, which re-checks
+   * pending/limbo/maturing membership atomically and releases the record's own claims — a
+   * record a concurrent recordSeen just created stays. Returns the number deleted.
+   */
+  async sweepOrphanRecords(): Promise<number> {
+    const prefix = this.keys.maturingRecord('')
+    let deleted = 0
+    for await (const key of this.client.scanIterator({ MATCH: this.keys.maturingRecord('*'), COUNT: 500 })) {
+      const txid = key.slice(prefix.length)
+      const reply = await this.client.eval(SWEEP_ORPHAN_LUA, {
+        keys: [key, this.keys.pending, this.keys.limbo, this.keys.maturing],
+        arguments: [txid, this.keys.outpointPrefix],
+      })
+      deleted += Number(reply)
+    }
+    return deleted
   }
 
   // ── outbox (the drainer's surface; contracts under DESIGN "Outbox") ────────
