@@ -31,6 +31,23 @@ under-tested, with real bugs in that gap. Order of work:
    weir defect: every event fired as DESIGN.md says, no duplicate idempotency keys, no stray
    redis state, zero error lines. This is the v0.2 gate.
 
+7. **v0.2 single-writer refactor** — DONE 2026-09-22 (branch `v0.2/single-writer`, version
+   0.2.0). A requirements-pruning pass found that every guard in the engine existed only
+   because it had been wired as three concurrent writers (fire-and-forget rawtx evaluations,
+   a self-mutexed reparse timer, a serial block queue) and six review rounds had defended
+   that accident. Decision (product owner): weir is ONE writer — every engine action is one
+   item on one queue (src/engine/queue.ts), every state change is one plain MULTI, and there
+   are no guards, fences, tombstones, watermarks or conditional scripts anywhere. A block is
+   one MULTI (tip included: crash before exec = nothing happened), and the tip-only work
+   (eviction, TTL, `evaluated` prune, limbo resolution) runs only when the block is the
+   node's current tip. Product behaviour unchanged; the E2E gate passes twice from scratch.
+   Removed, in counts: 5 key families (`tombstones`, `retired`, `mempool:current`,
+   `mempool:postBlock`, `block:txids`), 2 constants (`MAX_EVALUATION_AGE_MS`,
+   `TOMBSTONE_TTL_MS`), 10 Lua scripts → 0, 21 Store methods (60 → 39), 70 test cases net
+   (355 → 285, guard/race/Lua-text pins deleted, behavioural tests kept or rewritten), 644
+   source lines net (2505 → 1893 across the touched src files). DESIGN.md gained "Single writer"
+   and "Transaction lifecycle" (the state machine every code path is a transition of).
+
 Known bugs (from the reviews) are tracked against steps 2 and 4 above.
 
 ## Gate before any of this: regtest end-to-end

@@ -146,7 +146,7 @@ idempotencyKey, timestamp, blockHeight, blockHash, hex}`):
 | `dropped` | a seen tx vanishes from the mempool without being mined; `reason` is `replaced` (another tx spent one of its inputs — RBF fee-bump or redirect — detected the moment weir sees it, with `replacedBy: <txid>`) or `evicted` (residual: gone from the mempool at the next block) | roll back "payment detected"; a rebroadcast will fire a fresh `seen` |
 | `demoted` | a reorg orphans the tx's block and the tx returns to the mempool | revert to unconfirmed; new `confirmed` events follow if it's re-mined |
 | `conflicted` | a reorg orphans the tx's block and the tx is gone (double-spend won); when the new chain provably spent one of its inputs the event carries `reason: 'double-spend'` and `conflictingTxid` | reverse any credit, alert a human — terminal |
-| `expired` | a TTL'd watch passed its deadline unpaid (address-scoped payload) | close the invoice for that address |
+| `expired` | a TTL'd watch reached the end of its lifetime, paid or not (address-scoped payload); a tx already confirmed keeps firing its remaining milestones, one still unconfirmed stops being tracked once mined | stop expecting new payments on that address |
 | `heartbeat` | every `HEARTBEAT_INTERVAL` seconds (`{tipHeight, nodeHeight, chainLag, watchCount, memoryUsedPct, outboxDepth, outboxOldestAgeSec, deadLetterCount}`) | reset a dead-man's switch; page if heartbeats stop, `chainLag` stays above `READY_MAX_LAG`, or `outboxDepth` keeps growing |
 
 Every event carries an `idempotencyKey` unique to the logical occurrence — a re-mined tx's
@@ -291,13 +291,14 @@ you run a (pruned) node and just want to know when watched addresses get paid.
 
 ```sh
 pnpm test          # unit suite: engine + store contracts against in-memory fakes, no services needed
-pnpm test:redis    # executes every Store Lua script against a real redis (see below)
+pnpm test:redis    # executes the Store's MULTIs against a real redis (see below)
 pnpm typecheck && pnpm build
 ```
 
-The Store's state transitions are Redis Lua scripts (atomic guards + enqueue). The unit
-suite pins their text and mirrors their semantics in a fake, but only a real redis executes
-them — run the integration file before touching `src/store/redis.ts`:
+weir is one writer: every engine action runs on one queue, and every state transition is
+one plain Redis MULTI that carries its event with it. The unit suite mirrors those MULTIs in
+an in-memory fake; only a real redis executes them — run the integration file before
+touching `src/store/redis.ts`:
 
 ```sh
 docker run -d --name weir-test-redis -p 6390:6379 redis:7-alpine

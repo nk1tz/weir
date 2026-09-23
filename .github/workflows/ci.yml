@@ -29,7 +29,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
-      # executes every Store Lua script against a real redis — the unit suite only pins script text
+      # executes the Store's MULTIs against a real redis — the unit suite runs against in-memory fakes
       - run: pnpm test:redis
         env:
           REDIS_TEST_URL: redis://localhost:6390

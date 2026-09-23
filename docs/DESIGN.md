@@ -23,7 +23,38 @@ compose profile). The daemon has ZERO listening ports unless `ADMIN_TOKEN` is se
 exactly one). All its connections are outbound: RPC + ZMQ to bitcoind, redis, HTTPS to the
 webhook. Multiple networks = parallel stacks; a shared redis is safe because every key is
 prefixed `weir:{network}:`. weir targets a SINGLE redis instance: its transitions are
-multi-key MULTI/EVAL without hash tags, so Redis Cluster is not a target.
+multi-key MULTIs without hash tags, so Redis Cluster is not a target.
+
+## Single writer
+
+weir is ONE writer. Every engine action — a ZMQ rawtx evaluation, a ZMQ rawblock, a whole
+mempool reparse (initial, gap-triggered, periodic), boot reconciliation — is one item on the
+engine queue (src/engine/queue.ts: a promise chain) and runs to completion before the next
+item starts, in arrival order. Nothing else mutates engine state. Consequences, which are
+the rules of this codebase:
+
+- Every state change is ONE plain Redis MULTI grouping the writes that must land together
+  (state + outpoint claims + outbox enqueue). An action reads what it needs, decides in
+  memory, and execs one MULTI. Because no other writer exists, nothing can change between
+  the read and the exec: there are NO guards, fences, tombstones, watermarks or conditional
+  scripts anywhere, and there is no Lua. A read-then-write that looks racy is a sign
+  something is off the queue — put it on the queue; never add a condition.
+- A rejection inside a queue item is `fatal` (docker restarts the daemon, boot
+  reconciliation heals). There is no "skip the failed item and keep going".
+- Boot reconciliation (reconcile → resolveLimbo) is the queue's FIRST item; ZMQ opens only
+  after it finishes, so nothing can be queued ahead of or during it.
+- The queue is the reparser's mutex (the whole reparse body is one item) and the block
+  handler's serialisation (a burst of blocks runs one at a time). Throughput is explicitly
+  not a concern.
+- Three components run OUTSIDE the queue and are not writers of engine state:
+  - the heartbeat only READS (tip, watch count, memory, outbox stats) and sends directly;
+  - the admin server READS engine state and probes, and writes ONLY the watch set
+    (`addresses` / `expiries`), which the engine reads but never treats as its own state —
+    a watch renewed by the app while the TTL sweep expires it is decided by whichever
+    write lands last, and that is accepted: expiry is unconditional;
+  - the outbox drainer touches outbox keys only (`outbox`, `outbox:{id}`, `outbox:created`,
+    `outbox:dead`); the engine only ever APPENDS new ids to the outbox, so the drainer is
+    the outbox's one writer and its ack/retry/dead steps are plain MULTIs too.
 
 ## Config (src/config.ts — WRITTEN, do not change signatures)
 
@@ -45,9 +76,14 @@ See `keysFor()`. Public: `addresses` SET (+ `expiries` ZSET member=address score
 Durable chain view: `tip` HASH {hash,height}; `blocks` ZSET (member=hash, score=height,
 pruned to `ringSize`); `maturing` ZSET (member=txid, score=inclusion height);
 `maturing:{txid}` HASH {height, blockHash, matched(JSON), fired(JSON array), hex, inputs(JSON
-Outpoint[]; absent on records written before outpoint tracking — read as `[]`)}.
-Working set (reconstructible): `pending`, `evaluated`, `mempool:current`, `mempool:postBlock`,
-`blockTxids` — all SETs of txids.
+Outpoint[]; absent on records written before outpoint tracking — read as `[]`)} — the
+RECORD, which exists from seen-time (height 0) until tracking ends.
+Working set (reconstructible): `pending` SET of txids (records at height 0); `evaluated` SET
+of txids — the mempool reparse's DEDUPE LIST: every mempool txid evaluated since the last
+tip block (matched or not), so a reparse fetches only what it has not looked at yet. It is
+pruned at every tip block to the txids still in the mempool (a new mempool epoch). It is a
+dedupe, not a guard: nothing decides from it except the reparse's fetch list and the
+evaluator's early return.
 Reorg state (durable): `limbo` SET — txids whose inclusion block was disconnected by a reorg,
 awaiting re-resolution (re-included by the new chain / demoted to mempool / conflicted). Kept
 in redis so a crash mid-reorg finishes resolving on the next block or boot.
@@ -61,25 +97,8 @@ score=deadAt-ms (same hash keys; capped at `OUTBOX_DEAD_MAX`, oldest dropped wit
 hashes). eventId = `<nowMs padded 15>-<seq within that ms padded 8>-<8 hex random>`
 (`makeEventId`; the sequence restarts at 0 whenever the millisecond changes): monotonic, so
 redis' tie order for equal scores (by member) is enqueue order.
-Tombstones (durable, self-pruning): `tombstones` ZSET member=txid score=doneAt-ms — txids
-whose tracking ENDED (final milestone, conflicted); a stale mempool evaluation must not
-resurrect them (see `recordSeen`), and the block path's never-seen promotion skips them.
-ABSOLUTE: any evaluation of a tombstoned txid is refused. Pruned on every tip block below
-now − TOMBSTONE_TTL_MS (3,600,000; constant). The tombstone bounds the STORE side; the
-EVALUATION FENCE (`MAX_EVALUATION_AGE_MS` = 600,000, far below the TTL) bounds the evaluator
-side, so no evaluation can outlive the tombstone that guards it. `conflicted` needs no
-permanent set: an invalid tx cannot re-enter the mempool, and the only other path back, a
-stale evaluation, is fenced.
-Retirement watermark (durable, self-pruning): `retired` ZSET member=txid score=exitAt-ms —
-txids that LEFT pending without ending (`dropPending`, `replacePending`; same Lua). NOT a
-tombstone: a drop is not terminal (a rebroadcast may re-fire `seen`, and a dropped-then-mined
-tx must still confirm through the block path), so the watermark is RELATIVE: `recordSeen`
-refuses (stale) an evaluation whose `startedAtMs <= exitAt` — a duplicate evaluation (ZMQ
-rawtx + reparse fetch) that was in flight when the tx left would otherwise resurrect it as a
-fresh pending record and earn a second `dropped` under a different key — while an evaluation
-started after the exit (a real rebroadcast) records normally and leaves the watermark in
-place (the next exit overwrites it). Pruned with the tombstones (same TTL; only the window
-inside MAX_EVALUATION_AGE_MS matters).
+There are no other key families: no tombstones, no retirement watermark, no mempool or
+block scratch sets — set arithmetic happens in memory inside the queue item.
 
 ## Events (src/lib/types.ts — WRITTEN)
 
@@ -88,6 +107,7 @@ TxEvent payload: `{version:1, event, network, txid, confs, matched:[{address,vou
 idempotencyKey, timestamp, blockHeight, blockHash, hex}` plus, per Outpoint tracking rule 6,
 `reason`/`replacedBy` on `dropped` and `reason`/`conflictingTxid` on proven `conflicted`.
 `expired` is address-scoped: `{version:1, event:'expired', network, address, idempotencyKey, timestamp}`.
+It fires when the watch's lifetime ends, paid or not.
 `heartbeat`: `{version:1, event:'heartbeat', network, tipHeight, nodeHeight, chainLag, watchCount,
 memoryUsedPct, outboxDepth, outboxOldestAgeSec, deadLetterCount, idempotencyKey, timestamp}`.
 Idempotency key shapes are in `src/store/keys.ts` (`idem`). Timestamps: unix ms. For
@@ -100,6 +120,60 @@ attempt that the outbox retries. Consumers MUST dedupe on `idempotencyKey` in th
 database transaction as the credit/reversal they perform, and must not assume arrival order:
 every event carries absolute state (event type, confs, block hash in the key), never a delta.
 
+## Transaction lifecycle
+
+One tracked transaction is a state machine. The physical state is the record + the set it
+is a member of; `done` and `gone` are both "no record, no membership" and differ only in the
+last event the consumer received.
+
+| state | record | membership | meaning |
+|---|---|---|---|
+| `unseen` | none | none | weir knows nothing (or has finished/forgotten the tx) |
+| `pending` | height 0 | `pending` (+ `evaluated`) | seen in the mempool, paying a watch |
+| `maturing(h)` | height h | `maturing` index | mined at height h, below the max milestone |
+| `limbo` | height h (old block) | `limbo` | its block was disconnected; awaiting the new chain |
+| `done` | none | none | max milestone reached — tracking ended |
+| `gone` | none | none | left by a verdict, or quietly |
+
+Transitions — every code path is one of these, and each is one MULTI:
+
+| from → to | trigger | event | written by |
+|---|---|---|---|
+| `unseen → pending` | mempool evaluation matches a watch | `seen` (when milestone 0) | `applyEvaluation` |
+| `unseen → unseen` | evaluation matches nothing; or a repeated sighting of a tracked txid | — (marked evaluated) | `applyEvaluation` / no-op |
+| `unseen → maturing(h)` | mined paying a watch without a mempool sighting (missed ZMQ, direct-to-block, dropped-then-mined, re-inclusion after `done` at exactly max-milestone depth) | — (milestones follow) | `applyBlock.promoted` |
+| `pending → maturing(h)` | mined | — | `applyBlock.promoted` |
+| `maturing(h) → maturing(h)` | block at depth ≥ a milestone m not yet fired | `confirmed` (confs m, key with blockHash) | `applyBlock.fired` |
+| `maturing(h) → done` | confs ≥ max milestone and every milestone enqueued | (last `confirmed` in the same MULTI) | `applyBlock.finished` |
+| `pending → gone` | another tx spends one of its inputs (mempool or block) | `dropped` reason `replaced`, `replacedBy` | `applyEvaluation.dropped` / `applyBlock.dropped` |
+| `pending → gone` | absent from the live mempool at a tip block | `dropped` reason `evicted` | `dropPending` (tip-only) |
+| `maturing(h) → limbo` | its block is disconnected (reorg rewind) | — | `rewind` |
+| `limbo → maturing(h')` | re-included by the new chain | — (milestones re-fire under h') | `applyBlock.promoted` |
+| `limbo → gone` | a new-chain tx spends one of its inputs | `conflicted` reason `double-spend`, `conflictingTxid` | `applyBlock.conflicted` |
+| `limbo → pending` | still in limbo after the tip block, and in the node's mempool | `demoted` | `demoteToPending` (tip-only) |
+| `limbo → gone` | still in limbo after the tip block, not in the mempool | `conflicted` (by elimination) | `conflict` (tip-only) |
+| `pending \| limbo → gone` | mined but no longer paying any watch (watch removed or expired mid-flight) | — | `applyBlock.ended` |
+| `any → gone` | prune-window reset (downtime longer than the node's prune window) | — (logged loudly) | `resetTracking` |
+
+A watch's own lifecycle is one transition: `watched → expired` at a tip block whose wall
+clock passed the deadline (`expireWatch`, event `expired`), unconditional.
+
+Scenario → transitions (the nine E2E scenarios plus the two crash/burst cases):
+
+| scenario | transitions |
+|---|---|
+| 1 happy path | `unseen → pending` (seen) → `maturing(h)` (confirmed:1) → `done` (confirmed:3) |
+| 2 RBF fee-bump | A `pending → gone` (dropped replaced, replacedBy B) and B `unseen → pending` (seen), ONE MULTI; B then as scenario 1 |
+| 3 redirect | A `pending → gone` (dropped replaced, replacedBy B) and B `unseen → unseen`, one MULTI |
+| 4 reorg → demoted | `maturing(h) → limbo` (rewind) → replacement block, tip → `limbo → pending` (demoted) → next block `pending → maturing(h')` (confirmed:1 under h') → `done` |
+| 5 reorg + double-spend | `maturing(h) → limbo` (rewind) → block with B spending its input: `limbo → gone` (conflicted double-spend, conflictingTxid B) inside that block's MULTI; resolveLimbo finds nothing |
+| 6 TTL expiry | `watched → expired` at the next tip block; a pending tx of that address would go `pending → gone` quietly when mined |
+| 7 webhook down | no state change: the events sit in the outbox and drain later |
+| 8 restart mid-flight | `pending` survives the restart; boot reconciliation walks the 3 missed blocks (non-tip, non-tip, tip): `pending → maturing(h)` (confirmed:1) → `done` (confirmed:3); tip-only work at the last block only |
+| 9 /ready | no transition; the probe reads `runtime.reconciled` |
+| crash before exec | the block's MULTI never landed: NO transition, tip unchanged; boot reconciliation replays the block and every transition happens exactly once |
+| reorg burst | blocks B1..Bn queued back to back; each block's MULTI applies its own transitions (rewind, promotions, proven conflicts); the tip-only work (eviction, TTL, `evaluated` prune, limbo resolution) runs only at the block that equals `getbestblockhash` — earlier blocks defer it, so a limbo tx stays in limbo until the node's view is settled |
+
 ## Outbox (durable delivery)
 
 Why: the events that REVERSE money (`dropped`, `demoted`, `conflicted`, `expired`) must not
@@ -107,23 +181,11 @@ be lost when the webhook is down, and no state transition may await the network 
 delivery inside a transition let a block race the `seen` write and corrupt the record).
 
 Rules:
-1. A state transition and its event are ONE atomic Redis step. Every Store transition method
-   that produces an event takes the event and appends `HSET outbox:{id} …` + `ZADD outbox now id`
-   to the same MULTI as its state mutation. Either both persist or neither does. The
-   exceptions in MECHANISM (not in atomicity) are Lua scripts (EVAL) rather than MULTIs:
-   `recordSeen`, `replacePending` and `dropPending`, because they race other paths (a tx can
-   be mined, or replaced from the mempool, while a caller is between its read and its write)
-   and need guards a MULTI cannot express, and every transition that releases outpoints
-   (`conflict`, `finishMaturing`, `endTracking` too), whose release reads the record's
-   `inputs` and SREMs only the releaser's own txid from each claimant SET.
-   GUARDS: a transition re-validates live state INSIDE its Lua wherever two writers can
-   race. The mempool evaluator races the block pipeline, so `recordSeen`, `replacePending`
-   and the tip-check `dropPending` are guarded (evaluated / mined / tombstoned / pendingUnmined
-   / fence) and return 0 to a stale caller — never a second verdict. The block + reorg path
-   is ONE serialized writer (makeBlockHandler's queue; reconcile runs before ZMQ starts) and
-   the evaluator never mutates maturing/limbo state, so `conflict`, `finishMaturing`,
-   `endTracking`, `demoteToPending`, `promoteToMaturing`, `markFired` read-then-write within
-   one block's processing and carry no guard by design.
+1. A state transition and its event are ONE MULTI. Every Store transition that produces an
+   event appends `HSET outbox:{id} …` + `ZADD outbox now id` + `ZADD outbox:created now id`
+   to the same MULTI as its state mutation. Either both persist or neither does. There are
+   no conditional writes: the single writer (see Single writer) makes every read the
+   transition acts on current.
 2. Nothing in the engine awaits delivery. Engine code never calls the sink.
 3. One drainer (src/delivery/outbox.ts) delivers: every `OUTBOX_POLL_MS` (1000, constant) it
    takes due events (`ZRANGEBYSCORE outbox -inf now LIMIT 0 50`), reads each hash, and sends
@@ -131,13 +193,12 @@ Rules:
    together arrive in order when the endpoint is healthy; across failures order is
    best-effort). The interval pass keeps taking batches while they come back full (a backlog
    drains at line rate). Per event: 2xx → `outboxAck` (MULTI DEL hash, ZREM outbox, ZREM
-   created); failure → attempts+1, `lastError`, and either `outboxRetry` (ZADD score =
-   now + backoff, backoff = min(1000·2^(attempts−1), 300000) ms + up to 25% jitter) or,
-   once `now − createdAt ≥ OUTBOX_MAX_AGE`, `outboxDead` (ZREM outbox + created, ZADD dead,
-   then cap: drop the oldest dead entries and their hashes beyond `OUTBOX_DEAD_MAX` — ONE Lua)
-   with an error-level log naming the idempotencyKey. Both are Lua scripts that are NO-OPS
-   when the hash no longer exists (a concurrent ack won), so a partial hash can never be
-   created. A dangling id (hash missing) is ZREM'd.
+   created); failure → attempts+1, `lastError`, and either `outboxRetry` (MULTI: HSET + ZADD
+   score = now + backoff, backoff = min(1000·2^(attempts−1), 300000) ms + up to 25% jitter)
+   or, once `now − createdAt ≥ OUTBOX_MAX_AGE`, `outboxDead` (reads ZCARD dead + the
+   overflow ids, then ONE MULTI: HSET, ZREM outbox + created, ZADD dead, and the cap — DEL
+   the oldest dead hashes beyond `OUTBOX_DEAD_MAX` + ZREM them) with an error-level log
+   naming the idempotencyKey. A dangling id (hash missing) is ZREM'd.
 4. The drainer's own failures (redis) are fatal (background path). The sink never throws.
 5. Crash after a 2xx but before the ack → the event is sent again: this is the at-least-once
    duplicate consumers dedupe on `idempotencyKey`.
@@ -149,27 +210,19 @@ Rules:
    delivery's retry write is a deny-oom command and fails → fatal → docker restarts → the next
    boot drain tries again — a restart loop that ends as soon as deliveries succeed, never a
    silent stall. If the endpoint is merely down the pass just reschedules. Shutdown stops
-   the poll loop and waits for the
-   in-flight drain pass. Every pass — interval or a direct `drainOnce()` — runs through ONE
-   shared in-flight promise: a caller that finds a pass running waits for it, then runs; two
-   passes never overlap and never double-send.
-8. EVALUATION FENCE: every evaluation carries `startedAtMs` — captured at ZMQ rawtx receipt
-   (makeRawTxHandler) and, in the reparser, immediately BEFORE getrawtransaction is issued.
-   `recordSeen(rec, event, startedAtMs)` refuses (`stale`, warns with the age) when
-   `now − startedAtMs > MAX_EVALUATION_AGE_MS` (600,000, exported from src/store/redis.ts;
-   MUST stay far below TOMBSTONE_TTL_MS). The check runs inside the Lua, atomically with the
-   other guards. A refused evaluation leaves the txid un-evaluated: the next reparse redoes
-   it with a fresh view. Without it a response parked past the tombstone TTL would land after
-   the prune: confirmed:1 → seen → false dropped.
+   the poll loop and waits for the in-flight drain pass. Every pass — interval or a direct
+   `drainOnce()` — runs through ONE shared in-flight promise: a caller that finds a pass
+   running waits for it, then runs; two passes never overlap and never double-send. That
+   serialisation is why the outbox needs no conditional writes either.
 
 Store surface (all methods live on Store, mirrored exactly in tests/fakes.ts):
 `outboxDue(nowMs, limit): Promise<string[]>` (ids, ascending score), `outboxRead(id)` →
 `{event: WeirEvent, attempts, createdAt, lastError} | null`, `outboxAck(id)`,
-`outboxRetry(id, nextAtMs, attempts, lastError): Promise<boolean>` and
-`outboxDead(id, nowMs, attempts, lastError, deadMax): Promise<boolean>` (false = no-op, the
-hash was gone), `outboxStats(): Promise<{depth: number; oldestCreatedAt: number | null; dead: number}>`
-(`oldestCreatedAt` = the lowest score in `outbox:created`, `ZRANGE 0 0 WITHSCORES` — exact
-and O(1)). Transition methods that enqueue are listed under src/store/redis.ts.
+`outboxRetry(id, nextAtMs, attempts, lastError)`, `outboxDead(id, nowMs, attempts,
+lastError, deadMax)`, `outboxStats(): Promise<{depth: number; oldestCreatedAt: number | null;
+dead: number}>` (`oldestCreatedAt` = the lowest score in `outbox:created`, `ZRANGE 0 0
+WITHSCORES` — exact and O(1)). Transition methods that enqueue are listed under
+src/store/redis.ts.
 
 ## Outpoint tracking (replacement + proven conflicts)
 
@@ -178,94 +231,62 @@ noticed as `dropped` at the NEXT block (up to ~10 min), and `conflicted` is infe
 mempool absence rather than proven. Inputs are literal bytes in every tx weir already
 decodes — no txindex, no prevout resolution: weir only checks them against its OWN memory.
 
-Model: an outpoint can legitimately have SEVERAL concurrent tracked spenders (an RBF chain,
-competing double-spends), so ownership is a SET of claimants, never a single owner. Claims
-never conflict; there is no force, no waitlist, no handover, no adjudication rounds.
+Model: an outpoint can legitimately have SEVERAL concurrent tracked spenders (a mempool
+spender alongside a mined one during reorg lag), so ownership is a SET of claimants, never a
+single owner. Claims never conflict; there is no force, no waitlist, no handover.
 
 Rules:
 1. `DecodedTx` carries `inputs: Outpoint[]` (`{txid, vout}`, prev-txid display-order hex);
    the coinbase input (txid all zeros, vout 0xffffffff) is omitted. `MaturingRecord` carries
    the same `inputs` so terminal cleanup can release them.
 2. `weir:{net}:outpoint:{txid}:{vout}` SET of claimant txids (pending or maturing).
-   - CLAIM = SADD, inside `recordSeen` (its Lua) and `promoteToMaturing` (its MULTI). Always
-     succeeds. A tx's claims are complete or absent (same atomic op as its record).
-   - RELEASE = SREM of ONLY the releaser's own txid, inside every transition that deletes the
-     record (`dropPending`, `replacePending`, `conflict`, `finishMaturing`, `endTracking` —
-     each reads `inputs` from the record it deletes). The key vanishes when empty. Nobody
-     else's claim is ever touched. `demoteToPending` keeps claims (the tx stays tracked).
-   - `clearTracking` DELs every `outpoint:*` key (SCAN + DEL BEFORE its main Lua — the bulk
-     pass); its main Lua and the orphan sweep also release each record's OWN claims before
-     deleting the record, so a `recordSeen` landing between the bulk pass and the Lua leaves
-     no orphan claim. A claimant without a record is skipped by every reader anyway, so a
-     stray claim would be harmless, just unbounded.
-3. REPLACEMENT (mempool path, src/engine/txPipeline.ts) — ONE pass, no rounds:
-   `isEvaluated` → evaluation fence (a stale view is refused before anything is mutated) →
-   `outpointOwners(inputs)` (pipelined SMEMBERS, self excluded) → for EVERY distinct owner:
-   read its record only to build the payload (gone → nothing to do); record unmined →
-   `replacePending(owner, ev, startedAtMs, spender)` — ONE Lua that atomically checks the
-   SPENDER's own state first (the spender retired at an exit ≥ `startedAt`, or tombstoned →
-   `stale`, nothing written: an evaluation that predates its own tx's exit may not act on
-   anyone — an old evaluation of A would otherwise replace the B that replaced A), then
-   applies the fence (-1), requires `pendingUnmined` (in `pending` AND record exists with height 0, else 0:
-   nothing written, nothing enqueued — a second caller, or one the block pipeline overtook,
-   finds it already handled), then SREM pending, SREM evaluated (the original may return if
-   the replacement is itself dropped), release its claims, DEL record, + enqueue `dropped`
-   with `reason: 'replaced'`, `replacedBy: <this txid>`, key
-   `{net}:{owner}:dropped:replaced:{replacedBy}` → 1, and ZADD the retirement watermark
-   (`retired`, score = now); record MINED (maturing/limbo) → a mempool tx cannot displace a
-   confirmed tx (bitcoind would not have relayed it; during reorg lag the block path
-   adjudicates it — rule 4): warn, skip. `replacePending` resolves `'replaced' | 'skipped' |
-   'stale'`; if ANY adjudication of the pass came back `stale`, the evaluator stops WITHOUT
-   `markEvaluated` (an unwatched spender marked evaluated would never be re-fetched while the
-   tx it replaced stayed pending): the next reparse redoes the whole evaluation with a fresh
-   `startedAt`. Then match outputs; no match → `markEvaluated`, but only after the same
-   TS-side age check (`now − startedAtMs > MAX_EVALUATION_AGE_MS` → return without marking);
-   a watched tx is recorded with `recordSeen` (outcome `'recorded' | 'skipped' | 'stale'` —
-   `stale` also when the evaluation predates the txid's retirement watermark), which claims
-   its inputs. Documented imprecision: two spenders of one outpoint arriving CONCURRENTLY can both
-   see no prior owner and both be recorded; bitcoind keeps only one, and the loser is
-   reported `dropped` with `reason: 'evicted'` at the next tip check rather than `replaced`
-   immediately — a labelling difference, never a lost verdict.
-4. BLOCK PATH (src/engine/blockPipeline.ts, step 2, before promotion): collect every input of
-   every block tx (excluding coinbase), `outpointOwners` once, then for each owner ≠ its
-   spender (the owner's record read only for the payload; gone → skip):
-   - owner in LIMBO → PROVEN conflict: `conflict(owner, ev)` with `conflictingTxid` = the
-     spender, `reason: 'double-spend'`, timestamp = blockTime*1000;
+   - CLAIM = SADD, inside the MULTI that creates the record (`applyEvaluation`'s seen part)
+     or promotes it (`applyBlock.promoted`). A tx's claims are complete or absent (same
+     MULTI as its record).
+   - RELEASE = SREM of ONLY the releaser's own txid, inside every MULTI fragment that
+     deletes the record (drop, conflict, finish, end — each takes the record the caller
+     read; `inputs` come from it). The key vanishes when empty. Nobody else's claim is ever
+     touched. `demoteToPending` keeps claims (the tx stays tracked).
+   - `resetTracking` DELs every `outpoint:*` key in the same MULTI as the records.
+3. REPLACEMENT (mempool path, src/engine/txPipeline.ts) — ONE pass, one MULTI:
+   `isEvaluated` → return; a record already exists (pending, maturing or limbo) → return (a
+   repeated sighting, see txPipeline) → `outpointOwners(inputs)` (pipelined SMEMBERS, self
+   excluded) → for EVERY distinct owner: read its record to build the payload (gone →
+   nothing to do); record unmined → a `dropped` with `reason: 'replaced'`, `replacedBy:
+   <this txid>`, key `{net}:{owner}:dropped:replaced:{replacedBy}` goes into this
+   evaluation's `dropped` list; record MINED (maturing/limbo) → a mempool tx cannot
+   displace a confirmed tx (bitcoind would not have relayed it; during reorg lag the block
+   path adjudicates it — rule 4): warn, skip. Then match outputs; the whole outcome — SADD
+   evaluated, every drop (SREM pending, SREM evaluated, release, DEL record, enqueue), and
+   when matched the seen record (HSET height 0, SADD pending, claims, enqueue `seen`) — is
+   `applyEvaluation`, one MULTI. Two spenders of one outpoint are evaluated one after the
+   other (the queue), so the second always finds the first as a claimant and replaces it.
+4. BLOCK PATH (src/engine/blockPipeline.ts, the input scan, before promotion): collect every
+   input of every block tx (excluding coinbase), `outpointOwners` once, then for each owner
+   ≠ its spender (the owner's record read for the payload; gone → skip):
+   - owner in LIMBO → PROVEN conflict: `conflicted` with `conflictingTxid` = the spender,
+     `reason: 'double-spend'`, timestamp = blockTime*1000 — into the block's `conflicted`;
    - owner's record MINED (height > 0) and not in limbo → impossible on a valid chain; log
      error, skip;
-   - otherwise → `replacePending(owner, ev, scanStartMs, spender)` with `replacedBy` = the
-     confirmed spender (a double-spend confirmed while ours sat in the mempool); the Lua
-     decides (a `stale` here means the mined spender is tombstoned within the TTL — warned,
-     the owner is left to the tip-block dropped check).
+   - otherwise → `dropped` with `replacedBy` = the confirmed spender (a double-spend
+     confirmed while ours sat in the mempool) — into the block's `dropped`.
    Every claimant of a spent outpoint is adjudicated (a field may have several). Running
    before promotion means a limbo tx cannot be both re-included and conflicted by one block.
+   All of it lands in the block's ONE MULTI (`applyBlock`).
 5. `resolveLimbo` keeps its by-elimination fallback (`getmempoolentry` → demoted, else
    conflicted) for txs the new chain neither re-included nor provably conflicted (e.g. an
    input spent by a tx weir never decoded because it was below the ring floor).
 6. Payload additions (all OPTIONAL, additive — consumers ignoring them are unaffected):
    `dropped` gains `reason: 'replaced' | 'evicted'` (`evicted` is the residual verdict of the
-   tip-block dropped check) and `replacedBy?: string`; `conflicted` gains
+   tip-block eviction check) and `replacedBy?: string`; `conflicted` gains
    `reason?: 'double-spend'` and `conflictingTxid?: string` when proven.
-7. RETRY SAFETY NET: an evaluation the fence refused, or a tx missed by ZMQ without a
-   sequence gap, is un-evaluated and is picked up by the next mempool reparse — which runs
-   PERIODICALLY (`MEMPOOL_REPARSE_INTERVAL_MS` = 300 000, constant; the reparser's mutex skips
-   overlap), not only at boot and on ZMQ gaps. Cost: one getrawmempool plus fetches of
-   un-evaluated txids only.
+7. RETRY SAFETY NET: a tx missed by ZMQ without a sequence gap is un-evaluated and is picked
+   up by the next mempool reparse — which runs PERIODICALLY (`MEMPOOL_REPARSE_INTERVAL_MS` =
+   300 000, constant) as a queue item, not only at boot and on ZMQ gaps. Cost: one
+   getrawmempool plus fetches of un-evaluated txids only.
 
-Store surface: `outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string[]>>`
-(field → claimant txids, empty fields omitted, chunked pipelining), `replacePending(txid,
-event, startedAtMs, spenderTxid): Promise<'replaced' | 'skipped' | 'stale'>` (rule 3; only
-`replaced` wrote anything), `recordSeen(rec, event, startedAtMs): Promise<'recorded' | 'skipped' |
-'stale'>`, `promoteToMaturing` (claims via SADD), and the releasing Luas `dropPending(txid,
-event): Promise<boolean>` (guarded like replacePending, unfenced; both ZADD `retired`),
-`conflict(txid, event)`, `finishMaturing(txid, nowMs)`, `endTracking(txid)` — they read the
-record's own `inputs`, callers pass nothing. `pruneRetired(beforeMs)` (tip blocks, same TTL
-as `pruneTombstones`). `clearTracking` (SCAN-DEL of `outpoint:*` FIRST, then one Lua that
-releases each collected record's own claims and DELs records + tracking keys, then
-`sweepOrphanRecords` — a `recordSeen` landing after the Lua keeps its record, memberships
-and claims; one landing before it leaves no orphan claim) and `sweepOrphanRecords`
-(per-record conditional Lua that also releases the record's own claims). Idempotency: `idem.replaced(net, txid,
-replacedBy)`; `conflicted` keeps its single key (one terminal verdict per txid).
+Idempotency: `idem.replaced(net, txid, replacedBy)`; `conflicted` keeps its single key (one
+terminal verdict per txid).
 
 ## Health from chain lag (`/live`, `/ready`, `/metrics`)
 
@@ -303,9 +324,8 @@ they expose counts, never addresses or txids):
 src/lib/metrics.ts: an in-process registry — `counters.inc(name, labels?)`,
 `gauges.set(name, value, labels?)`, `render(): string`. Process-local (counters reset on
 restart; that is what `_total` means). Incremented by: every enqueuing Store transition
-AFTER its write succeeded (events_enqueued_total by event — MULTI and Lua paths alike;
-`Store.enqueue` itself is only the MULTI helper and runs before the write, and a guarded Lua
-may write nothing), the outbox drainer (deliveries_total, dead_lettered_total), the block pipeline
+AFTER its MULTI exec'd (events_enqueued_total by event, once per event the MULTI carried),
+the outbox drainer (deliveries_total, dead_lettered_total), the block pipeline
 (blocks_processed_total, reorgs_total), zmq.ts (last-message timestamps on every rawtx /
 rawblock). Gauges that need I/O (heights, watch count, outbox, memory) are computed at
 scrape time by the admin handler, not pushed.
@@ -340,12 +360,12 @@ NEVER swallow errors silently. ONE fatal-error policy for BACKGROUND paths: an U
 error on a path where nobody is waiting for an answer — where a swallowed error would be a
 silent stall — crashes the process through `fatal()` (src/lib/log.ts — logs message + stack,
 `process.exit(1)`); docker restarts the daemon and boot reconciliation (reconcile →
-resolveLimbo → mempool reparse) heals. Fatal sites: the ZMQ subscriber loop failing or ANY
-ZMQ handler rejecting (rawtx, rawblock, gap-triggered reparse), a heartbeat tick rejecting,
-the initial mempool reparse rejecting, a block that fails to process (makeBlockHandler — no
-"skip the failed block and keep the queue alive"), the redis client giving up reconnecting
-or ending unasked (src/store/redis.ts), the admin server's `'error'` event (listen failure),
-and boot/shutdown failures. Every abnormal exit goes through `fatal`; a clean shutdown exits 0.
+resolveLimbo → mempool reparse) heals. Fatal sites: the ZMQ subscriber loop failing, ANY
+engine-queue item rejecting (a rawtx evaluation, a block, a reparse — makeEngineQueue; no
+"skip the failed item and keep the queue alive"), a heartbeat tick rejecting, the redis
+client giving up reconnecting or ending unasked (src/store/redis.ts), the admin server's
+`'error'` event (listen failure), and boot/shutdown failures. Every abnormal exit goes
+through `fatal`; a clean shutdown exits 0.
 REQUEST/RESPONSE paths are different: a failed admin request is answered `500 {error}` and
 the daemon keeps running — the request has a natural error channel, and a failed request
 does not imply corrupted engine state. Webhook delivery failures are NEVER fatal either:
@@ -358,12 +378,14 @@ Deps are typed by picking from the real classes, never by hand-copying signature
 outbox drainer and the heartbeat take a sink; engine modules enqueue through the Store. Logging
 is the single shared `log` from src/lib/log.ts — no module takes a logger dep. Tests
 substitute tests/fakes.ts (`FakeStore`, `FakeSink`, `FakeChain`), which MUST match the real
-classes' semantics exactly (e.g. `removeMaturing` deletes index AND record; the ring is a
+classes' semantics exactly (e.g. a MULTI's fragments apply in the same order; the ring is a
 ZSET member→score map, so two hashes can coexist at one height); a signature mismatch is
 fixed in the fake, never in the real class. `FakeStore` also models the outbox (id → record,
 queue as id → score, dead set) and exposes `outboxEvents(): WeirEvent[]` (queued events in
 score-then-insertion order) so engine tests assert on what was ENQUEUED; delivery itself is
-tested through the drainer with `FakeSink`.
+tested through the drainer with `FakeSink`. `FakeChain.getBestBlockHash` answers the highest
+main-chain block (or `best` when a test sets it), so tests drive the tip-only gate the same
+way bitcoind does.
 
 ### src/lib/log.ts
 `export const log: { info(ctx: string, msg: string): void; warn(...): void; error(...): void }`
@@ -431,111 +453,80 @@ onRawBlock: (buf: Buffer) => void; onTxGap: () => void }): Promise<{ close(): Pr
 — zeromq v6 Subscriber, topics `rawtx` + `rawblock`, sequence tracking per topic; a rawtx
 sequence gap calls `onTxGap()` (fires once per gap, not per message). Handlers are invoked
 without await (fire-and-forget) but MUST be wrapped so a rejection is `fatal` — never
-unhandled, never swallowed. A subscriber-loop failure (other than close()) is fatal too.
+unhandled, never swallowed; in index.ts every handler hands its work to the engine queue,
+which is what makes the fire-and-forget safe. A subscriber-loop failure (other than close())
+is fatal too. bitcoind publishes a tx's `rawtx` when it enters the mempool AND again for
+every tx of a connected or disconnected block — always before the `rawblock` of a
+connected block, on one socket, so the queue sees them in that order.
+
+### src/engine/queue.ts
+`export function makeEngineQueue(onFatal = fatal): { run(fn: () => Promise<void>): Promise<void> }`
+— the one writer (see Single writer): a promise chain; `run` appends `fn` and resolves once
+it has run. A rejection is `onFatal('engine', err)` — the returned promise never rejects.
+`onFatal` is injectable for tests only.
 
 ### src/store/redis.ts
 `export class Store` wrapping `redis` v4 client. Constructor `(url: string, network: Network)`.
-`connect()/quit()`. Methods (all promise-returning; keys via `keysFor`):
+`connect()/quit()`. Zero Lua. Reads are single commands or read-only pipelines; every
+mutation is ONE MULTI. Keys via `keysFor`. Types exported: `Claimant` (= `Pick<MaturingRecord,
+'txid' | 'inputs'>`), `Drop` (`{rec: Claimant; event: TxEvent}`), `EvaluationWrites`,
+`BlockWrites`, `OutboxRecord`.
 - watches: `isWatched(addr)`, `watchedSubset(addrs: string[]): Promise<string[]>` (one
-  SMISMEMBER — return ALL matches, do not bail on first), `addWatch(addr, expiresAtMs?: number)`,
-  `removeWatch(addr): Promise<boolean>` (also ZREM expiries), `watchCount()`,
-  `scanWatches(cursor: string): Promise<{cursor: string; addresses: string[]}>` (SSCAN, COUNT 1000),
-  `dueExpiries(nowMs): Promise<Array<{address: string; expiresAtMs: number}>>`,
-  `clearExpiry(addr)`, `getExpiry(addr): Promise<number | null>` (ZSCORE expiries — the admin
-  server's `GET /watches/:address` needs the expiresAt readback).
-- evaluated/pending: `isEvaluated(txid)`, `markEvaluated(txid)` (the no-match path),
-  `pendingTxids(): Promise<string[]>`. Every other pending/evaluated mutation is part of a
-  transition below (there is no standalone `addPending`/`removePending`/`unmarkEvaluated`).
-- block/mempool bookkeeping: `setBlockTxids(txids)`, `pendingInBlock(): Promise<string[]>`
-  (SINTER pending ∩ blockTxids), `replaceCurrentMempool(txids)`,
-  `newMempoolTxids(): Promise<string[]>` (SDIFF current − evaluated — no "previous" snapshot:
-  `evaluated` alone decides; a dropped tx is un-evaluated again so a rebroadcast re-fires `seen`),
-  `clearCurrentMempool()` (DEL current), `replacePostBlockMempool(txids)`,
-  `droppedPending(): Promise<string[]>` (SDIFF pending − postBlock − blockTxids),
-  `pruneEvaluated()` (SINTERSTORE evaluated = evaluated ∩ postBlock).
-- tip/ring: `getTip(): Promise<Tip | null>`, `setTip(tip)`, `ringPut(height, hash)`,
-  `ringHashAt(height): Promise<string | null>`, `ringAll(): Promise<Array<{height; hash}>>`
-  (ZRANGE 0 -1 WITHSCORES, ascending — INCLUDES height 0, which a `(0 +inf` range would
-  miss on a fresh regtest ring holding only genesis), `ringPrune(keep: number)`,
-  `ringRemoveAbove(height)` (ZREMRANGEBYSCORE — reorg rewind, keeps the one-hash-per-height
-  invariant).
-- transitions that ENQUEUE (each one MULTI = state mutation + outbox HSET/ZADD; see Outbox):
-  `recordSeen(rec: MaturingRecord, event: TxEvent | null, startedAtMs: number): Promise<'recorded' | 'skipped' | 'stale'>`
-  — HSET record (height 0), SADD pending, SADD evaluated, claim each of `rec.inputs` (SADD
-  txid into `outpoint:{txid}:{vout}`; ARGV[14] = inputs JSON, ARGV[15] = the `{txid}:{vout}`
-  fields joined by ',', ARGV[16] = the key prefix the Lua builds the SET names from —
-  single-instance redis, see Topology), + enqueue when event is non-null (null when seen is
-  disabled). ONE Lua script, FENCED (refused when now − startedAtMs >
-  MAX_EVALUATION_AGE_MS, see Outbox rule 8) and GUARDED: a no-op (resolves false) when `evaluated` already
-  holds the txid (a duplicate concurrent evaluation), or the record already has height > 0
-  (the block pipeline mined + promoted it between this evaluation's read and its write —
-  without the guard a late `seen` write would put a mined record back to height 0), or the
-  txid is TOMBSTONED (tracking already ended and the record is GONE, so the first two guards
-  cannot see it: a mempool RPC that read the tx before the block and returned after the
-  final-milestone cleanup would otherwise recreate a height-0 pending record and the next
-  block would emit a false `dropped` for a confirmed payment); and `stale` (code -3, warned)
-  when the txid is RETIRED at an exit time ≥ `startedAtMs` (a duplicate evaluation that
-  predates a drop/replacement — see Redis schema, retirement watermark);
-  `markFired(txid, fired: number[], event: TxEvent)` — HSET fired + enqueue `confirmed`
-  (fired is recorded at ENQUEUE time; delivery retry is the outbox's job);
-  `dropPending(txid, event: TxEvent): Promise<boolean>` — ONE GUARDED Lua: not
-  pending-unmined → 0 (nothing written, false); else SREM pending, SREM evaluated, release its
-  claims (SREM its own txid from each prevout SET in the record's `inputs`), DEL record, ZADD
-  `retired` score=now (the retirement watermark), + enqueue (`reason: 'evicted'`) → true;
-  `replacePending(txid, event: TxEvent, startedAtMs, spenderTxid): Promise<'replaced' | 'skipped' | 'stale'>`
-  — ONE Lua: the spender retired at an exit ≥ startedAtMs, or tombstoned → -3 (`stale`,
-  warned); fence → -1 (`stale`, warned); not pending-unmined (not pending, record missing,
-  or mined) → 0 (`skipped`, nothing written); else the dropPending mutation (watermark
-  included) + enqueue `dropped` with `reason: 'replaced'` → 1 (`replaced`) (see Outpoint
-  tracking rule 3; no tombstone — not a terminal verdict);
-  `demoteToPending(rec, event: TxEvent)` — HSET record back to height 0/blockHash ''/fired [],
-  SADD pending, SADD evaluated, SREM limbo, + enqueue `demoted` (`evaluated` is part of it
-  because the tip prune forgot the txid when it was mined; without it the next reparse would
-  emit a second `seen`);
-  `conflict(txid, event: TxEvent)` — ONE Lua: SREM pending, ZREM maturing, release its
-  claims, DEL record, SREM limbo, ZADD tombstones, + enqueue;
-  `expireWatch(addr, event: ExpiredEvent)` — SREM addresses, ZREM expiries, + enqueue;
-  `endTracking(txid)` — ONE Lua: SREM pending, SREM limbo, release its claims, DEL record
-  (no event: watch removed mid-flight);
-  `finishMaturing(txid, nowMs)` — ONE Lua: release its claims, DEL record, ZREM maturing,
-  ZADD tombstones score=nowMs (no event: the final-milestone cleanup — tracking ENDED). `dropPending` deliberately does NOT
-  tombstone: a rebroadcast may legitimately re-fire `seen`.
-- tombstones: `isTombstoned(txid)` (ZSCORE non-nil), `pruneTombstones(beforeMs)`
-  (ZREMRANGEBYSCORE -inf beforeMs; the tip block calls it with now − TOMBSTONE_TTL_MS);
-  `pruneRetired(beforeMs)` — the same prune for the retirement watermark.
-- maturing: `promoteToMaturing(rec: MaturingRecord)` — THE mined-tx promotion, one MULTI:
-  HSET record, ZADD maturing, SREM pending, SREM limbo, SADD evaluated, SADD into each prevout SET (every promotion
-  branch uses it, so a crash cannot leave a half-promoted tx; no event — confirmations come
-  from the milestone sweep), `maturingEntries(): Promise<Array<{txid: string; height: number}>>`,
-  `removeMaturing(txid)` (DEL record + ZREM — dangling-index cleanup only; the final-milestone
-  cleanup is `finishMaturing`, which also tombstones),
-  `unindexMaturing(txids: string[])` (ONE ZREM of the index ONLY, records kept — the
-  maturing→limbo transition; no-op on empty). Reading a maturing record is `readRecord`.
-- records (hash-only, exist from seen-time): `readRecord(txid)`. Records are written only by
-  transitions (`recordSeen`, `promoteToMaturing`, `demoteToPending`, `markFired`) and deleted
-  only by transitions (`dropPending`, `conflict`, `endTracking`, `removeMaturing`).
-- limbo: `addLimbo(txids: string[])`, `limboTxids(): Promise<string[]>`, `removeLimbo(txid)`
-  (demotion is `demoteToPending` above).
-- outpoints: `outpointOwners(outpoints): Promise<Map<string, string[]>>` (one SMEMBERS per
-  prevout, pipelined in chunks of 1000; prevouts with claimants only; contract under Outpoint
-  tracking).
-- `sweepOrphanRecords(): Promise<number>` — SCAN `maturing:*`; each record's own claims are
-  released and the record deleted by its own Lua ONLY while its txid has no live membership
-  (not pending, not in limbo, not in the maturing index) — a record a concurrent
-  `recordSeen`/promotion just created is left alone.
-- `clearTracking(): Promise<string[]>` — prune-window guard: SCAN + DEL every `outpoint:*`
-  SET (the bulk pass), collect the txids of limbo + pending + maturing, then ONE Lua releases
-  each of their records' own claims, DELs the records AND the tracking keys (maturing index,
-  pending, limbo, evaluated, mempool scratch, block txids) atomically, then
-  `sweepOrphanRecords()` — so a `recordSeen` landing after the Lua keeps its record,
-  memberships and claims, and one landing before it leaves no orphan claim. PRESERVING watches/expiries/tip/ring AND the
-  outbox (queued events are still owed); returns the txids whose tracking was lost.
+  SMISMEMBER — return ALL matches, do not bail on first), `addWatch(addr, expiresAtMs?: number)`
+  (MULTI: SADD + ZADD expiries / ZREM expiries), `removeWatch(addr): Promise<boolean>` (MULTI:
+  SREM + ZREM expiries), `watchCount()`, `scanWatches(cursor: string): Promise<{cursor: string;
+  addresses: string[]}>` (SSCAN, COUNT 1000), `dueExpiries(nowMs): Promise<Array<{address:
+  string; expiresAtMs: number}>>`, `getExpiry(addr): Promise<number | null>` (ZSCORE expiries),
+  `expireWatch(addr, event: ExpiredEvent)` — MULTI: SREM addresses, ZREM expiries, + enqueue.
+- tracking reads: `isEvaluated(txid)`, `evaluatedTxids()`, `pendingTxids()`, `limboTxids()`,
+  `maturingEntries(): Promise<Array<{txid: string; height: number}>>` (ZRANGE WITHSCORES,
+  ascending), `readRecord(txid): Promise<MaturingRecord | null>`,
+  `outpointOwners(outpoints: Outpoint[]): Promise<Map<string, string[]>>` (one SMEMBERS per
+  prevout, pipelined in chunks of 1000; prevouts with claimants only, keyed `{txid}:{vout}`).
+- tip / ring reads: `getTip(): Promise<Tip | null>`, `ringHashAt(height): Promise<string |
+  null>`, `ringAll(): Promise<Array<{height; hash}>>` (ZRANGE 0 -1 WITHSCORES, ascending —
+  INCLUDES height 0, which a `(0 +inf` range would miss on a fresh regtest ring holding
+  only genesis).
+- MULTI fragments (private, the building blocks every transition is composed of — the fake
+  mirrors them 1:1): `enqueue` (HSET outbox:{id} + ZADD outbox + ZADD outbox:created),
+  `tipOps` (HSET tip + ZADD blocks), `forgetOps(rec)` (SREM its own txid from each of its
+  prevout SETs + DEL record), `dropOps(drop)` (SREM pending, SREM evaluated, forget, enqueue
+  `dropped`), `conflictOps(rec, event)` (SREM pending, ZREM maturing, SREM limbo, forget,
+  enqueue `conflicted`), `promoteOps(rec)` (HSET record, ZADD maturing, SREM pending, SREM
+  limbo, SADD its claims).
+- transitions, each ONE MULTI:
+  `setTip(tip)` — tipOps (boot first-run initialisation);
+  `applyEvaluation({txid, dropped: Drop[], seen: {rec, event | null} | null})` — SADD
+  evaluated; dropOps for every replaced claimant; when `seen`: HSET record (height 0), SADD
+  pending, SADD its claims, + enqueue `seen` when the event is non-null;
+  `applyBlock({promoted, fired, finished, dropped, conflicted, ended, unindexed, tip,
+  ringKeep})` — in this order: promoteOps for each promoted record; for each fired
+  `{txid, fired, event}` HSET fired + enqueue `confirmed`; for each finished record ZREM
+  maturing + forgetOps; dropOps for each dropped; conflictOps for each conflicted; for each
+  ended record SREM pending, SREM limbo, forgetOps; ZREM maturing for the unindexed
+  (dangling entries); tipOps; ZREMRANGEBYRANK blocks (keep `ringKeep`). A tx promoted and
+  finished in the same block nets out to gone with its `confirmed` events enqueued;
+  `rewind(ancestor: Tip, displaced: string[])` — SADD limbo + ZREM maturing for the
+  displaced (records kept), ZREMRANGEBYSCORE blocks `(ancestor.height +inf`, tipOps;
+  `dropPending(drop)` — dropOps (the tip-only eviction verdict, `reason: 'evicted'`);
+  `demoteToPending(rec, event)` — HSET record back to height 0 / blockHash '' / fired [],
+  SADD pending, SADD evaluated (the tx is in the mempool and evaluated: the reparse must not
+  fetch it again), SREM limbo, + enqueue `demoted`; claims kept;
+  `conflict(rec, event)` — conflictOps (the by-elimination verdict);
+  `removeLimbo(txid)` — SREM limbo (a limbo entry whose record is gone: corruption cleanup);
+  `forgetEvaluated(txids)` — SREM evaluated (no-op on []);
+  `resetTracking(tip): Promise<string[]>` — SCAN `outpoint:*` and `maturing:*` (reads),
+  collect the txids of limbo ∪ pending ∪ maturing, then ONE MULTI: DEL every scanned key,
+  DEL maturing/pending/limbo/evaluated, tipOps. Preserves watches, expiries, the ring below
+  and the outbox (queued events are still owed). Returns the lost txids.
 - outbox: `outboxDue`, `outboxRead`, `outboxAck`, `outboxRetry`, `outboxDead`, `outboxStats`
   (contracts under Outbox).
 - meta: `memoryInfo(): Promise<{usedBytes: number; maxBytes: number | null}>` (INFO memory),
   `maxmemoryPolicy(): Promise<string | null>` (CONFIG GET; null ONLY when the error is a
   command-access refusal — `/unknown command|not allowed|NOPERM|disabled|CONFIG/i`, e.g.
   managed redis — anything else, such as connection loss, is rethrown).
+- metrics: `weir_events_enqueued_total{event}` is bumped once per event a MULTI carried,
+  AFTER its exec.
 - connection: `connect()` rejects when the bounded reconnect (5 attempts, 250ms x2 capped 2s)
   is exhausted at boot. At RUNTIME exhaustion is fatal from inside the reconnect strategy
   (node-redis emits no terminal event when it gives up — a closed client with no command in
@@ -569,29 +560,28 @@ yields 2 entries).
 — thin wrapper: collect addresses from outputs, `watchedSubset`, `matchAgainst`.
 
 ### src/engine/txPipeline.ts
-`export function makeTxEvaluator(deps): (tx: DecodedTx, startedAtMs: number) => Promise<void>` and
-`export function makeRawTxHandler(deps): (raw: Buffer) => Promise<void>` (startedAtMs =
-receipt time, then decode → evaluate).
-Evaluate — ONE pass (Outpoint tracking rule 3): if `isEvaluated` → return. Fence (refuse a
-stale evaluation, warn, leave un-evaluated). Replacement check: `outpointOwners(inputs)`,
+`export function makeTxEvaluator(deps): (tx: DecodedTx) => Promise<void>` and
+`export function makeRawTxHandler(deps): (raw: Buffer) => Promise<void>` (decode → evaluate).
+Runs as one engine-queue item. Evaluate — reads, then ONE MULTI (Outpoint tracking rule 3):
+if `isEvaluated` → return. If `readRecord` is non-null → return: the tx is already tracked
+(pending, maturing or limbo) and this is a repeated sighting — bitcoind re-publishes `rawtx`
+for every tx of a connected AND a disconnected block, after the tip prune forgot the txid
+from `evaluated`; `seen` is the `unseen → pending` transition only, and a maturing/limbo
+record must never be put back to height 0. Replacement check: `outpointOwners(inputs)`,
 every distinct claimant ≠ this txid → its record (gone → skip; mined → warn, skip; unmined →
-the guarded `replacePending`); any `stale` outcome → warn, return WITHOUT markEvaluated.
-Match. If no match → the TS-side age check, then markEvaluated, done. If match:
-build the `seen` TxEvent (confs 0, block fields null, timestamp now) when seenEnabled, then
-`recordSeen(rec, event | null, startedAtMs)` — one atomic fenced + guarded step that also
-claims the inputs, nothing awaited from the network; `skipped` (a concurrent path already
-tracks or mined the tx) / `stale` is logged and is the end of the evaluation.
-The old "delivery failed → leave un-evaluated" path no longer exists: the outbox owns retry.
+a `dropped`/`replaced` for this evaluation's `dropped` list). Match. Build the `seen` TxEvent
+(confs 0, block fields null, timestamp now) when matched and seenEnabled. Then
+`applyEvaluation({txid, dropped, seen})` — one MULTI; nothing awaited from the network.
 
 ### src/engine/mempool.ts
-`export function makeMempoolReparser(deps): () => Promise<void>` — module-level mutex (skip
-if running). getRawMempool → replaceCurrentMempool → newMempoolTxids → for each (bounded
-concurrency 32): startedAtMs = now → getRawTransactionVerbose → decode → evaluate(tx,
-startedAtMs) (reuse txPipeline evaluator; the fence clock starts BEFORE the RPC);
-tx that vanished (null) is skipped; tx that was mined meanwhile (`blockhash` set) is skipped
-too — the block pipeline owns mined txs and a `seen` for it would be false. Then
-clearCurrentMempool. Exports `MEMPOOL_REPARSE_INTERVAL_MS` (300 000, constant): index.ts runs
-the reparser on that interval as the retry safety net (Outpoint tracking rule 7).
+`export function makeMempoolReparser(deps): () => Promise<void>` — the whole body is one
+engine-queue item (index.ts), so it has no mutex and no snapshot key: getRawMempool →
+`evaluatedTxids()` → fresh = mempool − evaluated → fetch `getRawTransactionVerbose` in
+batches of 32 (reads only) → for each, IN ORDER: a tx that vanished (null) is skipped; a tx
+that was mined meanwhile (`blockhash` set) is skipped too — the block pipeline owns mined txs
+and a `seen` for it would be false; else decode → evaluate (reuse txPipeline's evaluator).
+Exports `MEMPOOL_REPARSE_INTERVAL_MS` (300 000, constant): index.ts queues the reparser on
+that interval as the retry safety net (Outpoint tracking rule 7).
 
 ### src/engine/reorg.ts
 `export async function findForkPoint(deps, incomingPrevHash: string, incomingHeight: number):
@@ -603,79 +593,82 @@ entry (documented bound).
 Displaced-tx resolution is the LIMBO MODEL — on a pruned/no-txindex node there is no way to
 ask "which block is txid X in now?" at reorg time (getrawtransaction without a blockhash only
 answers for mempool txs), so weir never adjudicates at detection time:
-`export async function enterLimboAndRewind(deps, ancestorHeight): Promise<void>` — every
-maturing tx with inclusion height > ancestor: SADD `limbo` + `unindexMaturing` (record kept);
-then `ringRemoveAbove(ancestor)` and `setTip(ancestor)`. The replacement chain now processes
-as a plain connected walk: no second fork search, one hash per height in the ring.
+`export async function enterLimboAndRewind(deps, ancestorHeight): Promise<void>` — reads the
+maturing entries with inclusion height > ancestor and the ancestor's ring hash, then
+`store.rewind(ancestor, displaced)`: ONE MULTI (SADD limbo + ZREM maturing, records kept;
+ring truncated above the ancestor; tip = ancestor). The replacement chain now processes as
+a plain connected walk: no second fork search, one hash per height in the ring.
 Re-inclusion is discovered NATURALLY by the block pipeline's promotion step: a limbo txid
 found in a new block re-enters maturing (fresh height/blockHash, fired []) and leaves limbo —
 no event at re-inclusion; milestones re-fire on the sweep with new-blockhash idempotency keys.
-`export async function resolveLimbo(deps): Promise<void>` — runs after the TIP block finishes
-(and at boot when already reconciled): for each txid still in limbo (a PROVEN conflict —
-Outpoint tracking rule 4 — already left limbo inside `conflict` in the block pipeline, so it
-is never adjudicated twice),
+`export async function resolveLimbo(deps): Promise<void>` — runs in the tip-only work of a
+block that is the node's tip (and at boot): for each txid still in limbo (a PROVEN conflict
+— Outpoint tracking rule 4 — already left limbo inside the block's MULTI, so it is never
+adjudicated twice),
   - getMempoolEntry non-null → build `demoted` (confs 0, block fields = the OLD block,
     timestamp now) and `demoteToPending(rec, ev)` (one MULTI, enqueues it);
   - else → build `conflicted` (confs = last confirmed depth or 0, old block fields) and
-    `conflict(txid, ev)` (one MULTI: full cleanup + enqueue). Terminal.
+    `conflict(rec, ev)` (one MULTI: full cleanup + enqueue). Terminal.
 Because limbo is durable, a crash anywhere in the sequence re-resolves on the next block/boot.
 
 ### src/engine/blockPipeline.ts
 `export function makeBlockProcessor(deps): (raw: Buffer) => Promise<void>` used by both the ZMQ
-path and catch-up, plus `export function makeBlockHandler(processBlock, onFatal = fatal): (raw: Buffer) => Promise<void>`
-which wraps that ONE processor in a serialization queue (index.ts builds a single processor
-and hands it to both reconcile and makeBlockHandler). A rejected processBlock is fatal —
-`onFatal` is injectable for tests only. Sequence for
-a block B (hash H, prev P, height h from getBlockHeader(H)):
+path (as an engine-queue item) and boot catch-up (reconcile, inside the queue's first item).
+Sequence for a block B (hash H, prev P, height h from getBlockHeader(H)):
 1. connectivity: tip = getTip(). If tip === null → first run: process B standalone (no gap walk).
-   If P === tip.hash → connected. Else: findForkPoint (a pure gap yields empty disconnected);
-   on a REORG first `enterLimboAndRewind(ancestor)`. Then, if blocks are missing
-   (ancestor+1 < h), the PRUNE-WINDOW GUARD runs before walking: getBlockchainInfo; if the
-   node is pruned and ancestor+1 < pruneheight, catch-up is impossible — `clearTracking()`,
-   log the lost txids LOUDLY, jump tip/ring to B's parent and continue (watches unaffected;
-   still-unconfirmed txs re-fire `seen` via the mempool reparse). Otherwise walk
+   If H is the tip or already in the ring → duplicate, skip (a replay after a crash that
+   happened AFTER the block's exec). If P === tip.hash → connected. Else: findForkPoint (a
+   pure gap yields empty disconnected); on a REORG first `enterLimboAndRewind(ancestor)`
+   (one MULTI). Then, if blocks are missing (ancestor+1 < h), the PRUNE-WINDOW GUARD runs
+   before walking: getBlockchainInfo; if the node is pruned and ancestor+1 < pruneheight,
+   catch-up is impossible — `resetTracking({hash: P, height: h−1})` (one MULTI: tracking
+   wiped, tip/ring jumped to B's parent), log the lost txids LOUDLY, continue (watches
+   unaffected; still-unconfirmed txs re-fire `seen` via the mempool reparse). Otherwise walk
    ancestor+1 .. h-1 via getBlockHash → getBlockRaw → process (in order, as NON-tip blocks),
-   then B itself. After the OUTERMOST (tip) block completes: `resolveLimbo`.
-2. per connected block: decodeBlock → setBlockTxids → `pendingInBlock()` + `limboTxids()` →
-   the INPUT SCAN (Outpoint tracking rule 4: every block input → `outpointOwners`, chunked
-   pipelined SMEMBERS; for EVERY claimant ≠ its spender: limbo → proven `conflict` with
-   `timestamp = blockTime*1000`, and the local limbo snapshot forgets it; mined and not in
-   limbo → error, skip; otherwise the guarded `replacePending`) →
+   then B itself.
+2. per connected block, READS then ONE MULTI: `pendingTxids` + `limboTxids` → the INPUT SCAN
+   (Outpoint tracking rule 4: every block input → `outpointOwners`, chunked pipelined
+   SMEMBERS; for EVERY claimant ≠ its spender: limbo → a proven `conflicted` with `timestamp
+   = blockTime*1000` (and the local limbo snapshot forgets it); mined and not in limbo →
+   error, skip; otherwise a `dropped`/`replaced` (the local pending snapshot forgets it)) →
    resolve the block's DISTINCT output addresses with `watchedSubset` ONCE (chunked at 1000
    addresses) → `matchAgainst` per tx: for each block tx that matches (check EVERY block tx,
-   not just pending ∩ block — a payment never seen in the mempool still confirms): build
-   MaturingRecord from the block's own decode, then `promoteToMaturing` (one MULTI) for
-   every origin: limbo txid → re-inclusion (no event); pending txid → promotion; neither →
-   never-seen, promoted unless its record already has height > 0 (block replay guard) or the
-   txid is tombstoned (tracking already ended within TOMBSTONE_TTL_MS: a block replay after
-   the final cleanup, or a reorg at exactly max-milestone depth — not a new payment).
-   The `evaluated` flag is NOT a gate: it only says the mempool evaluator looked once —
-   possibly before the address was watched, or before a crash lost the record — and a
-   mined payment to a watched address must confirm regardless. A tracked tx that no
-   longer matches any watch (watch removed mid-flight) ends tracking quietly.
-3. milestone sweep: for each maturingEntries() entry: confs = h − height + 1; for each
-   confirm milestone m in (fired ∌ m) with confs ≥ m: build `confirmed` (confs = m, block
-   fields from the record, timestamp = blockTime*1000 of B) and `markFired(txid, fired+m, ev)`
-   (fired + enqueue, one MULTI; fired stays sorted). When confs ≥ maxMilestone AND all
-   milestones are fired → `finishMaturing(txid, now)` (final; tracking ends; tombstoned).
-4. dropped check — TIP BLOCKS ONLY: it compares pending against the LIVE mempool, which is
-   meaningless for historical blocks during a catch-up walk (a pending tx mined in a LATER
-   missed block would be falsely reported dropped). replacePostBlockMempool(getRawMempool) →
-   droppedPending() → for each: emit `dropped` (hex+matched come from the seen-time record:
-   every tx entering `pending` also gets its record written under `maturing:{txid}` with
-   height 0 / blockHash '' — a dropped tx cannot be re-fetched from a pruned node. The
-   `maturing` ZSET still only indexes MINED txs; the record exists from seen onward):
-   `dropPending(txid, ev)` — one GUARDED Lua (pending, evaluated so a rebroadcast can re-fire
-   `seen`, record, its own claims, + enqueue) with `reason: 'evicted'`, a no-op
-   (false, logged) when the txid is no longer pending-unmined — a mempool replacement that
-   landed since `droppedPending()` was read already gave the verdict; replacements are the
-   input scans' job.
-5. TTL sweep — TIP BLOCKS ONLY: dueExpiries(now) → `expireWatch(addr, ev)` (one MULTI).
-6. pruneEvaluated + pruneTombstones + pruneRetired (both now − TOMBSTONE_TTL_MS; tip only),
-   setTip({hash: H, height: h}), ringPut, ringPrune(ringSize).
-A tracked tx that no longer matches any watch → `endTracking(txid)` (no event).
-There are no delivery-failure branches in the engine: every event is enqueued atomically
-with its state change and the outbox retries it.
+   not just pending ∩ block — a payment never seen in the mempool still confirms): build the
+   MaturingRecord from the block's own decode → `promoted`, for every origin: limbo txid →
+   re-inclusion; pending txid → promotion; neither → never-seen. The `evaluated` flag is NOT
+   a gate: it only says the mempool evaluator looked once — possibly before the address was
+   watched, or before a crash lost the record — and a mined payment to a watched address
+   must confirm regardless. A tracked (pending or limbo) tx that no longer matches any watch
+   (watch removed mid-flight) → `ended` (no event).
+3. milestone sweep, in memory: records = every `maturingEntries()` entry's record (a missing
+   record → `unindexed`, warned) overlaid with the block's `promoted`; for each: confs = h −
+   height + 1; for each confirm milestone m in (fired ∌ m) with confs ≥ m: `fired` gets
+   `{txid, fired+m (sorted), confirmed event (confs = m, block fields from the record,
+   timestamp = blockTime*1000 of B)}` — fired is recorded at ENQUEUE time; delivery retry is
+   the outbox's job. When confs ≥ maxMilestone AND all milestones are fired → `finished`
+   (tracking ends).
+4. `applyBlock({promoted, fired, finished, dropped, conflicted, ended, unindexed, tip: {H, h},
+   ringKeep: ringSize})` — the block's ONE MULTI, tip and ring included. Crash before exec =
+   nothing happened; boot reconciliation replays B. `weir_blocks_processed_total` after it.
+5. TIP-ONLY WORK — only when B is the node's CURRENT tip. The steps below consult live node
+   state (mempool, wall clock), which is wrong for a block that is not the node's tip: a
+   catch-up block (a pending tx mined in a LATER missed block would be falsely evicted) or a
+   queued burst during a reorg. So: `isTip` (false for the catch-up walk) → snapshot
+   `getRawMempool` FIRST, then `getBestBlockHash`; if it is not H → log, return (the next
+   tip block picks the work up). Snapshotting before the check means a block that lands
+   between the two calls invalidates the snapshot instead of poisoning it. Each step is its
+   own MULTI and safe to repeat:
+   a. eviction check: every `pendingTxids()` member absent from the snapshot vanished
+      without being mined (replacements were caught by the input scans, so this is the
+      residual verdict): `dropPending({rec, event})` with `reason: 'evicted'`, key
+      `idem.dropped(net, txid, h)`, hex + matched from the seen-time record (a dropped tx
+      cannot be re-fetched from a pruned node; a missing record → error log, empty fields);
+   b. TTL sweep: dueExpiries(now) → `expireWatch(addr, ev)`;
+   c. `forgetEvaluated(evaluated − snapshot)` — the reparse dedupe list starts a new mempool
+      epoch;
+   d. `resolveLimbo`.
+There are no delivery-failure branches in the engine: every event is enqueued in the same
+MULTI as its state change and the outbox retries it.
 
 ### src/engine/heartbeat.ts
 `export function startHeartbeat(deps): {stop(): void}` — setInterval(heartbeatInterval s):
@@ -687,7 +680,7 @@ next interval is the retry; an interval that finds the previous tick still in fl
 warned once per stall — ticks never overlap). Payload: `{version:1, event:'heartbeat', network, tipHeight,
 nodeHeight, chainLag, watchCount, memoryUsedPct, outboxDepth, outboxOldestAgeSec (null when
 empty), deadLetterCount, idempotencyKey, timestamp}`. Skipped when interval 0. A rejected
-tick (store failure) is fatal; an RPC failure is not.
+tick (store failure) is fatal; an RPC failure is not. Reads only — not an engine writer.
 
 ### src/boot/preflight.ts
 `export async function preflight(deps): Promise<void>` — checks, in order, each with a clear
@@ -703,12 +696,13 @@ one-line log; throw Error (fatal) unless noted:
 
 ### src/boot/reconcile.ts
 `export async function reconcile(deps): Promise<void>` — tip = getTip(). If null: initialize
-tip/ring to current best block (getBestBlockHash + header; ringPut) — forward-only, no backfill.
-Else: node best = getBestBlockHash(); if same as tip.hash → done. Else: process blocks from
-tip → best via the blockPipeline's processor (handles gap, reorg, prune-window guard and limbo
-resolution via the same logic). reconcile takes no limbo dep: index.ts calls `resolveLimbo`
-unconditionally right after `reconcile` returns (a crash between limbo-rewind and resolution
-must not leave displaced txs unadjudicated until the next block; no-op when limbo is empty).
+tip/ring to current best block (getBestBlockHash + header; `setTip`, one MULTI) — forward-only,
+no backfill. Else: node best = getBestBlockHash(); if same as tip.hash → done. Else: process
+blocks from tip → best via the blockPipeline's processor (handles gap, reorg, prune-window
+guard and — at the tip — limbo resolution via the same logic). reconcile takes no limbo dep:
+index.ts calls `resolveLimbo` unconditionally right after `reconcile` returns, inside the
+same queue item (a crash between limbo-rewind and resolution must not leave displaced txs
+unadjudicated until the next block; no-op when limbo is empty).
 
 ### src/admin/server.ts
 `export function startAdminServer(deps, onFatal = fatal): {close(): Promise<void>; port: Promise<number>}` —
@@ -726,7 +720,8 @@ lag"); reads and probes never wait. Deps:
 `runtime: Readonly<Runtime>` (src/lib/types.ts), `config` incl. `readyMaxLag`.
 - `POST /watches` body `{address: string, ttl?: number}` → validate with isValidAddress →
   422 `{error}` on invalid; addWatch(+expiry from ttl ?? watchDefaultTtl when > 0) → 201
-  `{address, network, expiresAt: number | null}`. Idempotent.
+  `{address, network, expiresAt: number | null}`. Idempotent. Not an engine write: the watch
+  set is the engine's INPUT (see Single writer).
 - `DELETE /watches/:address` → 204 (idempotent; 204 even if absent).
 - `GET /watches?cursor=0` → `{addresses, cursor}` (SSCAN passthrough; cursor "0" = done;
   a cursor that is not `/^\d+$/` → 400).
@@ -744,15 +739,16 @@ never fatal); a server `'error'` event (listen failure) → `fatal` (background 
 ### src/index.ts (integration)
 loadConfig → Store.connect → preflight → admin server if token (probes answer from here:
 `/live` 200, `/ready` 503 until reconciled) → startOutboxDrainer → ONE awaited `drainOnce()`
-(logged; acks free memory before reconcile writes under a full redis) → reconcile →
-resolveLimbo → `runtime.reconciled = true` → startZmq (rawtx → txHandler, rawblock →
-blockHandler, gap → reparser; each receipt stamps `runtime.lastZmqTxAt` / `lastZmqBlockAt`
-before decoding) → initial mempool reparse (async) → periodic reparse timer
-(`setInterval(reparse, MEMPOOL_REPARSE_INTERVAL_MS)`, unref'd; the reparser's mutex skips
-overlap; a rejection is fatal — background path) → startHeartbeat (takes `rpc` for
-getBlockCount). Engine deps get NO sink (they enqueue); the sink goes only to the drainer and
-the heartbeat. SIGINT/SIGTERM → `runtime.shuttingDown = true` FIRST, then close zmq, clear
-the reparse timer, stop heartbeat, close admin, await drainer.stop(), store.quit, exit 0.
+(logged; acks free memory before reconcile writes under a full redis) → `makeEngineQueue()`
+→ the queue's first item, awaited: reconcile → resolveLimbo → `runtime.reconciled = true` →
+startZmq (rawtx → `engine.run(handleRawTx)`, rawblock → `engine.run(processBlock)`, gap →
+`engine.run(reparse)`; each receipt stamps `runtime.lastZmqTxAt` / `lastZmqBlockAt` before
+queuing) → initial mempool reparse (queued, not awaited) → periodic reparse timer
+(`setInterval(() => engine.run(reparse), MEMPOOL_REPARSE_INTERVAL_MS)`, unref'd) →
+startHeartbeat (takes `rpc` for getBlockCount). Engine deps get NO sink (they enqueue); the
+sink goes only to the drainer and the heartbeat. SIGINT/SIGTERM → `runtime.shuttingDown =
+true` FIRST, then close zmq, clear the reparse timer, stop heartbeat, close admin, await
+drainer.stop(), store.quit, exit 0.
 Log a startup banner: version, network, milestones, webhook target host, admin on/off.
 
 ## Coding conventions
