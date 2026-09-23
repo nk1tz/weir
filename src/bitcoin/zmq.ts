@@ -1,5 +1,6 @@
 import { Subscriber } from 'zeromq'
 import { fatal, log } from '../lib/log'
+import { metrics } from '../lib/metrics'
 
 const CTX = 'zmq'
 
@@ -53,6 +54,8 @@ export async function startZmq(opts: {
       const seq = seqBuf !== undefined && seqBuf.length >= 4 ? seqBuf.readUInt32LE(0) : null
 
       if (topic === TOPIC_RAWTX) {
+        // Last-message timestamps (unix seconds) for /metrics — a flat line means ZMQ is dead.
+        metrics.gauges.set('weir_last_zmq_tx_timestamp_seconds', Math.floor(Date.now() / 1000))
         if (seq !== null) {
           if (lastTxSeq !== null) {
             const expected = (lastTxSeq + 1) % UINT32_WRAP
@@ -67,6 +70,7 @@ export async function startZmq(opts: {
         }
         safeInvoke('onRawTx', () => opts.onRawTx(message))
       } else if (topic === TOPIC_RAWBLOCK) {
+        metrics.gauges.set('weir_last_zmq_block_timestamp_seconds', Math.floor(Date.now() / 1000))
         if (seq !== null) {
           if (lastBlockSeq !== null) {
             const expected = (lastBlockSeq + 1) % UINT32_WRAP

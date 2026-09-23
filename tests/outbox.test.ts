@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { OUTBOX_BATCH, OUTBOX_POLL_MS, backoffMs, startOutboxDrainer, type OutboxDrainer } from '../src/delivery/outbox'
+import { metrics } from '../src/lib/metrics'
 import type { TxEvent, WeirEvent } from '../src/lib/types'
 import { FakeSink, FakeStore } from './fakes'
 
@@ -43,6 +44,7 @@ describe('outbox drainer', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {})
     warnLog = vi.spyOn(console, 'warn').mockImplementation(() => {})
     errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    metrics.reset()
   })
 
   afterEach(async () => {
@@ -175,6 +177,23 @@ describe('outbox drainer', () => {
     vi.setSystemTime(T0 + 10 * 60_000)
     await drainer.drainOnce()
     expect(sink.attempts).toHaveLength(1)
+  })
+
+  it('metrics: every send bumps weir_webhook_deliveries_total{result}, a dead-letter bumps weir_events_dead_lettered_total', async () => {
+    const { store, sink, drainer } = setup()
+    store.enqueue(ev('a'), T0 - 1000)
+    store.enqueue(ev('b'), T0 - 1000)
+    const old = store.enqueue(ev('old'), T0 - MAX_AGE_SEC * 1000)
+    store.outboxQueue.set(old, T0 - 1)
+    sink.failWhen = (e) => e.idempotencyKey !== 'regtest:a:dropped:1'
+
+    await drainer.drainOnce()
+
+    expect(metrics.counters.get('weir_webhook_deliveries_total', { result: 'ok' })).toBe(1)
+    expect(metrics.counters.get('weir_webhook_deliveries_total', { result: 'fail' })).toBe(2)
+    expect(metrics.counters.get('weir_events_dead_lettered_total')).toBe(1) // `old` only; `b` was retried
+    // the enqueues themselves were counted by the (fake, mirroring) store
+    expect(metrics.counters.get('weir_events_enqueued_total', { event: 'dropped' })).toBe(3)
   })
 
   it('an event one millisecond younger than the limit is retried, not dead-lettered', async () => {

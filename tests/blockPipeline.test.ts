@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { makeBlockHandler, makeBlockProcessor, type BlockPipelineDeps } from '../src/engine/blockPipeline'
 import { makeTxEvaluator } from '../src/engine/txPipeline'
 import { findForkPoint } from '../src/engine/reorg'
+import { metrics } from '../src/lib/metrics'
 import type { DecodedTx, MatchedOutput, TxEvent } from '../src/lib/types'
 import { ADDR, FakeChain, FakeStore, mkTx } from './fakes'
 
@@ -311,6 +312,25 @@ describe('blockPipeline', () => {
     expect(confirmed[0]!.timestamp).toBe(1_700_000_101 * 1000)
     expect(confirmed[1]!.timestamp).toBe(1_700_000_103 * 1000)
     expect(store.maturingIndex.has('tx1')).toBe(false)
+  })
+
+  it('metrics: weir_blocks_processed_total counts every processed block (catch-up included, duplicates excluded); weir_reorgs_total counts reorgs', async () => {
+    metrics.reset()
+    const { store, chain, process } = setup()
+    seedTip(store, chain, 100, 'b100')
+    chain.addBlock({ hash: 'b101', prevHash: 'b100', height: 101, time: 1_700_000_101, txs: [] })
+    chain.addBlock({ hash: 'b102', prevHash: 'b101', height: 102, time: 1_700_000_102, txs: [] })
+
+    await process(chain.raw('b102')) // gap: b101 walked, then b102
+    await process(chain.raw('b102')) // duplicate (already tip) — skipped, not counted
+    expect(metrics.counters.get('weir_blocks_processed_total')).toBe(2)
+    expect(metrics.counters.get('weir_reorgs_total')).toBe(0)
+
+    // reorg: b102 replaced by b102b on b101
+    chain.addBlock({ hash: 'b102b', prevHash: 'b101', height: 102, time: 1_700_000_112, txs: [] })
+    await process(chain.raw('b102b'))
+    expect(metrics.counters.get('weir_reorgs_total')).toBe(1)
+    expect(metrics.counters.get('weir_blocks_processed_total')).toBe(3)
   })
 
   it('reorg with re-inclusion resets fired and re-fires with the new blockHash idempotency key', async () => {

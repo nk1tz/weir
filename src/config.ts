@@ -29,6 +29,8 @@ export interface WeirConfig {
   outboxMaxAgeSec: number
   /** dead-letter cap: oldest dead events beyond this are dropped */
   outboxDeadMax: number
+  /** /ready fails once nodeHeight − tipHeight exceeds this (lag 1 is normal for a moment after every block) */
+  readyMaxLag: number
 }
 
 const NETWORKS: Network[] = ['mainnet', 'testnet', 'signet', 'regtest']
@@ -122,5 +124,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): WeirConfig {
     webhookTimeoutMs: intOr(env, 'WEBHOOK_TIMEOUT_MS', 10000),
     outboxMaxAgeSec: positiveIntOr(env, 'OUTBOX_MAX_AGE', 259200),
     outboxDeadMax: positiveIntOr(env, 'OUTBOX_DEAD_MAX', 1000),
+    readyMaxLag: positiveIntOr(env, 'READY_MAX_LAG', 2),
   }
 }

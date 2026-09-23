@@ -39,6 +39,7 @@ describe('loadConfig', () => {
       webhookTimeoutMs: 10000,
       outboxMaxAgeSec: 259200,
       outboxDeadMax: 1000,
+      readyMaxLag: 2,
     })
   })
 
@@ -57,6 +58,7 @@ describe('loadConfig', () => {
         WEBHOOK_TIMEOUT_MS: '2500',
         OUTBOX_MAX_AGE: '3600',
         OUTBOX_DEAD_MAX: '50',
+        READY_MAX_LAG: '5',
       }),
     )
     expect(cfg).toMatchObject({
@@ -67,7 +69,15 @@ describe('loadConfig', () => {
       webhookTimeoutMs: 2500,
       outboxMaxAgeSec: 3600,
       outboxDeadMax: 50,
+      readyMaxLag: 5,
     })
+  })
+
+  it('READY_MAX_LAG must be a positive integer', () => {
+    for (const bad of ['0', '-1', '1.5', 'two']) {
+      expect(() => loadConfig(env({ READY_MAX_LAG: bad }))).toThrow(/READY_MAX_LAG must be a positive integer/)
+    }
+    expect(loadConfig(env({ READY_MAX_LAG: ' ' })).readyMaxLag).toBe(2) // blank = default
   })
 
   it.each(REQUIRED)('a missing %s throws naming it', (name) => {

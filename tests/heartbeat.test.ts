@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { startHeartbeat } from '../src/engine/heartbeat'
 import type { HeartbeatEvent, TxEvent } from '../src/lib/types'
-import { FakeSink, FakeStore } from './fakes'
+import { FakeChain, FakeSink, FakeStore } from './fakes'
 
 const T0 = 1_700_000_000_000
 
@@ -39,15 +39,17 @@ describe('heartbeat', () => {
 
   function setup(interval = 5) {
     const store = new FakeStore()
+    const chain = new FakeChain()
     const sink = new FakeSink()
-    const hb = startHeartbeat({ cfg: { network: 'regtest', heartbeatInterval: interval }, store, sink })
+    const hb = startHeartbeat({ cfg: { network: 'regtest', heartbeatInterval: interval }, store, rpc: chain.rpc(), sink })
     stops.push(hb.stop)
-    return { store, sink, hb }
+    return { store, chain, sink, hb }
   }
 
-  it('sends the documented payload DIRECTLY via the sink every interval — including the outbox fields', async () => {
-    const { store, sink } = setup(5)
+  it('sends the documented payload DIRECTLY via the sink every interval — including the outbox fields, nodeHeight and chainLag', async () => {
+    const { store, chain, sink } = setup(5)
     store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 101
     store.watches.add('bcrt1qa')
     store.watches.add('bcrt1qb')
     store.memory = { usedBytes: 64 * 1024 * 1024, maxBytes: 256 * 1024 * 1024 }
@@ -67,6 +69,8 @@ describe('heartbeat', () => {
       event: 'heartbeat',
       network: 'regtest',
       tipHeight: 100,
+      nodeHeight: 101,
+      chainLag: 1,
       watchCount: 2,
       memoryUsedPct: 25,
       outboxDepth: 2,
@@ -81,15 +85,37 @@ describe('heartbeat', () => {
 
     await vi.advanceTimersByTimeAsync(5000)
     expect(sink.attempts).toHaveLength(2)
+    expect(chain.getBlockCountCalls).toBe(2) // one getblockcount per tick
   })
 
-  it('empty outbox → outboxDepth 0, outboxOldestAgeSec null, deadLetterCount 0; no maxmemory → memoryUsedPct null', async () => {
-    const { store, sink } = setup(1)
+  it('empty outbox → outboxDepth 0, outboxOldestAgeSec null, deadLetterCount 0; no maxmemory → memoryUsedPct null; no tip → chainLag null even with a nodeHeight', async () => {
+    const { store, chain, sink } = setup(1)
     store.memory = { usedBytes: 10, maxBytes: null }
+    chain.blockCount = 7
 
     await vi.advanceTimersByTimeAsync(1000)
 
-    expect(sink.attempts[0]).toMatchObject({ tipHeight: null, watchCount: 0, memoryUsedPct: null, outboxDepth: 0, outboxOldestAgeSec: null, deadLetterCount: 0 })
+    expect(sink.attempts[0]).toMatchObject({ tipHeight: null, nodeHeight: 7, chainLag: null, watchCount: 0, memoryUsedPct: null, outboxDepth: 0, outboxOldestAgeSec: null, deadLetterCount: 0 })
+  })
+
+  it('a getblockcount failure does not fail the tick: nodeHeight and chainLag are null, warned, the heartbeat still goes out', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never)
+    const { store, chain, sink } = setup(1)
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCountError = new Error('bitcoind unreachable')
+
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(sink.delivered).toHaveLength(1)
+    expect(sink.delivered[0]).toMatchObject({ tipHeight: 100, nodeHeight: null, chainLag: null })
+    expect(warnLog.mock.calls.some((c) => /getblockcount failed — nodeHeight\/chainLag null this tick: bitcoind unreachable/.test(String(c[0])))).toBe(true)
+    expect(exit).not.toHaveBeenCalled()
+
+    // the node comes back: the next tick reports the lag again
+    chain.blockCountError = null
+    chain.blockCount = 103
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(sink.delivered[1]).toMatchObject({ tipHeight: 100, nodeHeight: 103, chainLag: 3 })
   })
 
   it('a failed send is warned with the sink error and retried on the next interval — never fatal', async () => {
@@ -119,6 +145,31 @@ describe('heartbeat', () => {
     await vi.advanceTimersByTimeAsync(1000)
 
     expect(exit).toHaveBeenCalledWith(1)
+  })
+
+  it('ticks never overlap: while one is in flight the interval skips (warned once per stall), then resumes', async () => {
+    const { store, chain, sink } = setup(1)
+    chain.blockCount = 100
+    let release: (tip: { hash: string; height: number }) => void = () => {}
+    store.getTip = () => new Promise((resolve) => (release = resolve))
+
+    await vi.advanceTimersByTimeAsync(1000) // tick 1 starts, parked on getTip
+    expect(sink.attempts).toHaveLength(0)
+    await vi.advanceTimersByTimeAsync(1000) // skipped
+    await vi.advanceTimersByTimeAsync(1000) // skipped
+    expect(sink.attempts).toHaveLength(0)
+    const skips = () => warnLog.mock.calls.filter((c) => /previous heartbeat tick still in flight/.test(String(c[0]))).length
+    expect(skips()).toBe(1)
+
+    release({ hash: 'b100', height: 100 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(sink.attempts).toHaveLength(1) // tick 1 completed, exactly one heartbeat — nothing piled up
+    expect(sink.attempts[0]).toMatchObject({ tipHeight: 100, chainLag: 0 })
+
+    store.getTip = FakeStore.prototype.getTip
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(sink.attempts).toHaveLength(2)
+    expect(skips()).toBe(1)
   })
 
   it('HEARTBEAT_INTERVAL=0 → disabled: nothing is ever sent', async () => {

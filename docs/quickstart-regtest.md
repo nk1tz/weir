@@ -38,17 +38,32 @@ Check the daemon came up clean:
 
 ```console
 $ docker compose logs weir
-weir-1  | [info] [boot] weir 0.1.0 network=regtest milestones=0,1,3 webhook=host.docker.internal admin=off
-weir-1  | [info] [preflight] redis reachable, maxmemory-policy=noeviction
-weir-1  | [info] [preflight] bitcoind reachable, chain=regtest, pruned=false (pruned would be fine)
-weir-1  | [info] [preflight] zmq notifications ok: pubrawtx, pubrawblock
-weir-1  | [info] [preflight] capacity estimate: ~415000 watches at 256mb maxmemory
-weir-1  | [info] [reconcile] no stored tip — starting at current best block, height 0 (forward-only, no backfill)
-weir-1  | [info] [zmq] subscribed rawtx + rawblock at tcp://bitcoind:28332
+weir-1  | [info] [index] weir v0.1.0 starting
+weir-1  | [info] [index] network=regtest milestones=[0,1,3] webhook=host.docker.internal admin=off
+weir-1  | [info] [index] redis connected
+weir-1  | [info] [preflight] redis reachable (used 1.1 MB)
+weir-1  | [info] [preflight] redis maxmemory-policy=noeviction — OK
+weir-1  | [info] [preflight] bitcoind reachable: chain=regtest blocks=0 pruned=false
+weir-1  | [info] [preflight] zmq publishers OK (pubrawtx=tcp://0.0.0.0:28332, pubrawblock=tcp://0.0.0.0:28332)
+weir-1  | [info] [preflight] redis maxmemory 256 MB — estimated watch capacity ~399000 addresses
+weir-1  | [info] [reconcile] first run — initialized tip to 0f9188f1…@0 (forward-only, no backfill)
+weir-1  | [info] [zmq] subscribed to rawtx+rawblock at tcp://bitcoind:28332
+weir-1  | [info] [index] weir is running
 ```
 
-Two lines matter: `maxmemory-policy=noeviction` (weir refuses to start under any eviction
-policy — evicted keys would be silently forgotten watches) and `zmq notifications ok`.
+Two lines matter: `maxmemory-policy=noeviction — OK` (weir refuses to start under any
+eviction policy — evicted keys would be silently forgotten watches) and `zmq publishers OK`.
+
+If you set `ADMIN_TOKEN` in `.env` (and publish the port), `GET /ready` is the one-shot
+health check — `ok` turns true once boot reconciliation is done and weir is within
+`READY_MAX_LAG` blocks of the node:
+
+```console
+$ curl -s localhost:8787/ready
+{"ok":true,"redis":true,"rpc":true,"reconciled":true,"tipHeight":0,"nodeHeight":0,"chainLag":0,"watchCount":0,"outboxDepth":0,"outboxOldestAgeSec":null,"deadLetterCount":0,"lastZmqTxAgeSec":null,"lastZmqBlockAgeSec":null}
+```
+
+No token needed for `/ready`, `/live` or `/metrics`. See the README's "Monitoring" section.
 
 ## 3. Start the event catcher
 
@@ -206,10 +221,12 @@ The catcher stays silent — there's no daemon to deliver anything. Now bring it
 ```console
 $ docker compose start weir
 $ docker compose logs -f weir
-weir-1  | [info] [preflight] redis reachable, maxmemory-policy=noeviction
+weir-1  | [info] [preflight] redis maxmemory-policy=noeviction — OK
 ...
-weir-1  | [info] [reconcile] stored tip height=104 behind node best height=105 — catching up 1 block
-weir-1  | [info] [block] height=105 txs=2 matched=1
+weir-1  | [info] [reconcile] tip 3c1e…@104 behind/diverged from node best 5a7d… — processing catch-up
+weir-1  | [info] [blockPipeline] first run — … (or: promoted pending … / never-seen 7c1d9e0f… mined paying a watched address — maturing at 5a7d…@105)
+weir-1  | [info] [blockPipeline] processed block 5a7d…@105 (2 txs)
+weir-1  | [info] [reconcile] reconcile complete
 ```
 
 And the catcher receives:

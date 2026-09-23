@@ -2,6 +2,7 @@ import type { DecodedBlock, DecodedTx, ExpiredEvent, MaturingRecord, Outpoint, T
 import type { SendResult } from '../src/delivery/webhook'
 import { outpointField } from '../src/store/keys'
 import { MAX_EVALUATION_AGE_MS, makeEventId, type OutboxRecord, type RecordSeenOutcome, type ReplaceOutcome } from '../src/store/redis'
+import { metrics } from '../src/lib/metrics'
 
 /**
  * In-memory fakes for engine tests — no redis/bitcoind needed.
@@ -308,12 +309,18 @@ export class FakeStore {
 
   // --- transitions that ENQUEUE (state mutation + outbox, one step) ---
 
-  /** the real Store's private `enqueue`: HSET outbox:{id} + ZADD outbox + ZADD outbox:created. Public here so drainer tests can seed. */
+  /**
+   * The real Store's private `enqueue`: HSET outbox:{id} + ZADD outbox + ZADD outbox:created.
+   * Public here so drainer tests can seed. Here the enqueue IS the successful write, so this
+   * is where `weir_events_enqueued_total` is bumped (the real Store bumps it after each
+   * transition's write succeeds — same moment, same count).
+   */
   enqueue(event: WeirEvent, nowMs: number): string {
     const id = makeEventId(nowMs)
     this.outbox.set(id, { event: structuredClone(event), attempts: 0, createdAt: nowMs, lastError: null })
     this.outboxQueue.set(id, nowMs)
     this.outboxCreated.set(id, nowMs)
+    metrics.counters.inc('weir_events_enqueued_total', { event: event.event })
     return id
   }
 
@@ -641,6 +648,11 @@ export class FakeChain {
   getBlockHashCalls: number[] = []
   pruned = false
   pruneheight: number | undefined = undefined
+  /** what getblockcount answers; null = the highest main-chain height (0 when the chain is empty) */
+  blockCount: number | null = null
+  /** set to make getblockcount reject (bitcoind unreachable) */
+  blockCountError: Error | null = null
+  getBlockCountCalls = 0
 
   addBlock(b: FakeBlock, opts: { main?: boolean } = {}): FakeBlock {
     this.blocks.set(b.hash, b)
@@ -660,6 +672,12 @@ export class FakeChain {
 
   rpc() {
     return {
+      getBlockCount: async () => {
+        this.getBlockCountCalls++
+        if (this.blockCountError !== null) throw this.blockCountError
+        if (this.blockCount !== null) return this.blockCount
+        return this.mainChain.size === 0 ? 0 : Math.max(...this.mainChain.keys())
+      },
       getBlockHeader: async (hash: string) => {
         const b = this.blocks.get(hash)
         if (!b) throw new Error(`getblockheader: unknown block ${hash}`)

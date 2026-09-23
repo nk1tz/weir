@@ -66,7 +66,7 @@ function summarize(event) {
     case 'expired':
       return `expired address=${event.address}`
     case 'heartbeat':
-      return `heartbeat tip=${event.tipHeight} watches=${event.watchCount} mem=${event.memoryUsedPct === null ? 'n/a' : event.memoryUsedPct + '%'}`
+      return `heartbeat tip=${event.tipHeight} node=${event.nodeHeight} lag=${event.chainLag} watches=${event.watchCount} mem=${event.memoryUsedPct === null ? 'n/a' : event.memoryUsedPct + '%'} outbox=${event.outboxDepth} dead=${event.deadLetterCount}`
     default:
       return `unknown event type "${event.event}"`
   }

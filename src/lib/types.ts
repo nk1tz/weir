@@ -90,6 +90,10 @@ export interface ExpiredEvent extends EventBase {
 export interface HeartbeatEvent extends EventBase {
   event: 'heartbeat'
   tipHeight: number | null
+  /** the node's best height (one getblockcount per tick), null when the RPC failed */
+  nodeHeight: number | null
+  /** nodeHeight − tipHeight: the stuck-pipeline signal; null when either height is unknown */
+  chainLag: number | null
   watchCount: number
   /** 0-100, or null when redis has no maxmemory set */
   memoryUsedPct: number | null
@@ -120,4 +124,19 @@ export interface MaturingRecord {
 export interface Tip {
   hash: string
   height: number
+}
+
+/**
+ * The daemon's live process state, owned by src/index.ts and read by the admin server's
+ * probes (`/live`, `/ready`, `/metrics`). Plain mutable fields — no I/O behind any of them.
+ */
+export interface Runtime {
+  /** boot reconcile + resolveLimbo finished — before that /ready is 503 */
+  reconciled: boolean
+  /** set FIRST in shutdown(), so /live flips to 503 before anything closes */
+  shuttingDown: boolean
+  /** unix ms of the last ZMQ rawtx message, null until the first */
+  lastZmqTxAt: number | null
+  /** unix ms of the last ZMQ rawblock message, null until the first */
+  lastZmqBlockAt: number | null
 }

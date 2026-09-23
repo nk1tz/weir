@@ -1,8 +1,29 @@
+/**
+ * The admin HTTP API (node:http, no framework), constructed only when ADMIN_TOKEN is set.
+ * Spec: docs/DESIGN.md "src/admin/server.ts" and "Health from chain lag".
+ *
+ * Two kinds of route on one port:
+ * - the watch API (`/watches…`), bearer-token authenticated;
+ * - the probes (`/live`, `/ready`, `/health` = `/ready`, `/metrics`), UNAUTHENTICATED — they
+ *   are for the platform and expose counts only, never addresses or txids.
+ *   `/live` depends on nothing but the process (a restart cannot fix a dependency).
+ *   `/ready` = redis ok AND rpc ok AND reconciled AND chainLag ≤ READY_MAX_LAG AND not
+ *   shutting down; the webhook/outbox never fails readiness (weir is healthy when the
+ *   consumer is down).
+ * Until boot reconciliation is done, the WRITE routes (POST /watches, DELETE /watches/:address)
+ * answer 503 `not ready: reconciling` (+ `retry-after: 1`): a watch added during the boot
+ * window could otherwise be paid and mined in a block that first-run reconcile then
+ * initialises the tip PAST — never processed. Reads and probes stay available.
+ *   `/metrics` renders the process-local registry plus gauges read at scrape time; a read
+ *   that fails drops its gauges (warned) and never turns the scrape into a 500.
+ */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createHash, timingSafeEqual } from 'node:crypto'
-import type { Network } from '../lib/types'
+import type { Network, Runtime } from '../lib/types'
+import type { Rpc } from '../bitcoin/rpc'
 import type { Store } from '../store/redis'
 import { describeError, fatal, log } from '../lib/log'
+import { type GaugeSample, metrics } from '../lib/metrics'
 
 const MAX_BODY_BYTES = 4096
 /** ttl upper bound: 10 years in seconds */
@@ -11,20 +32,43 @@ const MAX_TTL_SECONDS = 10 * 365 * 24 * 3600
 export interface AdminDeps {
   store: Pick<
     Store,
-    'addWatch' | 'removeWatch' | 'isWatched' | 'scanWatches' | 'watchCount' | 'getTip' | 'getExpiry' | 'outboxStats'
+    | 'addWatch'
+    | 'removeWatch'
+    | 'isWatched'
+    | 'scanWatches'
+    | 'watchCount'
+    | 'getTip'
+    | 'getExpiry'
+    | 'outboxStats'
+    | 'memoryInfo'
   >
+  /** getBlockCount is both the rpc liveness probe and the node height for chainLag */
+  rpc: Pick<Rpc, 'getBlockCount'>
+  /** the daemon's live state (owned by index.ts); read only here */
+  runtime: Readonly<Runtime>
   isValidAddress(address: string): boolean
-  /** cheap RPC liveness probe (e.g. getBlockCount); must reject when bitcoind is unreachable */
-  rpcPing(): Promise<void>
-  /** unix ms of the last block weir processed, null before the first block */
-  lastBlockAtMs(): number | null
   config: {
     network: Network
     adminToken: string | null
     adminPort: number
     /** seconds; 0 = watch forever */
     watchDefaultTtl: number
+    /** /ready is 503 once nodeHeight − tipHeight exceeds this */
+    readyMaxLag: number
   }
+}
+
+/** `text/plain; version=0.0.4` is what Prometheus asks for; charset makes curl output sane. */
+const METRICS_CONTENT_TYPE = 'text/plain; version=0.0.4; charset=utf-8'
+
+function sendText(res: ServerResponse, status: number, body: string, contentType: string): void {
+  res.writeHead(status, { 'content-type': contentType, 'content-length': Buffer.byteLength(body) })
+  res.end(body)
+}
+
+/** whole seconds since `atMs`, floored at 0; null when there is no timestamp */
+function ageSec(nowMs: number, atMs: number | null): number | null {
+  return atMs === null ? null : Math.max(0, Math.floor((nowMs - atMs) / 1000))
 }
 
 function sendJson(res: ServerResponse, status: number, payload: unknown, extraHeaders: Record<string, string> = {}): void {
@@ -99,50 +143,128 @@ export function startAdminServer(
 ): { close(): Promise<void>; port: Promise<number> } {
   const token = requireAdminToken(deps.config.adminToken)
 
-  async function handleHealth(res: ServerResponse): Promise<void> {
-    let redisOk = true
-    let rpcOk = true
-    let tipHeight: number | null = null
-    let watchCount = 0
-    let outboxDepth = 0
-    let outboxOldestAgeSec: number | null = null
-    let deadLetterCount = 0
+  /** `/live`: up and not shutting down. No dependency is consulted — on purpose. */
+  function handleLive(res: ServerResponse): void {
+    const ok = !deps.runtime.shuttingDown
+    sendJson(res, ok ? 200 : 503, { ok })
+  }
+
+  interface RedisView {
+    tipHeight: number | null
+    watchCount: number
+    outboxDepth: number
+    outboxOldestAgeSec: number | null
+    deadLetterCount: number
+  }
+
+  /** The redis-backed fields of /ready in one round of reads; null when any of them failed. */
+  async function readRedis(probe: string): Promise<RedisView | null> {
     try {
-      const tip = await deps.store.getTip()
-      tipHeight = tip?.height ?? null
-      watchCount = await deps.store.watchCount()
-      const outbox = await deps.store.outboxStats()
-      outboxDepth = outbox.depth
-      outboxOldestAgeSec =
-        outbox.oldestCreatedAt === null ? null : Math.max(0, Math.floor((Date.now() - outbox.oldestCreatedAt) / 1000))
-      deadLetterCount = outbox.dead
+      const [tip, watchCount, outbox] = await Promise.all([deps.store.getTip(), deps.store.watchCount(), deps.store.outboxStats()])
+      return {
+        tipHeight: tip?.height ?? null,
+        watchCount,
+        outboxDepth: outbox.depth,
+        outboxOldestAgeSec: ageSec(Date.now(), outbox.oldestCreatedAt),
+        deadLetterCount: outbox.dead,
+      }
     } catch (err) {
-      redisOk = false
-      log.warn('admin', `health: redis check failed: ${describeError(err)}`)
+      log.warn('admin', `${probe}: redis check failed: ${describeError(err)}`)
+      return null
     }
+  }
+
+  /** getblockcount — the rpc liveness probe AND the node height; null when bitcoind does not answer. */
+  async function readNodeHeight(probe: string): Promise<number | null> {
     try {
-      await deps.rpcPing()
+      return await deps.rpc.getBlockCount()
     } catch (err) {
-      rpcOk = false
-      log.warn('admin', `health: rpc check failed: ${describeError(err)}`)
+      log.warn('admin', `${probe}: rpc check failed: ${describeError(err)}`)
+      return null
     }
-    const lastBlockAtMs = deps.lastBlockAtMs()
-    const secondsSinceLastBlock =
-      lastBlockAtMs === null ? null : Math.max(0, Math.floor((Date.now() - lastBlockAtMs) / 1000))
-    // `ok` is still redis && rpc: outbox depth is a signal for the operator, not a readiness
-    // failure — the daemon is healthy when the consumer's endpoint is the thing that is down.
-    const ok = redisOk && rpcOk
+  }
+
+  /**
+   * `/ready` (and its alias `/health`): ok = redis && rpc && reconciled && chainLag ≤
+   * READY_MAX_LAG && !shuttingDown. chainLag = nodeHeight − tipHeight, null when either is
+   * unknown (then not ready: a lag that cannot be measured is not a lag within bound). The
+   * runtime flags are read AFTER the async reads, so a shutdown that begins mid-probe still
+   * answers 503. The outbox fields are reported for the operator and never affect `ok`.
+   */
+  async function handleReady(res: ServerResponse): Promise<void> {
+    const [redis, nodeHeight] = await Promise.all([readRedis('ready'), readNodeHeight('ready')])
+    const tipHeight = redis?.tipHeight ?? null
+    const chainLag = nodeHeight !== null && tipHeight !== null ? nodeHeight - tipHeight : null
+    const { reconciled, shuttingDown } = deps.runtime // after the awaits — see above
+    const ok =
+      redis !== null && nodeHeight !== null && reconciled && !shuttingDown && chainLag !== null && chainLag <= deps.config.readyMaxLag
+    const now = Date.now()
     sendJson(res, ok ? 200 : 503, {
       ok,
-      redis: redisOk,
-      rpc: rpcOk,
+      redis: redis !== null,
+      rpc: nodeHeight !== null,
+      reconciled,
+      shuttingDown,
       tipHeight,
-      secondsSinceLastBlock,
-      watchCount,
-      outboxDepth,
-      outboxOldestAgeSec,
-      deadLetterCount,
+      nodeHeight,
+      chainLag,
+      watchCount: redis?.watchCount ?? 0,
+      outboxDepth: redis?.outboxDepth ?? 0,
+      outboxOldestAgeSec: redis?.outboxOldestAgeSec ?? null,
+      deadLetterCount: redis?.deadLetterCount ?? 0,
+      lastZmqTxAgeSec: ageSec(now, deps.runtime.lastZmqTxAt),
+      lastZmqBlockAgeSec: ageSec(now, deps.runtime.lastZmqBlockAt),
     })
+  }
+
+  /**
+   * `/metrics`: the registry (counters + the ZMQ timestamp gauges pushed by zmq.ts) plus
+   * the gauges that need I/O, read now. Each read is independent: one that fails drops
+   * only its own gauges (one warn line names them) — `weir_up` stays 1 and the scrape is
+   * still a 200, because a redis hiccup is exactly what the remaining series should show.
+   */
+  async function handleMetrics(res: ServerResponse): Promise<void> {
+    const extra: GaugeSample[] = [
+      { name: 'weir_up', value: 1 },
+      { name: 'weir_reconciled', value: deps.runtime.reconciled ? 1 : 0 },
+    ]
+    const failed: string[] = []
+    const reads = await Promise.allSettled([
+      deps.store.getTip(),
+      deps.rpc.getBlockCount(),
+      deps.store.watchCount(),
+      deps.store.outboxStats(),
+      deps.store.memoryInfo(),
+    ])
+    const [tipRead, nodeRead, watchRead, outboxRead, memRead] = reads
+    const take = <T>(name: string, r: PromiseSettledResult<T>): T | null => {
+      if (r.status === 'fulfilled') return r.value
+      failed.push(`${name}: ${describeError(r.reason)}`)
+      return null
+    }
+    const tip = take('getTip', tipRead)
+    const nodeHeight = take('getBlockCount', nodeRead)
+    const watchCount = take('watchCount', watchRead)
+    const outbox = take('outboxStats', outboxRead)
+    const mem = take('memoryInfo', memRead)
+
+    const tipHeight = tip?.height ?? null // absent on a failed read AND before the first tip
+    if (tipHeight !== null) extra.push({ name: 'weir_tip_height', value: tipHeight })
+    if (nodeHeight !== null) extra.push({ name: 'weir_node_height', value: nodeHeight })
+    if (tipHeight !== null && nodeHeight !== null) extra.push({ name: 'weir_chain_lag', value: nodeHeight - tipHeight })
+    if (watchCount !== null) extra.push({ name: 'weir_watch_count', value: watchCount })
+    if (outbox !== null) {
+      extra.push({ name: 'weir_outbox_depth', value: outbox.depth })
+      // 0 when empty (not absent): the alert `> 300` and the graph stay continuous.
+      extra.push({ name: 'weir_outbox_oldest_age_seconds', value: ageSec(Date.now(), outbox.oldestCreatedAt) ?? 0 })
+      extra.push({ name: 'weir_dead_letter_count', value: outbox.dead })
+    }
+    if (mem !== null) {
+      extra.push({ name: 'weir_redis_memory_used_bytes', value: mem.usedBytes })
+      if (mem.maxBytes !== null) extra.push({ name: 'weir_redis_memory_max_bytes', value: mem.maxBytes })
+    }
+    if (failed.length > 0) log.warn('admin', `metrics: scrape-time read(s) failed, gauges omitted — ${failed.join('; ')}`)
+    sendText(res, 200, metrics.render(extra), METRICS_CONTENT_TYPE)
   }
 
   async function handleCreateWatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -213,9 +335,20 @@ export function startAdminServer(
     const method = req.method ?? 'GET'
     const url = new URL(req.url ?? '/', 'http://admin.internal')
 
-    if (method === 'GET' && url.pathname === '/health') {
-      await handleHealth(res)
-      return
+    // Probes: unauthenticated, GET only (a POST /live falls through to 401 like any other route).
+    if (method === 'GET') {
+      switch (url.pathname) {
+        case '/live':
+          handleLive(res)
+          return
+        case '/ready':
+        case '/health':
+          await handleReady(res)
+          return
+        case '/metrics':
+          await handleMetrics(res)
+          return
+      }
     }
 
     if (!authorized(req, token)) {
@@ -233,6 +366,11 @@ export function startAdminServer(
     }
 
     if (segments[0] === 'watches') {
+      // Writes wait for boot reconciliation (see module doc); reads never do.
+      if ((method === 'POST' || method === 'DELETE') && !deps.runtime.reconciled) {
+        sendJson(res, 503, { error: 'not ready: reconciling' }, { 'retry-after': '1' })
+        return
+      }
       if (segments.length === 1) {
         if (method === 'POST') {
           await handleCreateWatch(req, res)

@@ -42,6 +42,7 @@ import type { Rpc } from '../bitcoin/rpc'
 import type { Store } from '../store/redis'
 import { idem, outpointField } from '../store/keys'
 import { fatal, log } from '../lib/log'
+import { metrics } from '../lib/metrics'
 import { matchAgainst } from './matcher'
 import { enterLimboAndRewind, findForkPoint, type ReorgRpc, type ReorgStore, resolveLimbo } from './reorg'
 
@@ -363,6 +364,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
     await store.setTip({ hash: block.hash, height })
     await store.ringPut(height, block.hash)
     await store.ringPrune(cfg.ringSize)
+    metrics.counters.inc('weir_blocks_processed_total')
     log.info(CTX, `processed block ${block.hash}@${height} (${block.txs.length} txs)`)
   }
 
@@ -386,6 +388,7 @@ export function makeBlockProcessor(deps: BlockPipelineDeps): (raw: Buffer) => Pr
         // Gap or reorg — findForkPoint distinguishes them (a pure gap yields no disconnected).
         const { ancestorHeight, disconnected } = await findForkPoint(deps, block.prevHash, height)
         if (disconnected.length > 0) {
+          metrics.counters.inc('weir_reorgs_total')
           log.warn(
             CTX,
             `reorg detected at incoming ${block.hash}@${height}: fork point height=${ancestorHeight}, ` +

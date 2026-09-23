@@ -88,8 +88,8 @@ TxEvent payload: `{version:1, event, network, txid, confs, matched:[{address,vou
 idempotencyKey, timestamp, blockHeight, blockHash, hex}` plus, per Outpoint tracking rule 6,
 `reason`/`replacedBy` on `dropped` and `reason`/`conflictingTxid` on proven `conflicted`.
 `expired` is address-scoped: `{version:1, event:'expired', network, address, idempotencyKey, timestamp}`.
-`heartbeat`: `{version:1, event:'heartbeat', network, tipHeight, watchCount, memoryUsedPct,
-outboxDepth, outboxOldestAgeSec, deadLetterCount, idempotencyKey, timestamp}`.
+`heartbeat`: `{version:1, event:'heartbeat', network, tipHeight, nodeHeight, chainLag, watchCount,
+memoryUsedPct, outboxDepth, outboxOldestAgeSec, deadLetterCount, idempotencyKey, timestamp}`.
 Idempotency key shapes are in `src/store/keys.ts` (`idem`). Timestamps: unix ms. For
 `confirmed`/`demoted`/`conflicted` use blockTime*1000 where a block drives the event, else `Date.now()`.
 
@@ -279,12 +279,14 @@ they expose counts, never addresses or txids):
 - `GET /live` → 200 `{ok:true}` while the process is up and not shutting down; 503 during
   shutdown. Never depends on redis, rpc, or the webhook: restarting weir because a
   dependency is down fixes nothing.
-- `GET /ready` → 200/503 `{ok, redis, rpc, reconciled, tipHeight, nodeHeight, chainLag,
-  watchCount, outboxDepth, outboxOldestAgeSec, deadLetterCount, lastZmqTxAgeSec,
+- `GET /ready` → 200/503 `{ok, redis, rpc, reconciled, shuttingDown, tipHeight, nodeHeight,
+  chainLag, watchCount, outboxDepth, outboxOldestAgeSec, deadLetterCount, lastZmqTxAgeSec,
   lastZmqBlockAgeSec}`. `ok` = redis ok AND rpc ok AND reconciled (boot finished reconcile +
-  resolveLimbo) AND chainLag ≤ `READY_MAX_LAG`. Webhook/outbox state NEVER fails readiness:
-  the daemon is healthy when the consumer is down. `nodeHeight` is one `getblockcount` per
-  probe; `chainLag` is null when either height is unknown.
+  resolveLimbo) AND NOT shuttingDown AND chainLag ≤ `READY_MAX_LAG`. The runtime flags are
+  read AFTER the async reads, so a shutdown that begins mid-probe still answers 503.
+  Webhook/outbox state NEVER fails readiness: the daemon is healthy when the consumer is
+  down. `nodeHeight` is one `getblockcount` per probe (short deadline, see src/bitcoin/rpc.ts);
+  `chainLag` is null when either height is unknown.
 - `GET /health` → alias of `/ready` (kept for compatibility; `secondsSinceLastBlock` removed).
 - `GET /metrics` → Prometheus text exposition (text/plain; version=0.0.4), weir-native signals
   only — host metrics are the platform's job:
@@ -300,14 +302,24 @@ they expose counts, never addresses or txids):
 
 src/lib/metrics.ts: an in-process registry — `counters.inc(name, labels?)`,
 `gauges.set(name, value, labels?)`, `render(): string`. Process-local (counters reset on
-restart; that is what `_total` means). Incremented by: Store.enqueue (events_enqueued_total
-by event), the outbox drainer (deliveries_total, dead_lettered_total), the block pipeline
+restart; that is what `_total` means). Incremented by: every enqueuing Store transition
+AFTER its write succeeded (events_enqueued_total by event — MULTI and Lua paths alike;
+`Store.enqueue` itself is only the MULTI helper and runs before the write, and a guarded Lua
+may write nothing), the outbox drainer (deliveries_total, dead_lettered_total), the block pipeline
 (blocks_processed_total, reorgs_total), zmq.ts (last-message timestamps on every rawtx /
 rawblock). Gauges that need I/O (heights, watch count, outbox, memory) are computed at
 scrape time by the admin handler, not pushed.
 
 Heartbeat gains `nodeHeight` and `chainLag` (one getblockcount per tick) so a consumer can
-apply the stuck-pipeline rule without an independent chain source.
+apply the stuck-pipeline rule without an independent chain source. Ticks never overlap: a
+tick still in flight makes the interval skip (warned once per stall) — a stalled node or
+endpoint must not pile up heartbeats.
+
+Admin writes during the boot window: until `runtime.reconciled`, `POST /watches` and
+`DELETE /watches/:address` answer 503 `{error: 'not ready: reconciling'}` with
+`retry-after: 1` (after auth). A watch added before first-run reconcile could be paid and
+mined in a block that reconcile then initialises the tip PAST — a payment weir would never
+process. Reads (`GET /watches…`) and the probes are always served.
 
 Config: `READY_MAX_LAG` (default 2 — lag 1 is normal for a moment after every block; 2 means
 weir is genuinely behind). Docs (README "Monitoring"): alert on no heartbeat for 2× the
@@ -316,7 +328,10 @@ interval; `chainLag > READY_MAX_LAG` persisting > 3 min; `weir_outbox_oldest_age
 
 src/index.ts: a `Runtime` object `{reconciled, shuttingDown, lastZmqTxAt, lastZmqBlockAt}`
 replaces the `lastBlockAt` closure; reconciled is set after resolveLimbo; shuttingDown is
-set first thing in shutdown() so `/live` flips before anything closes.
+set first thing in shutdown() so `/live` flips before anything closes. The admin server
+starts right after preflight — BEFORE the boot drain and reconcile — so the probes answer
+during a long catch-up (`/live` 200, `/ready` 503 `{reconciled: false}`) instead of refusing
+connections; started after reconcile, `reconciled` could never be observed false.
 
 ## Module map and contracts
 
@@ -395,6 +410,11 @@ plus at least one known-good mainnet tx per script type with hardcoded expected 
 ### src/bitcoin/rpc.ts
 `export class Rpc { constructor(url: string) }` — creds parsed from URL, Basic auth, global
 `fetch`, JSON-RPC 1.0, small retry (3x, backoff) on network errors, NO retry on 401/403.
+DEADLINE: every attempt runs under one AbortController covering the request AND reading the
+body — `RPC_TIMEOUT_MS` (30 000; the block path fetches whole blocks) or, for
+`getBlockCount` (the probe/heartbeat call), `RPC_PROBE_TIMEOUT_MS` (5 000). An abort is a
+network failure for retry purposes, so a call's total budget is bounded at attempts ×
+timeout + backoff. A stalled node is a rejection, never a hang.
 Methods: `getBlockCount(): Promise<number>`, `getBestBlockHash(): Promise<string>`,
 `getBlockHash(height): Promise<string>`,
 `getBlockHeader(hash): Promise<{height: number; previousblockhash?: string; time: number}>`,
@@ -659,11 +679,15 @@ with its state change and the outbox retries it.
 
 ### src/engine/heartbeat.ts
 `export function startHeartbeat(deps): {stop(): void}` — setInterval(heartbeatInterval s):
-build HeartbeatEvent from getTip/watchCount/memoryInfo/outboxStats and `sink.send` it
+build HeartbeatEvent from getTip/watchCount/memoryInfo/outboxStats + one `rpc.getBlockCount`
+(`nodeHeight`; `chainLag = nodeHeight − tipHeight`, both null when the RPC fails — warned,
+the tick still goes out) and `sink.send` it
 DIRECTLY (not via the outbox — proof-of-life must reflect now; a failed send is warned, the
-next interval is the retry). Payload: `{version:1, event:'heartbeat', network, tipHeight,
-watchCount, memoryUsedPct, outboxDepth, outboxOldestAgeSec (null when empty), deadLetterCount,
-idempotencyKey, timestamp}`. Skipped when interval 0. A rejected tick is fatal.
+next interval is the retry; an interval that finds the previous tick still in flight skips,
+warned once per stall — ticks never overlap). Payload: `{version:1, event:'heartbeat', network, tipHeight,
+nodeHeight, chainLag, watchCount, memoryUsedPct, outboxDepth, outboxOldestAgeSec (null when
+empty), deadLetterCount, idempotencyKey, timestamp}`. Skipped when interval 0. A rejected
+tick (store failure) is fatal; an RPC failure is not.
 
 ### src/boot/preflight.ts
 `export async function preflight(deps): Promise<void>` — checks, in order, each with a clear
@@ -693,7 +717,13 @@ the bound port once listening (`ADMIN_PORT=0` = ephemeral; tests use it) and REJ
 the listen error (EADDRINUSE, EACCES) when the server errors before listening — a caller
 awaiting it fails fast with the real cause; the error still takes the fatal path
 (`onFatal` is injectable for tests only). Every route
-(except /health) requires `authorization: Bearer <ADMIN_TOKEN>` (timingSafeEqual) → 401 otherwise.
+except the GET probes (`/live`, `/ready`, `/health`, `/metrics`) requires
+`authorization: Bearer <ADMIN_TOKEN>` (timingSafeEqual) → 401 otherwise. After auth, the
+write routes (`POST /watches`, `DELETE /watches/:address`) answer 503 `{error: 'not ready:
+reconciling'}` + `retry-after: 1` while `runtime.reconciled` is false (see "Health from chain
+lag"); reads and probes never wait. Deps:
+`store: Pick<Store, …>`, `rpc: Pick<Rpc, 'getBlockCount'>` (liveness probe AND node height),
+`runtime: Readonly<Runtime>` (src/lib/types.ts), `config` incl. `readyMaxLag`.
 - `POST /watches` body `{address: string, ttl?: number}` → validate with isValidAddress →
   422 `{error}` on invalid; addWatch(+expiry from ttl ?? watchDefaultTtl when > 0) → 201
   `{address, network, expiresAt: number | null}`. Idempotent.
@@ -701,25 +731,28 @@ awaiting it fails fast with the real cause; the error still takes the fatal path
 - `GET /watches?cursor=0` → `{addresses, cursor}` (SSCAN passthrough; cursor "0" = done;
   a cursor that is not `/^\d+$/` → 400).
 - `GET /watches/:address` → 200 `{address, watched: true, expiresAt}` or 404.
-- `GET /health` (no auth) → 200/503 `{ok, redis, rpc, tipHeight, secondsSinceLastBlock, watchCount,
-  outboxDepth, outboxOldestAgeSec, deadLetterCount}` (`ok` is still redis && rpc — outbox
-  depth is a signal for the operator, not a readiness failure: the daemon is healthy when the
-  consumer is down).
+- `GET /live`, `GET /ready`, `GET /health` (= `/ready`), `GET /metrics` (no auth) — contracts
+  under "Health from chain lag". `/metrics` is `text/plain; version=0.0.4; charset=utf-8`;
+  its scrape-time reads run independently (`Promise.allSettled`): a failed read omits its
+  own gauges (ONE warn line naming the failed reads), `weir_up` stays 1, the response is 200.
+  `weir_outbox_oldest_age_seconds` is 0 (not absent) when the outbox is empty.
 Reject bodies > 4KB with a real 413 response (`connection: close`; the socket is never
 destroyed before the status is written). JSON errors as `{error: string}`. An unhandled
 error inside a request handler → `500 {error: 'internal error'}` (request/response path:
 never fatal); a server `'error'` event (listen failure) → `fatal` (background path).
 
 ### src/index.ts (integration)
-loadConfig → Store.connect → preflight → startOutboxDrainer → ONE awaited `drainOnce()`
+loadConfig → Store.connect → preflight → admin server if token (probes answer from here:
+`/live` 200, `/ready` 503 until reconciled) → startOutboxDrainer → ONE awaited `drainOnce()`
 (logged; acks free memory before reconcile writes under a full redis) → reconcile →
-resolveLimbo → startZmq (rawtx → txHandler, rawblock → blockHandler, gap → reparser) →
-initial mempool reparse (async) → periodic reparse timer (`setInterval(reparse,
-MEMPOOL_REPARSE_INTERVAL_MS)`, unref'd; the reparser's mutex skips overlap; a rejection is
-fatal — background path) → startHeartbeat → admin server if token. Engine deps get NO sink
-(they enqueue); the sink goes only to the drainer and the heartbeat. SIGINT/SIGTERM → close
-zmq, clear the reparse timer, stop heartbeat, close admin, await drainer.stop(), store.quit,
-exit 0.
+resolveLimbo → `runtime.reconciled = true` → startZmq (rawtx → txHandler, rawblock →
+blockHandler, gap → reparser; each receipt stamps `runtime.lastZmqTxAt` / `lastZmqBlockAt`
+before decoding) → initial mempool reparse (async) → periodic reparse timer
+(`setInterval(reparse, MEMPOOL_REPARSE_INTERVAL_MS)`, unref'd; the reparser's mutex skips
+overlap; a rejection is fatal — background path) → startHeartbeat (takes `rpc` for
+getBlockCount). Engine deps get NO sink (they enqueue); the sink goes only to the drainer and
+the heartbeat. SIGINT/SIGTERM → `runtime.shuttingDown = true` FIRST, then close zmq, clear
+the reparse timer, stop heartbeat, close admin, await drainer.stop(), store.quit, exit 0.
 Log a startup banner: version, network, milestones, webhook target host, admin on/off.
 
 ## Coding conventions

@@ -6,6 +6,14 @@ const CTX = 'rpc'
 const MAX_ATTEMPTS = 3
 /** First retry delay; doubles per attempt. */
 const BACKOFF_BASE_MS = 250
+/**
+ * Per-attempt deadline covering the request AND reading the response body. Generous: the
+ * block path fetches whole blocks (`getblock` verbosity 0 on mainnet is a few MB). A call's
+ * total budget is bounded at MAX_ATTEMPTS × timeout (+ backoff).
+ */
+export const RPC_TIMEOUT_MS = 30_000
+/** The probe/heartbeat call (`getblockcount`) answers in microseconds or not at all — short deadline. */
+export const RPC_PROBE_TIMEOUT_MS = 5_000
 
 interface JsonRpcErrorShape {
   code: number
@@ -54,23 +62,42 @@ export class Rpc {
   }
 
   /**
-   * One JSON-RPC 1.0 call. Retries (3 attempts, 250ms base, x2 backoff) ONLY on
-   * network-level failures (fetch rejection). Never retries 401/403 (throws
-   * 'Unauthorized' immediately) and never retries JSON-RPC error responses
-   * (throws RpcError with the node's code/message).
+   * One attempt: POST and read the whole body under ONE AbortController deadline — a
+   * stalled node (connection accepted, no bytes, or a body that never ends) is a rejection
+   * at `timeoutMs`, never a hang. Throws on fetch rejection, body abort or deadline.
    */
-  /** POST with retry on network-level failure (fetch rejection); never retries an HTTP response. */
-  private async fetchWithRetry(method: string, body: string): Promise<Response> {
+  private async attempt(body: string, timeoutMs: number): Promise<{ status: number; ok: boolean; text: string }> {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const res = await fetch(this.endpoint, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: this.authHeader,
+        },
+        body,
+        signal: controller.signal,
+      })
+      const text = await res.text()
+      return { status: res.status, ok: res.ok, text }
+    } catch (err) {
+      if (controller.signal.aborted) throw new Error(`timeout after ${timeoutMs}ms`, { cause: err })
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * POST with retry (MAX_ATTEMPTS, 250ms base, x2 backoff) ONLY on network-level failures —
+   * a fetch rejection, a body that aborted, or the per-attempt deadline; an HTTP response
+   * of any status is never retried. Total budget ≤ MAX_ATTEMPTS × timeoutMs + backoff.
+   */
+  private async fetchWithRetry(method: string, body: string, timeoutMs: number): Promise<{ status: number; ok: boolean; text: string }> {
     for (let attempt = 1; ; attempt++) {
       try {
-        return await fetch(this.endpoint, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            authorization: this.authHeader,
-          },
-          body,
-        })
+        return await this.attempt(body, timeoutMs)
       } catch (err) {
         if (attempt >= MAX_ATTEMPTS) {
           log.error(CTX, `${method}: network failure after ${MAX_ATTEMPTS} attempts: ${describeError(err)}`)
@@ -86,17 +113,22 @@ export class Rpc {
     }
   }
 
-  private async call(method: string, params: unknown[] = []): Promise<unknown> {
+  /**
+   * One JSON-RPC 1.0 call under a per-attempt deadline (RPC_TIMEOUT_MS unless the caller
+   * passes a tighter one). Never retries 401/403 (throws 'Unauthorized' immediately) and
+   * never retries JSON-RPC error responses (throws RpcError with the node's code/message).
+   */
+  private async call(method: string, params: unknown[] = [], timeoutMs: number = RPC_TIMEOUT_MS): Promise<unknown> {
     const id = ++this.nextId
     const body = JSON.stringify({ jsonrpc: '1.0', id, method, params })
-    const response = await this.fetchWithRetry(method, body)
+    const response = await this.fetchWithRetry(method, body, timeoutMs)
 
     if (response.status === 401 || response.status === 403) {
       log.error(CTX, `${method}: HTTP ${response.status} from node — bad RPC credentials`)
       throw new Error('Unauthorized')
     }
 
-    const text = await response.text()
+    const text = response.text
     let parsed: JsonRpcResponse
     try {
       parsed = JSON.parse(text) as JsonRpcResponse
@@ -119,8 +151,9 @@ export class Rpc {
     return parsed.result
   }
 
+  /** The probe/heartbeat call: short deadline so /ready, /metrics and a heartbeat tick never wait on a stalled node. */
   async getBlockCount(): Promise<number> {
-    return (await this.call('getblockcount')) as number
+    return (await this.call('getblockcount', [], RPC_PROBE_TIMEOUT_MS)) as number
   }
 
   async getBestBlockHash(): Promise<string> {

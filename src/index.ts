@@ -1,14 +1,20 @@
 /**
  * weir daemon entrypoint. Boot sequence per DESIGN.md "src/index.ts":
- *   loadConfig → Store.connect → preflight → startOutboxDrainer → ONE awaited drainOnce →
- *   reconcile (+ resolveLimbo) → startZmq (rawtx → txHandler, rawblock → blockHandler,
- *   gap → reparser) → initial mempool reparse (async) → periodic reparse timer → startHeartbeat
- *   → admin server when ADMIN_TOKEN is set.
- * The drainer starts right after preflight and one pass is awaited BEFORE reconcile: events
+ *   loadConfig → Store.connect → preflight → admin server when ADMIN_TOKEN is set →
+ *   startOutboxDrainer → ONE awaited drainOnce → reconcile (+ resolveLimbo; then
+ *   `runtime.reconciled = true`) → startZmq (rawtx → txHandler, rawblock → blockHandler,
+ *   gap → reparser) → initial mempool reparse (async) → periodic reparse timer → startHeartbeat.
+ * The admin server comes up BEFORE the boot drain and reconcile so the platform's probes
+ * get answers during a long catch-up: `/live` 200, `/ready` 503 `{reconciled: false}` —
+ * instead of a refused connection that looks like a dead process.
+ * The drainer starts right after that and one pass is awaited BEFORE reconcile: events
  * queued before a crash go out first, and their acks free redis memory before reconcile
  * writes (a full redis would otherwise crash-loop at boot); if the endpoint is still down
  * the pass just reschedules. Engine deps get NO sink (they enqueue through the Store); the
  * sink goes only to the drainer and the heartbeat.
+ * `runtime` (DESIGN "Health from chain lag") is the process state the probes read:
+ * reconciled, shuttingDown (set FIRST in shutdown, so /live flips before anything closes),
+ * and the last ZMQ rawtx/rawblock receipt times.
  * SIGINT/SIGTERM → close zmq, stop the reparse timer, stop heartbeat, close admin, await
  * drainer.stop(), store.quit, exit 0.
  *
@@ -18,6 +24,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { loadConfig } from './config'
+import type { Runtime } from './lib/types'
 import { describeError, fatal, log } from './lib/log'
 import { Store } from './store/redis'
 import { Rpc } from './bitcoin/rpc'
@@ -73,6 +80,20 @@ async function main(): Promise<void> {
 
   await preflight({ cfg, store, rpc })
 
+  const runtime: Runtime = { reconciled: false, shuttingDown: false, lastZmqTxAt: null, lastZmqBlockAt: null }
+
+  // Probes answer from here on: /live 200, /ready 503 until reconcile is done.
+  let admin: { close(): Promise<void> } | null = null
+  if (cfg.adminToken !== null) {
+    admin = startAdminServer({
+      store,
+      rpc,
+      runtime,
+      isValidAddress: (address: string) => isValidAddress(address, cfg.network),
+      config: cfg,
+    })
+  }
+
   // Events still owed from before a restart go out now, ahead of the (possibly long) reconcile;
   // their acks free redis memory before reconcile writes. A store failure here is fatal (boot).
   const drainer = startOutboxDrainer({ cfg, store, sink })
@@ -84,24 +105,26 @@ async function main(): Promise<void> {
   // Crash-recovery: adjudicate reorg-displaced txs even when there was nothing to catch up
   // (a crash between limbo-rewind and resolution). No-op when limbo is empty.
   await resolveLimbo({ cfg, store, rpc })
+  runtime.reconciled = true
 
   const evaluate = makeTxEvaluator({ store, cfg })
   const handleRawTx = makeRawTxHandler({ store, cfg, decodeRawTx })
   const reparse = makeMempoolReparser({ rpc, store, cfg, decodeRawTx, evaluate })
   const handleBlock = makeBlockHandler(processBlock)
 
-  /** unix ms of the last block weir fully processed — feeds /health secondsSinceLastBlock */
-  let lastBlockAt: number | null = null
-
   // zmq's safeInvoke wraps every handler: a returned promise rejection is fatal (never
-  // unhandled, never swallowed) — including a gap-triggered reparse failing.
+  // unhandled, never swallowed) — including a gap-triggered reparse failing. Receipt times
+  // are stamped on the way in (before decoding) — /ready reports them as ages.
   const zmq = await startZmq({
     url: cfg.bitcoinZmqUrl,
-    onRawTx: (buf) => handleRawTx(buf),
-    onRawBlock: (buf) =>
-      handleBlock(buf).then(() => {
-        lastBlockAt = Date.now()
-      }),
+    onRawTx: (buf) => {
+      runtime.lastZmqTxAt = Date.now()
+      return handleRawTx(buf)
+    },
+    onRawBlock: (buf) => {
+      runtime.lastZmqBlockAt = Date.now()
+      return handleBlock(buf)
+    },
     onTxGap: () => reparse(),
   })
 
@@ -121,25 +144,11 @@ async function main(): Promise<void> {
   reparseTimer.unref()
   log.info(CTX, `periodic mempool reparse every ${MEMPOOL_REPARSE_INTERVAL_MS / 1000}s`)
 
-  const heartbeat = startHeartbeat({ cfg, store, sink })
+  const heartbeat = startHeartbeat({ cfg, store, rpc, sink })
 
-  let admin: { close(): Promise<void> } | null = null
-  if (cfg.adminToken !== null) {
-    admin = startAdminServer({
-      store,
-      isValidAddress: (address: string) => isValidAddress(address, cfg.network),
-      rpcPing: async () => {
-        await rpc.getBlockCount()
-      },
-      lastBlockAtMs: () => lastBlockAt,
-      config: cfg,
-    })
-  }
-
-  let shuttingDown = false
   function shutdown(signal: string): void {
-    if (shuttingDown) return
-    shuttingDown = true
+    if (runtime.shuttingDown) return
+    runtime.shuttingDown = true // FIRST: /live answers 503 from this instant
     log.info(CTX, `${signal} received — shutting down`)
     ;(async () => {
       await zmq.close()

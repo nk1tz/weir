@@ -15,6 +15,7 @@
 import type { Store } from '../store/redis'
 import type { Sink } from './webhook'
 import { fatal, log } from '../lib/log'
+import { metrics } from '../lib/metrics'
 
 const CTX = 'outbox'
 
@@ -68,6 +69,7 @@ export function startOutboxDrainer(deps: OutboxDrainerDeps): OutboxDrainer {
         continue
       }
       const result = await sink.send(rec.event)
+      metrics.counters.inc('weir_webhook_deliveries_total', { result: result.ok ? 'ok' : 'fail' })
       if (result.ok) {
         await store.outboxAck(id)
         delivered++
@@ -82,6 +84,7 @@ export function startOutboxDrainer(deps: OutboxDrainerDeps): OutboxDrainer {
           log.warn(CTX, `outbox ${id} vanished before it could be dead-lettered (acked concurrently) — ignoring`)
           continue
         }
+        metrics.counters.inc('weir_events_dead_lettered_total')
         log.error(
           CTX,
           `DEAD-LETTERED ${rec.event.event} ${rec.event.idempotencyKey} after ${attempts} attempt(s) over ` +

@@ -1,8 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { request as httpRequest } from 'node:http'
 import { startAdminServer } from '../src/admin/server'
-import type { TxEvent } from '../src/lib/types'
-import { FakeStore } from './fakes'
+import { metrics } from '../src/lib/metrics'
+import type { Runtime, TxEvent } from '../src/lib/types'
+import { FakeChain, FakeStore } from './fakes'
 
 const TOKEN = 'test-admin-token'
 const GOOD = 'bcrt1qgoodaddress'
@@ -50,25 +51,35 @@ function call(
   })
 }
 
+/** Parse an exposition body into {line → value} for the samples (TYPE lines dropped). */
+function samples(text: string): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const line of text.split('\n')) {
+    if (line === '' || line.startsWith('#')) continue
+    const sp = line.lastIndexOf(' ')
+    out.set(line.slice(0, sp), line.slice(sp + 1))
+  }
+  return out
+}
+
 describe('admin server', () => {
   const store = new FakeStore()
-  let rpcOk = true
-  let lastBlockAt: number | null = null
+  const chain = new FakeChain()
+  const runtime: Runtime = { reconciled: true, shuttingDown: false, lastZmqTxAt: null, lastZmqBlockAt: null }
+  let warnLog: ReturnType<typeof vi.spyOn>
   let port = 0
   let handle: { close(): Promise<void>; port: Promise<number> }
 
   beforeAll(async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {})
-    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    warnLog = vi.spyOn(console, 'warn').mockImplementation(() => {})
     vi.spyOn(console, 'error').mockImplementation(() => {})
     handle = startAdminServer({
       store,
+      rpc: chain.rpc(),
+      runtime,
       isValidAddress: (a) => a.startsWith('bcrt1q'),
-      rpcPing: async () => {
-        if (!rpcOk) throw new Error('bitcoind unreachable')
-      },
-      lastBlockAtMs: () => lastBlockAt,
-      config: { network: 'regtest', adminToken: TOKEN, adminPort: 0, watchDefaultTtl: 0 },
+      config: { network: 'regtest', adminToken: TOKEN, adminPort: 0, watchDefaultTtl: 0, readyMaxLag: 2 },
     })
     // rejects with the real listen error (EADDRINUSE, ...) instead of hanging the whole file
     port = await handle.port
@@ -85,10 +96,10 @@ describe('admin server', () => {
       const clashing = startAdminServer(
         {
           store,
+          rpc: chain.rpc(),
+          runtime,
           isValidAddress: () => true,
-          rpcPing: async () => {},
-          lastBlockAtMs: () => null,
-          config: { network: 'regtest', adminToken: TOKEN, adminPort: held, watchDefaultTtl: 0 },
+          config: { network: 'regtest', adminToken: TOKEN, adminPort: held, watchDefaultTtl: 0, readyMaxLag: 2 },
         },
         onFatal,
       )
@@ -111,25 +122,63 @@ describe('admin server', () => {
     store.expiries.clear()
     store.outbox.clear()
     store.outboxQueue.clear()
+    store.outboxCreated.clear()
     store.outboxDeadSet.clear()
     store.tip = null
-    rpcOk = true
-    lastBlockAt = null
+    store.memory = { usedBytes: 0, maxBytes: null }
+    store.outboxStats = FakeStore.prototype.outboxStats
+    chain.blockCount = null
+    chain.blockCountError = null
+    chain.getBlockCountCalls = 0
+    runtime.reconciled = true
+    runtime.shuttingDown = false
+    runtime.lastZmqTxAt = null
+    runtime.lastZmqBlockAt = null
+    metrics.reset()
+    warnLog.mockClear()
   })
 
   afterEach(() => {
     vi.useRealTimers()
   })
 
-  it('GET /health needs no auth and returns the documented shape', async () => {
+  // ── /live ────────────────────────────────────────────────────────────────────────────
+
+  it('GET /live is 200 {ok:true} without auth, consulting neither redis nor rpc', async () => {
+    store.getTip = async () => {
+      throw new Error('redis down')
+    }
+    chain.blockCountError = new Error('bitcoind down')
+    try {
+      const r = await call(port, 'GET', '/live')
+      expect(r.status).toBe(200)
+      expect(r.headers['content-type']).toBe('application/json')
+      expect(r.json).toEqual({ ok: true })
+      expect(chain.getBlockCountCalls).toBe(0)
+    } finally {
+      delete (store as { getTip?: unknown }).getTip
+    }
+  })
+
+  it('GET /live is 503 {ok:false} during shutdown', async () => {
+    runtime.shuttingDown = true
+    const r = await call(port, 'GET', '/live')
+    expect(r.status).toBe(503)
+    expect(r.json).toEqual({ ok: false })
+  })
+
+  // ── /ready ───────────────────────────────────────────────────────────────────────────
+
+  it('GET /ready needs no auth and returns the documented shape: 200 when redis, rpc, reconciled and lag ≤ READY_MAX_LAG', async () => {
     store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 101 // lag 1: normal right after a block
     store.watches.add(GOOD)
-    lastBlockAt = 1_700_000_000_000
-    // Pin the clock the handler reads (not the timers — the socket stays real).
-    const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_005_000)
+    runtime.lastZmqTxAt = 1_700_000_000_000 - 4_000
+    runtime.lastZmqBlockAt = 1_700_000_000_000 - 65_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
     let r: Reply
     try {
-      r = await call(port, 'GET', '/health')
+      r = await call(port, 'GET', '/ready')
     } finally {
       now.mockRestore()
     }
@@ -140,16 +189,94 @@ describe('admin server', () => {
       ok: true,
       redis: true,
       rpc: true,
+      reconciled: true,
+      shuttingDown: false,
       tipHeight: 100,
-      secondsSinceLastBlock: 5,
+      nodeHeight: 101,
+      chainLag: 1,
       watchCount: 1,
       outboxDepth: 0,
       outboxOldestAgeSec: null,
       deadLetterCount: 0,
+      lastZmqTxAgeSec: 4,
+      lastZmqBlockAgeSec: 65,
     })
+    expect(chain.getBlockCountCalls).toBe(1) // one getblockcount per probe
   })
 
-  it('GET /health reports the outbox (depth, oldest age, dead count) and stays 200: a down consumer is not a readiness failure', async () => {
+  it('GET /ready is exactly at the bound → 200; one block past it → 503 with the lag reported', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 102
+    expect((await call(port, 'GET', '/ready')).status).toBe(200)
+
+    chain.blockCount = 103
+    const r = await call(port, 'GET', '/ready')
+    expect(r.status).toBe(503)
+    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: true, reconciled: true, tipHeight: 100, nodeHeight: 103, chainLag: 3 })
+  })
+
+  it('GET /ready is 503 {reconciled:false} before boot reconciliation finishes, with every other field still reported', async () => {
+    runtime.reconciled = false
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 100
+    const r = await call(port, 'GET', '/ready')
+    expect(r.status).toBe(503)
+    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: true, reconciled: false, tipHeight: 100, nodeHeight: 100, chainLag: 0 })
+  })
+
+  it('GET /ready is 503 with rpc:false, nodeHeight and chainLag null when getblockcount rejects', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCountError = new Error('bitcoind unreachable')
+    const r = await call(port, 'GET', '/ready')
+    expect(r.status).toBe(503)
+    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: false, reconciled: true, tipHeight: 100, nodeHeight: null, chainLag: null, outboxDepth: 0 })
+    expect(warnLog.mock.calls.some((c) => /ready: rpc check failed: bitcoind unreachable/.test(String(c[0])))).toBe(true)
+  })
+
+  it('GET /ready is 503 with redis:false, tipHeight and chainLag null when a store read rejects', async () => {
+    chain.blockCount = 100
+    store.outboxStats = async () => {
+      throw new Error('redis went away')
+    }
+    const r = await call(port, 'GET', '/ready')
+    expect(r.status).toBe(503)
+    expect(r.json).toMatchObject({ ok: false, redis: false, rpc: true, tipHeight: null, nodeHeight: 100, chainLag: null, watchCount: 0, outboxDepth: 0, outboxOldestAgeSec: null, deadLetterCount: 0 })
+    expect(warnLog.mock.calls.some((c) => /ready: redis check failed: redis went away/.test(String(c[0])))).toBe(true)
+  })
+
+  it('GET /ready is 503 with chainLag null when weir has no tip yet (fresh boot) — an unmeasurable lag is not within bound', async () => {
+    chain.blockCount = 100
+    const r = await call(port, 'GET', '/ready')
+    expect(r.status).toBe(503)
+    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: true, tipHeight: null, nodeHeight: 100, chainLag: null })
+  })
+
+  it('GET /ready is 503 {shuttingDown:true} once shutdown has begun — while /live is 503 too', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 100
+    runtime.shuttingDown = true
+    const r = await call(port, 'GET', '/ready')
+    expect(r.status).toBe(503)
+    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: true, reconciled: true, shuttingDown: true, chainLag: 0 })
+    expect((await call(port, 'GET', '/live')).status).toBe(503)
+  })
+
+  it('GET /ready reads the shutdown flag AFTER its async reads: a shutdown that begins mid-probe still yields 503', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 100
+    const realStats = store.outboxStats
+    store.outboxStats = async () => {
+      runtime.shuttingDown = true // flips while the probe is awaiting redis
+      return realStats.call(store)
+    }
+    const r = await call(port, 'GET', '/ready')
+    expect(r.status).toBe(503)
+    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: true, shuttingDown: true })
+  })
+
+  it('GET /ready reports the outbox (depth, oldest age, dead count) and stays 200: a down consumer is not a readiness failure', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 100
     const queued: TxEvent = {
       version: 1,
       event: 'dropped',
@@ -170,7 +297,7 @@ describe('admin server', () => {
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
     let r: Reply
     try {
-      r = await call(port, 'GET', '/health')
+      r = await call(port, 'GET', '/ready')
     } finally {
       now.mockRestore()
     }
@@ -179,13 +306,180 @@ describe('admin server', () => {
     expect(r.json).toMatchObject({ ok: true, outboxDepth: 2, outboxOldestAgeSec: 90, deadLetterCount: 2 })
   })
 
-  it('GET /health is 503 with rpc:false when the rpc ping rejects', async () => {
-    rpcOk = false
+  it('GET /health is an alias of /ready: same status, same body, no secondsSinceLastBlock', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 101
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    let health: Reply
+    let ready: Reply
+    try {
+      health = await call(port, 'GET', '/health')
+      ready = await call(port, 'GET', '/ready')
+    } finally {
+      now.mockRestore()
+    }
+    expect(health.status).toBe(200)
+    expect(health.json).toEqual(ready.json)
+    expect(health.json).not.toHaveProperty('secondsSinceLastBlock')
 
-    const r = await call(port, 'GET', '/health')
+    runtime.reconciled = false
+    expect((await call(port, 'GET', '/health')).status).toBe(503)
+  })
 
-    expect(r.status).toBe(503)
-    expect(r.json).toMatchObject({ ok: false, redis: true, rpc: false, tipHeight: null, secondsSinceLastBlock: null, outboxDepth: 0 })
+  // ── /metrics ─────────────────────────────────────────────────────────────────────────
+
+  it('GET /metrics needs no auth, is Prometheus text 0.0.4, and carries the registry plus every scrape-time gauge', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCount = 102
+    store.watches.add(GOOD)
+    store.watches.add('bcrt1qsecond')
+    store.memory = { usedBytes: 12_345, maxBytes: 256 * 1024 * 1024 }
+    store.outboxDeadSet.set('dead-1', 1)
+    const queued: TxEvent = {
+      version: 1,
+      event: 'seen',
+      network: 'regtest',
+      txid: 'tx1',
+      confs: 0,
+      matched: [],
+      blockHeight: null,
+      blockHash: null,
+      hex: '',
+      idempotencyKey: 'regtest:tx1:seen',
+      timestamp: 1_700_000_000_000,
+    }
+    store.enqueue(queued, 1_700_000_000_000 - 30_000) // counts one seen enqueued (fake mirrors the Store)
+    metrics.counters.inc('weir_blocks_processed_total')
+    metrics.counters.inc('weir_blocks_processed_total')
+    metrics.counters.inc('weir_reorgs_total')
+    metrics.counters.inc('weir_webhook_deliveries_total', { result: 'ok' }, 3)
+    metrics.counters.inc('weir_webhook_deliveries_total', { result: 'fail' })
+    metrics.counters.inc('weir_events_dead_lettered_total')
+    metrics.gauges.set('weir_last_zmq_tx_timestamp_seconds', 1_699_999_990)
+    metrics.gauges.set('weir_last_zmq_block_timestamp_seconds', 1_699_999_900)
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    let r: Reply
+    try {
+      r = await call(port, 'GET', '/metrics')
+    } finally {
+      now.mockRestore()
+    }
+
+    expect(r.status).toBe(200)
+    expect(r.headers['content-type']).toBe('text/plain; version=0.0.4; charset=utf-8')
+    expect(r.text.endsWith('\n')).toBe(true)
+    // one # TYPE per family
+    const typeLines = r.text.split('\n').filter((l) => l.startsWith('# TYPE '))
+    expect(new Set(typeLines).size).toBe(typeLines.length)
+    expect(typeLines).toContain('# TYPE weir_events_enqueued_total counter')
+    expect(typeLines).toContain('# TYPE weir_chain_lag gauge')
+
+    const got = samples(r.text)
+    expect(got.get('weir_up')).toBe('1')
+    expect(got.get('weir_reconciled')).toBe('1')
+    expect(got.get('weir_tip_height')).toBe('100')
+    expect(got.get('weir_node_height')).toBe('102')
+    expect(got.get('weir_chain_lag')).toBe('2')
+    expect(got.get('weir_watch_count')).toBe('2')
+    expect(got.get('weir_outbox_depth')).toBe('1')
+    expect(got.get('weir_outbox_oldest_age_seconds')).toBe('30')
+    expect(got.get('weir_dead_letter_count')).toBe('1')
+    expect(got.get('weir_redis_memory_used_bytes')).toBe('12345')
+    expect(got.get('weir_redis_memory_max_bytes')).toBe(String(256 * 1024 * 1024))
+    expect(got.get('weir_last_zmq_tx_timestamp_seconds')).toBe('1699999990')
+    expect(got.get('weir_last_zmq_block_timestamp_seconds')).toBe('1699999900')
+    // counters reflect the registry, labelled families included
+    expect(got.get('weir_events_enqueued_total{event="seen"}')).toBe('1')
+    expect(got.get('weir_events_enqueued_total{event="confirmed"}')).toBe('0')
+    expect(got.get('weir_webhook_deliveries_total{result="ok"}')).toBe('3')
+    expect(got.get('weir_webhook_deliveries_total{result="fail"}')).toBe('1')
+    expect(got.get('weir_events_dead_lettered_total')).toBe('1')
+    expect(got.get('weir_blocks_processed_total')).toBe('2')
+    expect(got.get('weir_reorgs_total')).toBe('1')
+    // never addresses or txids
+    expect(r.text).not.toContain(GOOD)
+    expect(r.text).not.toContain('tx1')
+  })
+
+  it('GET /metrics: absent-when-unknown gauges — no tip, unlimited redis, no ZMQ message yet, empty outbox → oldest age 0', async () => {
+    chain.blockCount = 5
+    const r = await call(port, 'GET', '/metrics')
+    expect(r.status).toBe(200)
+    const got = samples(r.text)
+    expect(got.has('weir_tip_height')).toBe(false)
+    expect(got.has('weir_chain_lag')).toBe(false)
+    expect(got.get('weir_node_height')).toBe('5')
+    expect(got.has('weir_redis_memory_max_bytes')).toBe(false)
+    expect(got.get('weir_redis_memory_used_bytes')).toBe('0')
+    expect(got.has('weir_last_zmq_tx_timestamp_seconds')).toBe(false)
+    expect(got.get('weir_outbox_oldest_age_seconds')).toBe('0')
+    expect(got.get('weir_reconciled')).toBe('1')
+  })
+
+  it('GET /metrics never 500s: a failed scrape-time read only omits its own gauges (warned), weir_up stays 1', async () => {
+    store.tip = { hash: 'b100', height: 100 }
+    chain.blockCountError = new Error('bitcoind unreachable')
+    store.outboxStats = async () => {
+      throw new Error('redis hiccup')
+    }
+    runtime.reconciled = false
+    const r = await call(port, 'GET', '/metrics')
+
+    expect(r.status).toBe(200)
+    const got = samples(r.text)
+    expect(got.get('weir_up')).toBe('1')
+    expect(got.get('weir_reconciled')).toBe('0')
+    expect(got.get('weir_tip_height')).toBe('100') // the reads that worked are still there
+    expect(got.get('weir_watch_count')).toBe('0')
+    expect(got.has('weir_node_height')).toBe(false)
+    expect(got.has('weir_chain_lag')).toBe(false)
+    expect(got.has('weir_outbox_depth')).toBe(false)
+    expect(got.has('weir_outbox_oldest_age_seconds')).toBe(false)
+    expect(got.has('weir_dead_letter_count')).toBe(false)
+    expect(got.get('weir_blocks_processed_total')).toBe('0') // the registry always renders
+    const warned = warnLog.mock.calls.map((c) => String(c[0])).filter((l) => /metrics: scrape-time read\(s\) failed/.test(l))
+    expect(warned).toHaveLength(1)
+    expect(warned[0]).toMatch(/getBlockCount: bitcoind unreachable/)
+    expect(warned[0]).toMatch(/outboxStats: redis hiccup/)
+  })
+
+  it('the probes are GET-only and unauthenticated; other methods on their paths are 401 like any route', async () => {
+    for (const path of ['/live', '/ready', '/health', '/metrics']) {
+      expect((await call(port, 'POST', path)).status, path).toBe(401)
+      expect((await call(port, 'DELETE', path, { token: TOKEN })).status, path).toBe(404)
+    }
+  })
+
+  // ── writes wait for reconciliation ───────────────────────────────────────────────────
+
+  it('POST /watches and DELETE /watches/:address are 503 `not ready: reconciling` (retry-after: 1) until boot reconciliation is done; reads and probes stay available', async () => {
+    runtime.reconciled = false
+    store.watches.add('bcrt1qexisting')
+
+    const post = await call(port, 'POST', '/watches', { token: TOKEN, body: JSON.stringify({ address: GOOD }) })
+    expect(post.status).toBe(503)
+    expect(post.json).toEqual({ error: 'not ready: reconciling' })
+    expect(post.headers['retry-after']).toBe('1')
+    expect(store.watches.has(GOOD)).toBe(false)
+
+    const del = await call(port, 'DELETE', '/watches/bcrt1qexisting', { token: TOKEN })
+    expect(del.status).toBe(503)
+    expect(del.json).toEqual({ error: 'not ready: reconciling' })
+    expect(store.watches.has('bcrt1qexisting')).toBe(true)
+
+    // auth still comes first: an unauthenticated write in the window is 401, not 503
+    expect((await call(port, 'POST', '/watches', { body: JSON.stringify({ address: GOOD }) })).status).toBe(401)
+    // reads are fine
+    expect((await call(port, 'GET', '/watches', { token: TOKEN })).status).toBe(200)
+    expect((await call(port, 'GET', '/watches/bcrt1qexisting', { token: TOKEN })).status).toBe(200)
+    expect((await call(port, 'GET', '/live')).status).toBe(200)
+    expect((await call(port, 'GET', '/ready')).status).toBe(503)
+
+    runtime.reconciled = true
+    const again = await call(port, 'POST', '/watches', { token: TOKEN, body: JSON.stringify({ address: GOOD }) })
+    expect(again.status).toBe(201)
+    expect(store.watches.has(GOOD)).toBe(true)
+    expect((await call(port, 'DELETE', '/watches/bcrt1qexisting', { token: TOKEN })).status).toBe(204)
   })
 
   it('POST /watches without a token is 401', async () => {

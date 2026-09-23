@@ -58,6 +58,7 @@ import { randomBytes } from 'node:crypto'
 import { createClient } from 'redis'
 import type { ExpiredEvent, MaturingRecord, Network, Outpoint, Tip, TxEvent, WeirEvent } from '../lib/types'
 import { describeError, fatal, log } from '../lib/log'
+import { metrics } from '../lib/metrics'
 import { type Keys, keysFor, outpointField } from './keys'
 
 const CTX = 'store'
@@ -634,6 +635,15 @@ export class Store {
   }
 
   /**
+   * `weir_events_enqueued_total{event}` — bumped by every transition AFTER its write
+   * succeeded (MULTI exec'd, or the Lua reported the enqueuing branch), never inside
+   * `enqueue`/`eventArgs`: those run before the write, and a guarded Lua may write nothing.
+   */
+  private noteEnqueued(event: WeirEvent): void {
+    metrics.counters.inc('weir_events_enqueued_total', { event: event.event })
+  }
+
+  /**
    * A tx paying a watched address entered the mempool: HSET record (height 0), SADD
    * pending, SADD evaluated, claim its inputs (SADD txid into each prevout's SET), + enqueue
    * `seen` when `event` is non-null (null when seen events are disabled). One Lua script,
@@ -693,7 +703,9 @@ export class Store {
       )
       return 'stale'
     }
-    return code === 1 ? 'recorded' : 'skipped'
+    if (code !== 1) return 'skipped'
+    if (event !== null) this.noteEnqueued(event)
+    return 'recorded'
   }
 
   /** The outbox part of an EVAL: id + the ARGV tail every enqueuing script takes (eventId, payload, event, idempotencyKey). */
@@ -707,6 +719,7 @@ export class Store {
     const multi = this.client.multi().hSet(this.keys.maturingRecord(txid), { fired: JSON.stringify(fired) })
     this.enqueue(multi, event, Date.now())
     await multi.exec()
+    this.noteEnqueued(event)
   }
 
   /**
@@ -723,7 +736,9 @@ export class Store {
       keys: [this.keys.maturingRecord(txid), this.keys.pending, this.keys.evaluated, this.keys.outbox, this.keys.outboxRecord(id), this.keys.outboxCreated, this.keys.retired],
       arguments: [txid, ...args, String(nowMs), this.keys.maturingRecord(''), this.keys.outpointPrefix],
     })
-    return Number(reply) === 1
+    const dropped = Number(reply) === 1
+    if (dropped) this.noteEnqueued(event)
+    return dropped
   }
 
   /**
@@ -771,7 +786,9 @@ export class Store {
       )
       return 'stale'
     }
-    return code === 1 ? 'replaced' : 'skipped'
+    if (code !== 1) return 'skipped'
+    this.noteEnqueued(event)
+    return 'replaced'
   }
 
   /**
@@ -782,6 +799,7 @@ export class Store {
     const multi = this.client.multi().sRem(this.keys.addresses, addr).zRem(this.keys.expiries, addr)
     this.enqueue(multi, event, Date.now())
     await multi.exec()
+    this.noteEnqueued(event)
   }
 
   /**
@@ -835,6 +853,7 @@ export class Store {
       .sRem(this.keys.limbo, rec.txid)
     this.enqueue(multi, event, Date.now())
     await multi.exec()
+    this.noteEnqueued(event)
   }
 
   /**
@@ -858,6 +877,7 @@ export class Store {
       ],
       arguments: [txid, ...args, String(nowMs), this.keys.outpointPrefix],
     })
+    this.noteEnqueued(event)
   }
 
   /**
